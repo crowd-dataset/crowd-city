@@ -1,0 +1,68 @@
+# Runs and output folders
+runs/
+runs_mt
+_output/
+check_videos_report.json
+corrupt_videos.txt
+
+# Video and data folders
+video/
+videos/
+data/
+data_country/
+data-bkp/
+source_videos/
+saved_snaps
+
+# Model files
+yolov8x.pt
+yolo11x.pt
+yolo11x-seg.pt
+yolo11n-cls.pt
+yolo11x_img640_fp16.engine
+yolo11x.onnx
+
+# Python environment files
+.vscode/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.egg-info/
+.venv
+.wb_cache
+
+# macOS specific files
+**/.DS_Store
+
+# Sublime Text project files
+*.sublime-project
+*.sublime-workspace
+
+# Instance specific files
+config
+secret
+
+mapping_bkp.csv
+mapping_cleaned.csv
+
+# Pickle files
+*.pickle
+
+# Docker files
+docker-compose.debug.yml
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# venv
+/yt
+
+# temp video file in root
+/*.mp4
+
+# log files
+*.log
+*.out
+
+# log of upgrades
+upgrade_log.json

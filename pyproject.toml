@@ -1,0 +1,36 @@
+[project]
+name = "crowd-city"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.10.18"
+dependencies = [
+    "bs4>=0.0.2",
+    "ffmpeg-python>=0.2.0",
+    "filterpy>=1.4.5",
+    "flake8==7.1.1",
+    "flask==3.0.3",
+    "geopy==2.4.1",
+    "kaleido==0.2.1",
+    "lap>=0.5.12",
+    "moviepy==1.0.3",
+    "nodejs-wheel>=22.20.0",
+    "pandas==2.1.4",
+    "plotly==5.24.1",
+    "polars>=1.33.1",
+    "pyarrow>=22.0.0",
+    "pycountry==24.6.1",
+    "pycountry-convert==0.7.2",
+    "pytubefix==10.0.0",
+    "scipy==1.11.4",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "torchvision==0.23.0",
+    "ultralytics>=8.3.182",
+    "wbdata>=0.3.0",
+    "world-bank-data==0.1.4",
+    "yt-dlp>=2025.0.0",
+]
+
+[tool.uv.sources]
+pytubefix = { git = "https://github.com/felipeucelli/pytubefix.git", rev = "sig-nsig" }
