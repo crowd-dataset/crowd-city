@@ -415,11 +415,6 @@ class MetricsCache:
 
         return cls._all_metrics_cache["vehicles"]
 
-    @classmethod
-    def clear_cache(cls) -> None:
-        """Clear cached metrics (useful if input data changes)."""
-        cls._all_metrics_cache.clear()
-
     # --------------------------------------------------------------------------
     # Utility: unique value extraction + duplicate reporting
     # --------------------------------------------------------------------------

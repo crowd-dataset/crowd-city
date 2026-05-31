@@ -1,5 +1,4 @@
 import os
-import ast
 import polars as pl
 import common
 from utils.core.tools import Tools
@@ -56,45 +55,3 @@ class IO:
                     return None
 
         return file
-
-    def parse_videos(self, s):
-        """Parse a bracketed, comma-separated video string into a list of IDs.
-
-        Args:
-            s (str): String representing video IDs, e.g. '[abc,def,ghi]'.
-
-        Returns:
-            List[str]: List of video IDs as strings, e.g. ['abc', 'def', 'ghi'].
-
-        Example:
-            >>> self.parse_videos('[abc,def]')
-            ['abc', 'def']
-        """
-        if not isinstance(s, str):
-            return []
-        s = s.strip()
-        if s.startswith("[") and s.endswith("]"):
-            s = s[1:-1]
-        return [x.strip() for x in s.split(",") if x.strip()]
-
-    def parse_col(self, row, colname):
-        """Safely parse a DataFrame row column (stored as a string) to a Python object.
-
-        Args:
-            row (pd.Series): The DataFrame row containing the column.
-            colname (str): The column name to parse.
-
-        Returns:
-            object: The parsed Python object (e.g., list or int). Returns empty list on failure.
-
-        Example:
-            >>> self.parse_col(row, 'start_time')
-            [[12], [34], [56]]
-        """
-        try:
-            v = row.get(colname)
-            if not isinstance(v, str):
-                return []
-            return ast.literal_eval(v)
-        except (ValueError, SyntaxError, KeyError, TypeError, AttributeError):
-            return []

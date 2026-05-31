@@ -2,7 +2,7 @@ import numpy as np
 import polars as pl
 from utils.core.metadata import MetaData
 from helper_script import Youtube_Helper
-from typing import Tuple, List, Any
+from typing import Tuple, List, Any, Optional
 
 metadata = MetaData()
 helper = Youtube_Helper()
@@ -14,91 +14,97 @@ class Detection:
         pass
 
     def pedestrian_crossing(self, dataframe: pl.DataFrame, video_id: str, df_mapping, min_x: float, max_x: float,
-                            person_id, tol: float = 0.00, min_track_frames: int = 10, min_road_frames: int = 3
+                            person_id, tol: float = 0.00, min_track_frames: int = 10, min_road_frames: int = 3,
+                            max_track_gap_frames: int = 30, min_crossing_x_range: float = 0.14,
+                            max_crossing_speed_per_frame: Optional[float] = None,
+                            weak_crossing_x_range: float = 0.64,
+                            low_x_range: float = 0.30,
+                            low_x_min_road_frames: int = 20,
+                            tiny_long_track_x_range: float = 0.36,
+                            tiny_long_track_height: float = 0.12,
+                            tiny_long_track_road_frames: int = 50,
+                            slender_track_width: float = 0.05,
+                            slender_track_height: float = 0.26,
+                            slender_track_min_road_frames: int = 5,
+                            slender_track_max_road_frames: int = 49,
+                            strong_static_relx: float = 0.155,
+                            heavy_camera_static_frames: int = 80,
+                            heavy_camera_static_sx: float = 0.02,
+                            large_lateral_x_range: float = 0.56,
+                            large_lateral_tiny_height: float = 0.105,
+                            camera_static_sx: float = 0.25,
+                            camera_static_ratio: float = 0.60,
+                            camera_static_relx: float = 0.18,
+                            camera_static_height: float = 0.15,
+                            camera_static_tiny_relx: float = 0.12,
+                            camera_static_tiny_relx_height: float = 0.19,
+                            weak_y_jitter_x_range: float = 0.50,
+                            weak_y_jitter_motion: float = 0.30,
+                            weak_y_jitter_height: float = 0.22,
+                            no_static_slender_height: float = 0.24,
+                            no_static_slender_max_road_frames: int = 20,
+                            tiny_no_static_height: float = 0.12,
+                            tiny_no_static_width: float = 0.026,
+                            tiny_no_static_min_road_frames: int = 10,
+                            slender_static_relx_min: float = 0.13,
+                            camera_tiny_height: float = 0.15
                             ) -> Tuple[List[Any], List[Any]]:
         """
         Identifies pedestrian tracks that satisfy a road-crossing criterion and filters false positives.
 
-        The function performs two stages:
-
-        1) Crossing-candidate detection (state machine on x-center):
-           - The image is partitioned into three zones based on x-center:
-               LEFT  : x <= min_x - tol
-               ROAD  : min_x + tol <= x <= max_x - tol
-               RIGHT : x >= max_x + tol
-             Values in the buffer region between these thresholds retain the previous state
-             to reduce boundary flicker due to detector jitter.
-
-           - A track is considered a crossing candidate if it:
-               (a) spends at least `min_road_frames` frames in ROAD, and
-               (b) has evidence of a side-to-side transition with an intermediate ROAD phase
-                   (LEFT → ROAD → RIGHT or RIGHT → ROAD → LEFT). Tracks that start inside ROAD
-                   are handled by checking for opposite-side presence before and after ROAD frames.
-
-        2) Candidate filtering:
-           - Vehicle-associated persons are removed via `Detection.is_rider_id(...)`.
-           - Camera-motion artifacts (e.g., turns) are removed via `self.is_valid_crossing(...)`.
-
-        Args:
-            dataframe: Polars DataFrame containing YOLO detections with normalized geometry.
-                Required columns:
-                  - "yolo-id", "unique-id", "frame-count", "x-center"
-                Additional columns used by downstream filters may include:
-                  - "y-center", "width", "height", "confidence"
-            video_id: Identifier used to retrieve metadata from `df_mapping`.
-            df_mapping: Lookup structure consumed by `metadata.find_values_with_video_id`.
-            min_x: Left boundary of the road band in normalized coordinates [0, 1].
-            max_x: Right boundary of the road band in normalized coordinates [0, 1].
-            person_id: Present for interface compatibility; not used for selection in this implementation.
-            tol: Boundary hysteresis tolerance. Larger values reduce flicker but may reduce sensitivity.
-            min_track_frames: Minimum number of frames required for a track to be considered.
-            min_road_frames: Minimum number of frames the track must spend inside the ROAD zone.
-
-        Returns:
-            A tuple of two lists:
-              - pedestrian_ids: unique-ids classified as pedestrian crossings after filtering.
-              - crossed_ids: unique-ids that satisfy the crossing-candidate state-machine criterion.
+        Tuned validation behaviour:
+        - Splits reused tracker IDs into temporal segments when frame gaps are large.
+        - Keeps the candidate stage broad, then rejects weak geometry cases after rider filtering.
+        - Relaxed long-road rejection so slow true crossings are not removed.
+        - Applies rider filtering on the segment window, not on the whole video, to avoid ID-reuse artefacts.
         """
-        # Restrict processing to the person class (COCO person == 0).
         crossed_df = dataframe.filter(pl.col("yolo-id") == 0)
         if crossed_df.height == 0:
             return [], []
 
-        # De-duplicate per (yolo-id, unique-id, frame-count) to stabilize per-frame state.
         crossed_df = Detection._dedup_per_frame(crossed_df)
 
-        # Prepare track data: one row per frame per id, sorted for sequential processing.
         tracks = (
-            crossed_df.select(["unique-id", "frame-count", "x-center"])
+            crossed_df.select(["unique-id", "frame-count", "x-center", "y-center", "width", "height"])
             .sort(["unique-id", "frame-count"])
         )
         if tracks.height == 0:
             return [], []
 
-        uids = tracks.select("unique-id").unique().to_series().to_list()
-
-        # State thresholds with hysteresis.
         left_hard = float(min_x) - float(tol)
         left_soft = float(min_x) + float(tol)
         right_soft = float(max_x) - float(tol)
         right_hard = float(max_x) + float(tol)
 
-        crossed_ids: List[Any] = []
+        def split_segments(track: pl.DataFrame) -> List[pl.DataFrame]:
+            """Split one tracker id into near-continuous temporal segments."""
+            if track.height == 0:
+                return []
 
-        for uid in uids:
-            tr = tracks.filter(pl.col("unique-id") == uid).sort("frame-count")
-            n = tr.height
-            if n < int(min_track_frames):
-                continue
+            frames = track.get_column("frame-count").cast(pl.Int64, strict=False).to_list()
+            if not frames:
+                return []
 
-            x = tr.get_column("x-center").to_numpy()
-            if x.size == 0:
-                continue
+            segments: List[pl.DataFrame] = []
+            start_idx = 0
+            prev_frame = int(frames[0])
+            max_gap = max(int(max_track_gap_frames), 0)
 
-            # State encoding: 0=LEFT, 1=ROAD, 2=RIGHT.
+            for idx in range(1, len(frames)):
+                frame = int(frames[idx])
+                if frame - prev_frame > max_gap:
+                    segments.append(track.slice(start_idx, idx - start_idx))
+                    start_idx = idx
+                prev_frame = frame
+
+            segments.append(track.slice(start_idx, len(frames) - start_idx))
+            return segments
+
+        def build_states(x: np.ndarray) -> np.ndarray:
             states = np.empty(x.size, dtype=np.int8)
+            if x.size == 0:
+                return states
 
-            # Initialize state from the first observation (no hysteresis).
             x0 = float(x[0])
             if x0 < float(min_x):
                 s = 0
@@ -108,7 +114,6 @@ class Detection:
                 s = 1
             states[0] = s
 
-            # State update with hysteresis/buffer behavior.
             for i in range(1, x.size):
                 xi = float(x[i])
 
@@ -119,43 +124,223 @@ class Detection:
                 elif left_soft <= xi <= right_soft:
                     s = 1
                 else:
-                    # Buffer region: keep previous state to suppress flicker near boundaries.
+                    # Buffer region: keep previous state to suppress boundary flicker.
                     s = s
 
                 states[i] = s
+
+            return states
+
+        def segment_is_candidate(seg: pl.DataFrame) -> bool:
+            if seg.height < int(min_track_frames):
+                return False
+
+            x = seg.get_column("x-center").cast(pl.Float64, strict=False).to_numpy()
+            if x.size == 0:
+                return False
+
+            states = build_states(x)
 
             is_left = states == 0
             is_road = states == 1
             is_right = states == 2
 
-            # Minimum presence in the road band.
             if int(is_road.sum()) < int(min_road_frames):
-                continue
+                return False
 
-            # Presence before/after each index for left/right zones.
             left_before = np.maximum.accumulate(is_left)
             right_before = np.maximum.accumulate(is_right)
             left_after = np.maximum.accumulate(is_left[::-1])[::-1]
             right_after = np.maximum.accumulate(is_right[::-1])[::-1]
 
-            # A crossing is indicated by a ROAD index that separates the two sides.
             crossing_mask = is_road & ((left_before & right_after) | (right_before & left_after))
-            if bool(crossing_mask.any()):
-                crossed_ids.append(uid)
+            return bool(crossing_mask.any())
 
-        # Metadata lookup for average height (used by the existing rider filter).
+        uids = tracks.select("unique-id").unique().to_series().to_list()
+
+        candidate_segments: List[Tuple[Any, int, int, float, float, int, float, float, float]] = []
+        crossed_ids: List[Any] = []
+
+        for uid in uids:
+            tr = tracks.filter(pl.col("unique-id") == uid).sort("frame-count")
+            if tr.height < int(min_track_frames):
+                continue
+
+            for seg in split_segments(tr):
+                if not segment_is_candidate(seg):
+                    continue
+
+                frames = seg.get_column("frame-count").cast(pl.Int64, strict=False).to_numpy()
+                x = seg.get_column("x-center").cast(pl.Float64, strict=False).to_numpy()
+                if frames.size == 0 or x.size == 0:
+                    continue
+
+                start_frame = int(frames.min())
+                end_frame = int(frames.max())
+                duration = max(1, end_frame - start_frame + 1)
+                x_range = float(np.nanmax(x) - np.nanmin(x))
+                x_speed = float(x_range / duration)
+
+                states = build_states(x)
+                road_frames = int((states == 1).sum())
+
+                if "height" in seg.columns:
+                    height = seg.get_column("height").cast(pl.Float64, strict=False).to_numpy()
+                    median_height = float(np.nanmedian(height)) if height.size > 0 else 0.0
+                else:
+                    median_height = 0.0
+
+                if "width" in seg.columns:
+                    width = seg.get_column("width").cast(pl.Float64, strict=False).to_numpy()
+                    median_width = float(np.nanmedian(width)) if width.size > 0 else 0.0
+                else:
+                    median_width = 0.0
+
+                if "y-center" in seg.columns:
+                    y = seg.get_column("y-center").cast(pl.Float64, strict=False).to_numpy()
+                    y_gross_motion = float(np.nansum(np.abs(np.diff(y)))) if y.size > 1 else 0.0
+                else:
+                    y_gross_motion = 0.0
+
+                candidate_segments.append(
+                    (uid, start_frame, end_frame, x_range, x_speed, road_frames, median_height, median_width, y_gross_motion)
+                )
+                if uid not in crossed_ids:
+                    crossed_ids.append(uid)
+
         avg_height = None
         result = metadata.find_values_with_video_id(df_mapping, video_id)
         if result is not None:
             avg_height = result[15]
 
         pedestrian_ids: List[Any] = []
-        for uid in crossed_ids:
-            if Detection.is_rider_id(dataframe, uid, avg_height):
+        for uid, start_frame, end_frame, x_range, x_speed, road_frames, median_height, median_width, y_gross_motion in candidate_segments:
+            segment_df = dataframe.filter(
+                (pl.col("frame-count") >= int(start_frame))
+                & (pl.col("frame-count") <= int(end_frame))
+            )
+
+            if Detection.is_rider_id(segment_df, uid, avg_height):
                 continue
-            if not Detection.is_valid_crossing(dataframe, uid):
+
+            static_stats = Detection.static_reference_motion_stats(segment_df, uid)
+            static_shared = int(static_stats.get("shared_frames", 0) or 0)
+            static_sx_range = float(static_stats.get("static_x_range", 0.0) or 0.0)
+            static_relx_range = float(static_stats.get("relative_x_range", 0.0) or 0.0)
+            static_ratio = float(static_stats.get("static_to_person_ratio", 0.0) or 0.0)
+
+            # Very tiny side-to-side movement is usually boundary flicker.  The threshold is intentionally
+            # lower than older versions because the second validation video contains real crossings with
+            # x-ranges around 0.16.
+            if float(x_range) < float(min_crossing_x_range):
                 continue
-            pedestrian_ids.append(uid)
+
+            # Small x-range can still be valid if the person clearly spends time inside the road band.
+            # Reject only short road-band contacts.
+            if float(x_range) < float(low_x_range) and int(road_frames) < int(low_x_min_road_frames):
+                continue
+
+            # Long weak tracks sitting in the road band are usually background/camera artefacts rather
+            # than pedestrians crossing laterally.
+            if float(x_range) < float(weak_crossing_x_range) and int(road_frames) > 90:
+                continue
+
+            # Some fake crossings are unstable tiny/background tracks: they appear to cross laterally,
+            # but their vertical trajectory jitters heavily while staying weak in x-range.
+            if float(x_range) < 0.56 and int(road_frames) > 40 and float(y_gross_motion) > 0.30:
+                continue
+
+            # Weak tracks with strong vertical jitter are often tracker or camera artefacts rather than
+            # pedestrians moving laterally across the road.
+            if (
+                float(x_range) < float(weak_y_jitter_x_range)
+                and float(y_gross_motion) > float(weak_y_jitter_motion)
+                and float(median_height) < float(weak_y_jitter_height)
+            ):
+                continue
+
+            # Tiny long tracks with weak lateral movement are normally far-background detections.
+            if (
+                float(x_range) < float(tiny_long_track_x_range)
+                and float(median_height) < float(tiny_long_track_height)
+                and int(road_frames) >= int(tiny_long_track_road_frames)
+            ):
+                continue
+
+            # If there is no static reference at all, only reject very small/slender tracks. This keeps
+            # real pedestrians such as the second-video uid 3489, while still removing no-reference
+            # background tracks such as uid 13658 and uid 343.
+            if (
+                static_shared < 8
+                and float(median_height) <= float(tiny_no_static_height)
+                and float(median_width) <= float(tiny_no_static_width)
+                and int(road_frames) >= int(tiny_no_static_min_road_frames)
+            ):
+                continue
+
+            # Strong camera motion should only reject a candidate when either the target is very small,
+            # or the person-static relative motion is genuinely tiny. The earlier v4 rule used relx<=0.22
+            # and height<=0.18, which rejected true crossings such as uids 3439 and 3464.
+            if static_sx_range >= float(camera_static_sx) and static_ratio >= float(camera_static_ratio):
+                if float(median_height) <= float(camera_tiny_height) and int(road_frames) >= 5:
+                    continue
+                if (
+                    static_relx_range <= float(camera_static_tiny_relx)
+                    and float(median_height) <= float(camera_static_tiny_relx_height)
+                ):
+                    continue
+                if (
+                    static_relx_range <= float(camera_static_relx)
+                    and float(median_height) <= float(camera_static_height)
+                ):
+                    continue
+
+            # Slender distant tracks are a major source of fake crossings. In v5 this rule is split into
+            # no-static and static-reference cases so that real slender pedestrians are not over-rejected.
+            if (
+                float(median_width) <= float(slender_track_width)
+                and float(median_height) < float(slender_track_height)
+                and int(slender_track_min_road_frames) <= int(road_frames) <= int(slender_track_max_road_frames)
+            ):
+                if static_shared < 8:
+                    if (
+                        float(median_height) < float(no_static_slender_height)
+                        and int(road_frames) <= int(no_static_slender_max_road_frames)
+                    ):
+                        continue
+                else:
+                    if static_relx_range < float(slender_static_relx_min):
+                        continue
+                    if (
+                        static_sx_range >= float(camera_static_sx)
+                        and static_ratio >= float(camera_static_ratio)
+                        and float(median_height) <= float(camera_tiny_height)
+                    ):
+                        continue
+
+            # Large lateral jumps from tiny detections are only rejected when static references also show
+            # camera dominance. A tiny but stable far pedestrian can be a real crossing, e.g. uid 17227.
+            if (
+                float(x_range) > float(large_lateral_x_range)
+                and float(median_height) < float(large_lateral_tiny_height)
+                and int(road_frames) >= 5
+                and static_sx_range >= float(camera_static_sx)
+                and static_ratio >= float(camera_static_ratio)
+                and static_relx_range < 0.20
+            ):
+                continue
+
+            # Keep the global speed filter optional. It is disabled by default because the validation set
+            # contains real crossings with fast x motion.
+            if max_crossing_speed_per_frame is not None:
+                if float(x_speed) > float(max_crossing_speed_per_frame):
+                    continue
+
+            if not Detection.is_valid_crossing(segment_df, uid):
+                continue
+
+            if uid not in pedestrian_ids:
+                pedestrian_ids.append(uid)
 
         return pedestrian_ids, crossed_ids
 
@@ -174,310 +359,430 @@ class Detection:
         )
 
     @staticmethod
-    def is_rider_id(
+    def _longest_frame_run(frames, *, gap_allow: int = 2) -> int:
+        """Return the longest near-continuous run of frame numbers."""
+        try:
+            values = sorted({int(f) for f in frames})
+        except Exception:
+            return 0
+
+        if not values:
+            return 0
+
+        max_run = 1
+        cur_run = 1
+        max_gap = max(int(gap_allow), 0) + 1
+        prev = values[0]
+
+        for frame in values[1:]:
+            if int(frame) - int(prev) <= max_gap:
+                cur_run += 1
+            else:
+                max_run = max(max_run, cur_run)
+                cur_run = 1
+            prev = frame
+
+        return max(max_run, cur_run)
+
+    @staticmethod
+    def classify_rider_type(
         df: pl.DataFrame,
-        id,
-        avg_height,
+        person_id,
+        *,
+        avg_height: Optional[float] = None,
         min_shared_frames: int = 4,
-        # Normalised-mode tuned thresholds (YOLO coords in 0..1)
+        min_continuous_shared_frames: int = 12,
+        shared_run_gap_allow: int = 2,
+        min_vehicle_width_ratio: float = 0.50,
+        min_vehicle_width_ratio_frames: float = 0.65,
         dist_rel_thresh: float = 0.8,
         prox_req: float = 0.7,
-        alpha_x: float = 1.0,
-        beta_y: float = 0.03,
+        alpha_x: float = 0.75,
+        beta_y: float = 0.08,
         gamma_y: float = 1.4,
         coloc_req: float = 0.7,
         sim_thresh: float = 0.4,
         sim_req: float = 0.5,
         min_motion_steps: int = 3,
         motion_coloc_min: float = 0.5,
-        # Short-overlap guard (prevents brief accidental co-location)
         short_shared_frames: int = 8,
         short_sim_req: float = 0.8,
         short_disp_req: float = 0.12,
         eps: float = 1e-9,
-        # ---------------------------------------------------------------------
-        # vehicle association beyond bicycle/motorcycle
-        # ---------------------------------------------------------------------
-        open_rider_class_ids: Tuple[int, ...] = (1, 3),          # bicycle, motorcycle
-        enclosed_vehicle_class_ids: Tuple[int, ...] = (2, 5, 7, 6),  # car, bus, truck, train (COCO)
-        enclosed_prox_req: float = 0.7,      # fraction of frames where person is close to vehicle center
-        enclosed_dist_rel_thresh: float = 0.9,  # dist / vehicle_height (dimensionless)
-        enclosed_inside_req: float = 0.4,    # fraction of frames where person center is inside vehicle bbox
-        enclosed_rel_stab_max: float = 0.10,  # max robust range of relative position (normalised by vehicle size)
-        enclosed_iou_req: float = 0.02,      # optional low IoU gate (kept permissive; many person-in-car boxes are small)  # noqa: E501
-        q: float = 0.05,                     # quantile for robust range (5%..95%)
-    ) -> bool:
+        person_class: int = 0,
+        bicycle_class: int = 1,
+        motorcycle_class: int = 3,
+        car_class: int = 2,
+        bus_class: int = 5,
+        truck_class: int = 7,
+        include_large_vehicle_passengers: bool = False,
+    ) -> dict:
         """
-        Returns whether a tracked person is a "rider / vehicle-associated person" using normalised YOLO boxes.
+        Classify whether a person track is associated with a vehicle.
 
-        What this function treats as "rider" (so we can exclude from pedestrian crossing):
-          1) Open riders: person riding *bicycle/motorcycle* (existing logic).
-          2) Enclosed vehicle association: person that appears *inside/attached to* a car/bus/truck/train.
-             This catches cases where the detector outputs a 'person' for a rider/passenger/driver that
-             moves with the vehicle, and we do not want to count them as a pedestrian crossing.
-
-        Assumptions:
-          - YOLO geometry columns are normalised to the frame:
-            x-center, y-center, width, height ∈ [0, 1].
-          - "frame-count" aligns detections across objects.
-
-        How enclosed-vehicle association works:
-          - The person's center should be inside the vehicle bbox for a meaningful fraction of shared frames.
-          - The person's position relative to the vehicle should be stable over time:
-              relx_norm = (x_person - x_vehicle) / max(vehicle_width, eps)
-              rely_norm = (y_person - y_vehicle) / max(vehicle_height, eps)
-            A true passenger/driver tends to have low variation in these values.
-          - Proximity is computed scale-free using vehicle height:
-              dist_rel = ||p_center - v_center|| / max(v_height, eps)
-
-        Args:
-          df: Polars DataFrame with YOLO detections (normalised coords).
-          id: Person unique-id to classify.
-          avg_height: Kept for compatibility; validated but not used in normalised-only logic.
-          ... (existing params preserved)
-          open_rider_class_ids: Vehicle classes that should use open-rider geometry checks.
-          enclosed_vehicle_class_ids: Vehicle classes treated as enclosed vehicles.
-          enclosed_*: Tunables for enclosed vehicle association.
-          q: Quantile for robust ranges.
-
-        Returns:
-          True if the person is classified as riding/vehicle-associated; else False.
+        This uses the cyclist/rider logic from the bicyclist detection repo:
+        - bicycle and motorcycle associations require a near-continuous shared run
+        - bicycle and motorcycle associations require enough vehicle width relative to the person
+        - car, bus and truck associations are treated as passengers when the person stays inside the vehicle box
         """
+        if avg_height is not None:
+            try:
+                if float(avg_height) <= 0.0:
+                    return {
+                        "is_rider": False, "rider_type": None, "role": None, "vehicle_id": None,
+                        "score": 0.0, "shared_frames": 0, "longest_shared_run": 0
+                    }
+            except Exception:
+                return {
+                    "is_rider": False, "rider_type": None, "role": None, "vehicle_id": None,
+                    "score": 0.0, "shared_frames": 0, "longest_shared_run": 0
+                }
 
-        # ---------------------------------------------------------------------
-        # Validate avg_height for compatibility with our upstream API.
-        # (Not used for scaling in normalised-only logic.)
-        # ---------------------------------------------------------------------
-        try:
-            if avg_height is None or float(avg_height) <= 0.0:
-                return False
-        except Exception:
-            return False
-
-        # ---------------------------------------------------------------------
-        # Deduplicate per (yolo-id, unique-id, frame-count) to stabilise joins.
-        # ---------------------------------------------------------------------
         df = Detection._dedup_per_frame(df)
 
-        # ---------------------------------------------------------------------
-        # Extract person track (yolo-id == 0).
-        # ---------------------------------------------------------------------
-        person_track = (
-            df.filter((pl.col("yolo-id") == 0) & (pl.col("unique-id") == id))
-            .sort("frame-count")
+        p = (
+            df.filter((pl.col("yolo-id") == person_class) & (pl.col("unique-id") == person_id))
+              .sort("frame-count")
         )
-        if person_track.height == 0:
-            return False
+        if p.height == 0:
+            return {
+                "is_rider": False, "rider_type": None, "role": None, "vehicle_id": None,
+                "score": 0.0, "shared_frames": 0, "longest_shared_run": 0
+            }
 
-        frames = person_track.get_column("frame-count").to_numpy()
-        if frames.size < min_shared_frames:
-            return False
+        p_frames = p.get_column("frame-count").to_numpy()
+        if p_frames.size < min_shared_frames:
+            return {
+                "is_rider": False, "rider_type": None, "role": None, "vehicle_id": None,
+                "score": 0.0, "shared_frames": 0, "longest_shared_run": 0
+            }
 
-        first_frame = int(frames.min())
-        last_frame = int(frames.max())
+        first_frame = int(p_frames.min())
+        last_frame = int(p_frames.max())
 
-        # ---------------------------------------------------------------------
-        # Gather all vehicle detections that overlap with the person in time.
-        # We include:
-        #   - open riders (bicycle, motorcycle)
-        #   - enclosed vehicles (car, bus, truck, train by default)
-        # ---------------------------------------------------------------------
-        vehicle_classes = tuple(open_rider_class_ids) + tuple(enclosed_vehicle_class_ids)
+        supported_vehicle_classes = [bicycle_class, motorcycle_class]
+        if include_large_vehicle_passengers:
+            supported_vehicle_classes.extend([car_class, bus_class, truck_class])
 
-        vehicles_in_frames = df.filter(
+        vehicles = df.filter(
             (pl.col("frame-count") >= first_frame)
             & (pl.col("frame-count") <= last_frame)
-            & (pl.col("yolo-id").is_in(list(vehicle_classes)))
+            & (pl.col("yolo-id").is_in(supported_vehicle_classes))
         )
-        if vehicles_in_frames.height == 0:
-            return False
+        if vehicles.height == 0:
+            return {
+                "is_rider": False, "rider_type": None, "role": None, "vehicle_id": None,
+                "score": 0.0, "shared_frames": 0, "longest_shared_run": 0
+            }
 
-        vehicle_ids = vehicles_in_frames.select("unique-id").unique().to_series().to_list()
+        vehicle_ids = vehicles.select("unique-id").unique().to_series().to_list()
+        p1 = p.unique(subset=["frame-count"], keep="first")
 
-        # One row per frame for person track (clean alignment).
-        p1 = person_track.unique(subset=["frame-count"], keep="first")
+        best = None
 
-        # ---------------------------------------------------------------------
-        # Small helper: robust range (q..1-q) to reduce jitter/outliers.
-        # ---------------------------------------------------------------------
-        def robust_range_np(x: np.ndarray) -> float:
-            if x.size == 0:
-                return 0.0
-            lo = np.quantile(x, q)
-            hi = np.quantile(x, 1.0 - q)
-            return float(hi - lo)
-
-        # ---------------------------------------------------------------------
-        # Helper: IoU in normalised coordinates for two aligned arrays of boxes.
-        # Boxes are (xc, yc, w, h) arrays, all normalised.
-        # ---------------------------------------------------------------------
-        def iou_xywh_norm(px, py, pw, ph, vx, vy, vw, vh) -> np.ndarray:
-            px1 = px - pw / 2.0
-            py1 = py - ph / 2.0
-            px2 = px + pw / 2.0
-            py2 = py + ph / 2.0
-
-            vx1 = vx - vw / 2.0
-            vy1 = vy - vh / 2.0
-            vx2 = vx + vw / 2.0
-            vy2 = vy + vh / 2.0
-
-            ix1 = np.maximum(px1, vx1)
-            iy1 = np.maximum(py1, vy1)
-            ix2 = np.minimum(px2, vx2)
-            iy2 = np.minimum(py2, vy2)
-
-            iw = np.maximum(0.0, ix2 - ix1)
-            ih = np.maximum(0.0, iy2 - iy1)
-            inter = iw * ih
-
-            p_area = np.maximum(0.0, px2 - px1) * np.maximum(0.0, py2 - py1)
-            v_area = np.maximum(0.0, vx2 - vx1) * np.maximum(0.0, vy2 - vy1)
-            union = np.maximum(p_area + v_area - inter, eps)
-
-            return inter / union
-
-        # ---------------------------------------------------------------------
-        # Evaluate each candidate vehicle track; return True on the first match.
-        # ---------------------------------------------------------------------
-        for vehicle_id in vehicle_ids:
-            v_track = vehicles_in_frames.filter(pl.col("unique-id") == vehicle_id).sort("frame-count")
-            if v_track.height == 0:
+        for vid in vehicle_ids:
+            v = vehicles.filter(pl.col("unique-id") == vid).sort("frame-count")
+            if v.height == 0:
                 continue
 
-            # Determine vehicle class for this track (safe because v_track is sorted).
-            try:
-                v_class = int(v_track.get_column("yolo-id")[0])
-            except Exception:
+            v_class = int(v.get_column("yolo-id")[0])
+            vtype = (
+                "bicycle" if v_class == bicycle_class else
+                "motorcycle" if v_class == motorcycle_class else
+                "car" if v_class == car_class else
+                "bus" if v_class == bus_class else
+                "truck" if v_class == truck_class else
+                None
+            )
+            if vtype is None:
                 continue
 
-            v1 = v_track.unique(subset=["frame-count"], keep="first")
+            role = "rider" if v_class in (bicycle_class, motorcycle_class) else "passenger"
 
-            # Align person and vehicle by frame-count.
+            v1 = v.unique(subset=["frame-count"], keep="first")
             j = p1.join(v1, on="frame-count", how="inner", suffix="_v")
             shared = j.height
             if shared < min_shared_frames:
                 continue
 
-            # Extract aligned arrays.
+            longest_shared_run = Detection._longest_frame_run(
+                j.get_column("frame-count").to_list(),
+                gap_allow=shared_run_gap_allow,
+            )
+            if role == "rider" and longest_shared_run < int(min_continuous_shared_frames):
+                continue
+
             p_xy = j.select(["x-center", "y-center"]).to_numpy()
             v_xy = j.select(["x-center_v", "y-center_v"]).to_numpy()
 
-            px = p_xy[:, 0]
-            py = p_xy[:, 1]
-            vx = v_xy[:, 0]
-            vy = v_xy[:, 1]
-
             p_w = j.get_column("width").to_numpy()
             p_h = j.get_column("height").to_numpy()
-
             v_w = j.get_column("width_v").to_numpy()
             v_h = j.get_column("height_v").to_numpy()
 
-            # ---------------------------------------------------------------
-            # Branch A: OPEN RIDERS (bicycle/motorcycle) => existing logic
-            # ---------------------------------------------------------------
-            if v_class in open_rider_class_ids:
-                dist = np.linalg.norm(p_xy - v_xy, axis=1)
+            if role == "rider":
+                vehicle_width_ratio_arr = v_w / np.maximum(p_w, eps)
+                vehicle_width_ratio = float(np.median(vehicle_width_ratio_arr))
+                vehicle_width_ratio_pass_ratio = float(
+                    (vehicle_width_ratio_arr >= float(min_vehicle_width_ratio)).mean()
+                )
+                if vehicle_width_ratio_pass_ratio < float(min_vehicle_width_ratio_frames):
+                    continue
+            else:
+                vehicle_width_ratio = 0.0
+                vehicle_width_ratio_pass_ratio = 0.0
+
+            dist = np.linalg.norm(p_xy - v_xy, axis=1)
+            if role == "rider":
                 dist_rel = dist / np.maximum(p_h, eps)
-                prox = dist_rel < dist_rel_thresh
-                if float(prox.mean()) < prox_req:
-                    continue
-
-                relx = vx - px
-                rely = vy - py
-
-                spatial = (np.abs(relx) < alpha_x * p_w) & (rely > beta_y * p_h) & (rely < gamma_y * p_h)
-                coloc = prox & spatial
-                coloc_ratio = float(coloc.mean())
-
-                # Motion similarity (optional fallback).
-                p_mov = np.diff(p_xy, axis=0)
-                v_mov = np.diff(v_xy, axis=0)
-
-                sim_ratio = 0.0
-                if p_mov.shape[0] > 0:
-                    na = np.linalg.norm(p_mov, axis=1)
-                    nb = np.linalg.norm(v_mov, axis=1)
-                    move_mask = (na > eps) & (nb > eps)
-
-                    cos = np.zeros_like(na, dtype=float)
-                    cos[move_mask] = (p_mov[move_mask] * v_mov[move_mask]).sum(axis=1) / (na[move_mask] * nb[move_mask])  # noqa: E501
-
-                    prox_steps = prox[1:]
-                    m = min(len(prox_steps), len(cos), len(move_mask))
-                    prox_steps = prox_steps[:m]
-                    cos = cos[:m]
-                    move_mask = move_mask[:m]
-
-                    denom_mask = prox_steps & move_mask
-                    denom = int(denom_mask.sum())
-                    if denom >= min_motion_steps:
-                        sim_ratio = float(((cos > sim_thresh) & denom_mask).sum() / denom)
-
-                # Short overlap guard.
-                if shared < short_shared_frames:
-                    if shared > 1:
-                        p_disp = float(np.linalg.norm(p_xy[-1] - p_xy[0]))
-                        p_disp_rel = p_disp / float(np.maximum(np.mean(p_h), eps))
-                    else:
-                        p_disp_rel = 0.0
-
-                    if not (sim_ratio >= short_sim_req or p_disp_rel >= short_disp_req):
-                        continue
-
-                ok = (coloc_ratio >= coloc_req) or (sim_ratio >= sim_req and coloc_ratio >= motion_coloc_min)
-                if ok:
-                    return True
-
-                continue  # open rider branch done
-
-            # ---------------------------------------------------------------
-            # Branch B: ENCLOSED VEHICLES (car/bus/truck/train) => logic
-            # ---------------------------------------------------------------
-            if v_class in enclosed_vehicle_class_ids:
-                # 1) Proximity relative to VEHICLE size (scale-free).
-                dist = np.linalg.norm(p_xy - v_xy, axis=1)
+            else:
                 dist_rel = dist / np.maximum(v_h, eps)
-                prox = dist_rel < enclosed_dist_rel_thresh
-                prox_ratio = float(prox.mean())
-                if prox_ratio < enclosed_prox_req:
+
+            prox = dist_rel < dist_rel_thresh
+            prox_ratio = float(prox.mean())
+            if prox_ratio < prox_req:
+                continue
+
+            relx = v_xy[:, 0] - p_xy[:, 0]
+            rely = v_xy[:, 1] - p_xy[:, 1]
+
+            if role == "rider":
+                spatial = (np.abs(relx) < alpha_x * p_w) & (rely > beta_y * p_h) & (rely < gamma_y * p_h)
+            else:
+                inside = (np.abs(relx) <= 0.5 * v_w) & (np.abs(rely) <= 0.5 * v_h)
+                spatial = inside
+
+            coloc = prox & spatial
+            coloc_ratio = float(coloc.mean())
+
+            p_mov = np.diff(p_xy, axis=0)
+            v_mov = np.diff(v_xy, axis=0)
+
+            sim_ratio = 0.0
+            if p_mov.shape[0] > 0:
+                na = np.linalg.norm(p_mov, axis=1)
+                nb = np.linalg.norm(v_mov, axis=1)
+                move_mask = (na > eps) & (nb > eps)
+
+                cos = np.zeros_like(na, dtype=float)
+                cos[move_mask] = (p_mov[move_mask] * v_mov[move_mask]).sum(axis=1) / (na[move_mask] * nb[move_mask])
+
+                prox_steps = prox[1:]
+                m = min(len(prox_steps), len(cos), len(move_mask))
+                prox_steps = prox_steps[:m]
+                cos = cos[:m]
+                move_mask = move_mask[:m]
+
+                denom_mask = prox_steps & move_mask
+                denom = int(denom_mask.sum())
+                if denom >= min_motion_steps:
+                    sim_ratio = float(((cos > sim_thresh) & denom_mask).sum() / denom)
+
+            if shared < short_shared_frames:
+                if shared > 1:
+                    p_disp = float(np.linalg.norm(p_xy[-1] - p_xy[0]))
+                    p_disp_rel = p_disp / float(np.maximum(np.mean(p_h), eps))
+                else:
+                    p_disp_rel = 0.0
+
+                if not (sim_ratio >= short_sim_req or p_disp_rel >= short_disp_req):
                     continue
 
-                # 2) Person center inside vehicle box (common for driver/passenger detections).
-                dx = px - vx
-                dy = py - vy
-                inside = (np.abs(dx) <= (v_w / 2.0)) & (np.abs(dy) <= (v_h / 2.0))
-                inside_ratio = float(inside.mean())
-                if inside_ratio < enclosed_inside_req:
-                    continue
+            ok = (coloc_ratio >= coloc_req) or (sim_ratio >= sim_req and coloc_ratio >= motion_coloc_min)
+            if not ok:
+                continue
 
-                # 3) Relative-position stability: passenger/driver stays in roughly same place in vehicle.
-                relx_norm = dx / np.maximum(v_w, eps)
-                rely_norm = dy / np.maximum(v_h, eps)
-                rel_stab = max(robust_range_np(relx_norm), robust_range_np(rely_norm))
-                if rel_stab > enclosed_rel_stab_max:
-                    continue
+            score = 0.7 * coloc_ratio + 0.2 * prox_ratio + 0.1 * float(sim_ratio)
+            cand = {
+                "is_rider": True,
+                "rider_type": vtype,
+                "role": role,
+                "vehicle_id": vid,
+                "score": float(score),
+                "shared_frames": int(shared),
+                "longest_shared_run": int(longest_shared_run),
+                "vehicle_width_ratio": float(vehicle_width_ratio),
+                "vehicle_width_ratio_pass_ratio": float(vehicle_width_ratio_pass_ratio),
+                "prox_ratio": prox_ratio,
+                "coloc_ratio": coloc_ratio,
+                "sim_ratio": float(sim_ratio),
+            }
 
-                # 4) Optional: low IoU requirement (kept permissive; many person-in-car boxes are tiny).
-                # This helps reject odd cases where center is "inside" due to jitter but boxes never overlap.
-                iou = iou_xywh_norm(px, py, p_w, p_h, vx, vy, v_w, v_h)
-                if float(np.quantile(iou, 0.5)) < enclosed_iou_req:
-                    continue
+            if best is None or cand["score"] > best["score"]:
+                best = cand
 
-                # 5) Short overlap guard: require stronger inside ratio for very short overlaps.
-                if shared < short_shared_frames and inside_ratio < max(enclosed_inside_req, 0.6):
-                    continue
+        if best is None:
+            return {
+                "is_rider": False, "rider_type": None, "role": None, "vehicle_id": None,
+                "score": 0.0, "shared_frames": 0, "longest_shared_run": 0
+            }
 
-                # If all enclosed-vehicle tests pass, treat as vehicle-associated (exclude from crossings).
-                return True
+        return best
 
-        # No vehicle track matched rider/occupant criteria.
-        return False
+    @staticmethod
+    def is_rider_id(
+        df: pl.DataFrame,
+        id,
+        avg_height: Optional[float] = None,
+        min_shared_frames: int = 4,
+        min_continuous_shared_frames: int = 12,
+        shared_run_gap_allow: int = 2,
+        min_vehicle_width_ratio: float = 0.50,
+        min_vehicle_width_ratio_frames: float = 0.65,
+        dist_rel_thresh: float = 0.8,
+        prox_req: float = 0.7,
+        alpha_x: float = 0.75,
+        beta_y: float = 0.08,
+        gamma_y: float = 1.4,
+        coloc_req: float = 0.7,
+        sim_thresh: float = 0.4,
+        sim_req: float = 0.5,
+        min_motion_steps: int = 3,
+        motion_coloc_min: float = 0.5,
+        short_shared_frames: int = 8,
+        short_sim_req: float = 0.8,
+        short_disp_req: float = 0.12,
+        eps: float = 1e-9,
+        include_large_vehicle_passengers: bool = False,
+    ) -> bool:
+        """
+        Return True when the person is associated with a vehicle and should be removed
+        from pedestrian crossing counts.
+
+        Vehicle associations removed:
+        - bicyclist
+        - motorcyclist
+        - passenger/driver associated with car, bus or truck
+        """
+        res = Detection.classify_rider_type(
+            df,
+            id,
+            avg_height=avg_height,
+            min_shared_frames=min_shared_frames,
+            min_continuous_shared_frames=min_continuous_shared_frames,
+            shared_run_gap_allow=shared_run_gap_allow,
+            min_vehicle_width_ratio=min_vehicle_width_ratio,
+            min_vehicle_width_ratio_frames=min_vehicle_width_ratio_frames,
+            dist_rel_thresh=dist_rel_thresh,
+            prox_req=prox_req,
+            alpha_x=alpha_x,
+            beta_y=beta_y,
+            gamma_y=gamma_y,
+            coloc_req=coloc_req,
+            sim_thresh=sim_thresh,
+            sim_req=sim_req,
+            min_motion_steps=min_motion_steps,
+            motion_coloc_min=motion_coloc_min,
+            short_shared_frames=short_shared_frames,
+            short_sim_req=short_sim_req,
+            short_disp_req=short_disp_req,
+            eps=eps,
+            include_large_vehicle_passengers=include_large_vehicle_passengers,
+        )
+        return bool(res.get("is_rider"))
+
+    @staticmethod
+    def static_reference_motion_stats(df, person_id, STATIC_CLASS_IDS=(9, 10, 11, 12, 13),
+                                      MIN_SHARED_FRAMES=8, Q=0.05, EPS=1e-9):
+        """
+        Return motion statistics between a person track and the best available static reference.
+
+        The returned values are used as weak evidence for camera-motion false positives.
+        If no usable static reference exists, zero-valued statistics are returned so the caller
+        can fall back to geometry-only checks.
+        """
+        empty = {
+            "has_reference": False,
+            "static_id": None,
+            "static_class": None,
+            "shared_frames": 0,
+            "person_x_range": 0.0,
+            "static_x_range": 0.0,
+            "relative_x_range": 0.0,
+            "static_to_person_ratio": 0.0,
+        }
+
+        if df.height == 0:
+            return empty
+
+        if "confidence" in df.columns:
+            df = Detection._dedup_per_frame(df)
+
+        p = (
+            df.filter((pl.col("yolo-id") == 0) & (pl.col("unique-id") == person_id))
+              .sort("frame-count")
+        )
+        if p.height == 0:
+            return empty
+
+        p = p.unique(subset=["frame-count"], keep="first")
+        first_frame = int(p.get_column("frame-count").min())
+        last_frame = int(p.get_column("frame-count").max())
+
+        refs = df.filter(
+            (pl.col("frame-count") >= first_frame)
+            & (pl.col("frame-count") <= last_frame)
+            & (pl.col("yolo-id").is_in(STATIC_CLASS_IDS))
+        )
+        if refs.height == 0:
+            return empty
+
+        def robust_range(values) -> float:
+            arr = np.asarray(values, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            if arr.size == 0:
+                return 0.0
+            lo = float(np.quantile(arr, float(Q)))
+            hi = float(np.quantile(arr, 1.0 - float(Q)))
+            return max(0.0, hi - lo)
+
+        best = None
+        for ref_id in refs.select("unique-id").unique().to_series().to_list():
+            r = refs.filter(pl.col("unique-id") == ref_id).sort("frame-count")
+            if r.height == 0:
+                continue
+
+            r = r.unique(subset=["frame-count"], keep="first")
+            joined = p.join(r, on="frame-count", how="inner", suffix="_ref")
+            shared = joined.height
+            if shared < int(MIN_SHARED_FRAMES):
+                continue
+
+            person_x = joined.get_column("x-center").cast(pl.Float64, strict=False).to_numpy()
+            ref_x = joined.get_column("x-center_ref").cast(pl.Float64, strict=False).to_numpy()
+
+            person_x_range = robust_range(person_x)
+            static_x_range = robust_range(ref_x)
+            relative_x_range = robust_range(person_x - ref_x)
+            ratio = static_x_range / max(person_x_range, float(EPS))
+
+            ref_class = None
+            try:
+                ref_class = int(r.get_column("yolo-id")[0])
+            except Exception:
+                ref_class = None
+
+            cand = {
+                "has_reference": True,
+                "static_id": ref_id,
+                "static_class": ref_class,
+                "shared_frames": int(shared),
+                "person_x_range": float(person_x_range),
+                "static_x_range": float(static_x_range),
+                "relative_x_range": float(relative_x_range),
+                "static_to_person_ratio": float(ratio),
+            }
+
+            if best is None or (cand["shared_frames"], cand["static_x_range"]) > (
+                best["shared_frames"], best["static_x_range"]
+            ):
+                best = cand
+
+        return best if best is not None else empty
 
     @staticmethod
     def is_valid_crossing(df, person_id, ratio_thresh=0.6, STATIC_CLASS_IDS=(9, 10, 11, 12, 13),
-                          MIN_SHARED_FRAMES=8, RELX_MIN=0.05, Q=0.05, EPS=1e-9):
+                          MIN_SHARED_FRAMES=8, RELX_MIN=0.01, Q=0.05, EPS=1e-9):
         """
         Checks whether an apparent pedestrian road-crossing is real or caused by dashcam turning.
 

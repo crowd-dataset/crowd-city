@@ -80,41 +80,6 @@ class Dataset_Stats:
     # ----------------------------
     # Public methods (Polars inputs)
     # ----------------------------
-    def calculate_total_seconds_for_locality(self, df: pl.DataFrame, locality_name: str, state_name: str) -> int:
-        """Calculates the total number of seconds of video for a given locality and state.
-
-        Args:
-            df (pl.DataFrame): Must include `locality`, `state`, `start_time`, `end_time`.
-            locality_name (str): locality to match.
-            state_name (str): State to match; if "unknown", matches null/empty/"NA".
-
-        Returns:
-            int: Total duration seconds for the first matching row; 0 if no match.
-        """
-        if state_name.lower() == "unknown":
-            mask = (
-                (pl.col("locality") == locality_name)
-                & (
-                    pl.col("state").is_null()
-                    | (pl.col("state").cast(pl.Utf8).str.strip_chars() == "")
-                    | (pl.col("state").cast(pl.Utf8) == "NA")
-                )
-            )
-        else:
-            mask = (pl.col("locality") == locality_name) & (pl.col("state") == state_name)
-
-        row = df.filter(mask).select(["start_time", "end_time"]).head(1)
-        if row.height == 0:
-            return 0
-
-        start_s = row["start_time"][0]
-        end_s = row["end_time"][0]
-
-        start_times = self._parse_nested_list(start_s)
-        end_times = self._parse_nested_list(end_s)
-
-        return self._sum_durations(start_times, end_times)
-
     def calculate_total_seconds(self, df: pl.DataFrame) -> int:
         """Calculates total video duration (seconds) across the entire mapping DataFrame.
 
