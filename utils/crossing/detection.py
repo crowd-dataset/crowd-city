@@ -13,6 +13,84 @@ class Detection:
     def __init__(self) -> None:
         pass
 
+    @staticmethod
+    def _first_float(value, default: Optional[float] = None) -> Optional[float]:
+        """Return the first positive float found in a scalar, list-like value, or string."""
+        if value is None:
+            return default
+
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                found = Detection._first_float(item, None)
+                if found is not None and found > 0:
+                    return found
+            return default
+
+        try:
+            found = float(value)
+            if found > 0:
+                return found
+        except Exception:
+            pass
+
+        text = str(value)
+        for ch in "[](){}'\"":
+            text = text.replace(ch, " " )
+        text = text.replace(",", " " )
+        for token in text.split():
+            try:
+                found = float(token)
+                if found > 0:
+                    return found
+            except Exception:
+                continue
+        return default
+
+    @staticmethod
+    def _fps_from_video_key(video_id: str, default: Optional[float] = None) -> Optional[float]:
+        """Extract FPS from keys like videoId_startSeconds_fps, e.g. abc_31_30."""
+        try:
+            parts = str(video_id).rsplit("_", 2)
+            if len(parts) == 3:
+                return Detection._first_float(parts[-1], default)
+        except Exception:
+            pass
+        return default
+
+    @staticmethod
+    def _resolve_fps(fps: Optional[float], df_mapping, video_id: str, default: float = 30.0) -> float:
+        """Resolve FPS from explicit argument, mapping metadata, or video key suffix."""
+        value = Detection._first_float(fps, None)
+        if value is not None and value > 0:
+            return float(value)
+
+        value = Detection._fps_from_video_key(video_id, None)
+        if value is not None and value > 0:
+            return float(value)
+
+        try:
+            result = metadata.find_values_with_video_id(df_mapping, video_id)
+            if result is not None and len(result) > 17:
+                value = Detection._first_float(result[17], None)
+                if value is not None and value > 0:
+                    return float(value)
+        except Exception:
+            pass
+
+        return float(default)
+
+    @staticmethod
+    def _scale_frames(value: int, fps: float, base_fps: float = 30.0, minimum: int = 1) -> int:
+        """Scale a 30-fps calibrated frame threshold to the current FPS.
+
+        Example: 10 frames at 30 fps becomes 20 frames at 60 fps and 5 frames at 15 fps.
+        """
+        try:
+            scaled = int(round(float(value) * float(fps) / float(base_fps)))
+        except Exception:
+            scaled = int(value)
+        return max(int(minimum), int(scaled))
+
     def pedestrian_crossing(self, dataframe: pl.DataFrame, video_id: str, df_mapping, min_x: float, max_x: float,
                             person_id, tol: float = 0.00, min_track_frames: int = 10, min_road_frames: int = 3,
                             max_track_gap_frames: int = 30, min_crossing_x_range: float = 0.14,
@@ -46,8 +124,16 @@ class Detection:
                             tiny_no_static_height: float = 0.12,
                             tiny_no_static_width: float = 0.026,
                             tiny_no_static_min_road_frames: int = 10,
+                            no_static_tiny_min_road_frames: int = 5,
+                            no_static_tiny_fast_speed: float = 0.006,
                             slender_static_relx_min: float = 0.13,
-                            camera_tiny_height: float = 0.15
+                            camera_tiny_height: float = 0.15,
+                            fps: Optional[float] = None,
+                            base_fps: float = 30.0,
+                            min_static_shared_frames: int = 8,
+                            long_weak_road_frames: int = 90,
+                            jitter_road_frames: int = 40,
+                            camera_min_road_frames: int = 5
                             ) -> Tuple[List[Any], List[Any]]:
         """
         Identifies pedestrian tracks that satisfy a road-crossing criterion and filters false positives.
@@ -57,7 +143,34 @@ class Detection:
         - Keeps the candidate stage broad, then rejects weak geometry cases after rider filtering.
         - Relaxed long-road rejection so slow true crossings are not removed.
         - Applies rider filtering on the segment window, not on the whole video, to avoid ID-reuse artefacts.
+        - Scales all frame-count thresholds by fps/base_fps so 30 fps behaviour stays unchanged.
         """
+        fps_value = Detection._resolve_fps(fps, df_mapping, video_id, default=float(base_fps))
+        base_fps_value = max(float(base_fps), 1e-9)
+
+        # All *_frames inputs are calibrated for 30 fps by default.
+        # Scale them to preserve the same real-world time duration at different FPS values.
+        min_track_frames_s = Detection._scale_frames(min_track_frames, fps_value, base_fps_value, minimum=1)
+        min_road_frames_s = Detection._scale_frames(min_road_frames, fps_value, base_fps_value, minimum=1)
+        max_track_gap_frames_s = Detection._scale_frames(max_track_gap_frames, fps_value, base_fps_value, minimum=0)
+        low_x_min_road_frames_s = Detection._scale_frames(low_x_min_road_frames, fps_value, base_fps_value, minimum=1)
+        tiny_long_track_road_frames_s = Detection._scale_frames(tiny_long_track_road_frames, fps_value, base_fps_value, minimum=1)
+        slender_track_min_road_frames_s = Detection._scale_frames(slender_track_min_road_frames, fps_value, base_fps_value, minimum=1)
+        slender_track_max_road_frames_s = Detection._scale_frames(slender_track_max_road_frames, fps_value, base_fps_value, minimum=1)
+        no_static_slender_max_road_frames_s = Detection._scale_frames(no_static_slender_max_road_frames, fps_value, base_fps_value, minimum=1)
+        tiny_no_static_min_road_frames_s = Detection._scale_frames(tiny_no_static_min_road_frames, fps_value, base_fps_value, minimum=1)
+        no_static_tiny_min_road_frames_s = Detection._scale_frames(no_static_tiny_min_road_frames, fps_value, base_fps_value, minimum=1)
+        min_static_shared_frames_s = Detection._scale_frames(min_static_shared_frames, fps_value, base_fps_value, minimum=1)
+        long_weak_road_frames_s = Detection._scale_frames(long_weak_road_frames, fps_value, base_fps_value, minimum=1)
+        jitter_road_frames_s = Detection._scale_frames(jitter_road_frames, fps_value, base_fps_value, minimum=1)
+        camera_min_road_frames_s = Detection._scale_frames(camera_min_road_frames, fps_value, base_fps_value, minimum=1)
+
+        rider_min_shared_frames_s = Detection._scale_frames(4, fps_value, base_fps_value, minimum=1)
+        rider_min_continuous_shared_frames_s = Detection._scale_frames(12, fps_value, base_fps_value, minimum=1)
+        rider_shared_run_gap_allow_s = Detection._scale_frames(2, fps_value, base_fps_value, minimum=0)
+        rider_min_motion_steps_s = Detection._scale_frames(3, fps_value, base_fps_value, minimum=1)
+        rider_short_shared_frames_s = Detection._scale_frames(8, fps_value, base_fps_value, minimum=1)
+
         crossed_df = dataframe.filter(pl.col("yolo-id") == 0)
         if crossed_df.height == 0:
             return [], []
@@ -88,7 +201,7 @@ class Detection:
             segments: List[pl.DataFrame] = []
             start_idx = 0
             prev_frame = int(frames[0])
-            max_gap = max(int(max_track_gap_frames), 0)
+            max_gap = max(int(max_track_gap_frames_s), 0)
 
             for idx in range(1, len(frames)):
                 frame = int(frames[idx])
@@ -132,7 +245,7 @@ class Detection:
             return states
 
         def segment_is_candidate(seg: pl.DataFrame) -> bool:
-            if seg.height < int(min_track_frames):
+            if seg.height < int(min_track_frames_s):
                 return False
 
             x = seg.get_column("x-center").cast(pl.Float64, strict=False).to_numpy()
@@ -145,7 +258,7 @@ class Detection:
             is_road = states == 1
             is_right = states == 2
 
-            if int(is_road.sum()) < int(min_road_frames):
+            if int(is_road.sum()) < int(min_road_frames_s):
                 return False
 
             left_before = np.maximum.accumulate(is_left)
@@ -163,7 +276,7 @@ class Detection:
 
         for uid in uids:
             tr = tracks.filter(pl.col("unique-id") == uid).sort("frame-count")
-            if tr.height < int(min_track_frames):
+            if tr.height < int(min_track_frames_s):
                 continue
 
             for seg in split_segments(tr):
@@ -220,10 +333,19 @@ class Detection:
                 & (pl.col("frame-count") <= int(end_frame))
             )
 
-            if Detection.is_rider_id(segment_df, uid, avg_height):
+            if Detection.is_rider_id(
+                segment_df,
+                uid,
+                avg_height,
+                min_shared_frames=rider_min_shared_frames_s,
+                min_continuous_shared_frames=rider_min_continuous_shared_frames_s,
+                shared_run_gap_allow=rider_shared_run_gap_allow_s,
+                min_motion_steps=rider_min_motion_steps_s,
+                short_shared_frames=rider_short_shared_frames_s,
+            ):
                 continue
 
-            static_stats = Detection.static_reference_motion_stats(segment_df, uid)
+            static_stats = Detection.static_reference_motion_stats(segment_df, uid, MIN_SHARED_FRAMES=min_static_shared_frames_s)
             static_shared = int(static_stats.get("shared_frames", 0) or 0)
             static_sx_range = float(static_stats.get("static_x_range", 0.0) or 0.0)
             static_relx_range = float(static_stats.get("relative_x_range", 0.0) or 0.0)
@@ -237,17 +359,17 @@ class Detection:
 
             # Small x-range can still be valid if the person clearly spends time inside the road band.
             # Reject only short road-band contacts.
-            if float(x_range) < float(low_x_range) and int(road_frames) < int(low_x_min_road_frames):
+            if float(x_range) < float(low_x_range) and int(road_frames) < int(low_x_min_road_frames_s):
                 continue
 
             # Long weak tracks sitting in the road band are usually background/camera artefacts rather
             # than pedestrians crossing laterally.
-            if float(x_range) < float(weak_crossing_x_range) and int(road_frames) > 90:
+            if float(x_range) < float(weak_crossing_x_range) and int(road_frames) > int(long_weak_road_frames_s):
                 continue
 
             # Some fake crossings are unstable tiny/background tracks: they appear to cross laterally,
             # but their vertical trajectory jitters heavily while staying weak in x-range.
-            if float(x_range) < 0.56 and int(road_frames) > 40 and float(y_gross_motion) > 0.30:
+            if float(x_range) < 0.56 and int(road_frames) > int(jitter_road_frames_s) and float(y_gross_motion) > 0.30:
                 continue
 
             # Weak tracks with strong vertical jitter are often tracker or camera artefacts rather than
@@ -263,18 +385,23 @@ class Detection:
             if (
                 float(x_range) < float(tiny_long_track_x_range)
                 and float(median_height) < float(tiny_long_track_height)
-                and int(road_frames) >= int(tiny_long_track_road_frames)
+                and int(road_frames) >= int(tiny_long_track_road_frames_s)
             ):
                 continue
 
-            # If there is no static reference at all, only reject very small/slender tracks. This keeps
-            # real pedestrians such as the second-video uid 3489, while still removing no-reference
-            # background tracks such as uid 13658 and uid 343.
+            # If there is no static reference at all, very tiny tracks are risky because the camera-motion
+            # check has no anchor. Reject them for both long road-band contact and short fast edge flicker.
+            # This catches third-video fake crossings such as uid 2693 and uid 3128 while preserving
+            # labelled small real crossings that have static-reference evidence, e.g. uid 17227.
             if (
-                static_shared < 8
+                static_shared < int(min_static_shared_frames_s)
                 and float(median_height) <= float(tiny_no_static_height)
                 and float(median_width) <= float(tiny_no_static_width)
-                and int(road_frames) >= int(tiny_no_static_min_road_frames)
+                and (
+                    int(road_frames) >= int(tiny_no_static_min_road_frames_s)
+                    or int(road_frames) >= int(no_static_tiny_min_road_frames_s)
+                    or float(x_speed) >= float(no_static_tiny_fast_speed)
+                )
             ):
                 continue
 
@@ -282,7 +409,7 @@ class Detection:
             # or the person-static relative motion is genuinely tiny. The earlier v4 rule used relx<=0.22
             # and height<=0.18, which rejected true crossings such as uids 3439 and 3464.
             if static_sx_range >= float(camera_static_sx) and static_ratio >= float(camera_static_ratio):
-                if float(median_height) <= float(camera_tiny_height) and int(road_frames) >= 5:
+                if float(median_height) <= float(camera_tiny_height) and int(road_frames) >= int(camera_min_road_frames_s):
                     continue
                 if (
                     static_relx_range <= float(camera_static_tiny_relx)
@@ -300,12 +427,12 @@ class Detection:
             if (
                 float(median_width) <= float(slender_track_width)
                 and float(median_height) < float(slender_track_height)
-                and int(slender_track_min_road_frames) <= int(road_frames) <= int(slender_track_max_road_frames)
+                and int(slender_track_min_road_frames_s) <= int(road_frames) <= int(slender_track_max_road_frames_s)
             ):
-                if static_shared < 8:
+                if static_shared < int(min_static_shared_frames_s):
                     if (
                         float(median_height) < float(no_static_slender_height)
-                        and int(road_frames) <= int(no_static_slender_max_road_frames)
+                        and int(road_frames) <= int(no_static_slender_max_road_frames_s)
                     ):
                         continue
                 else:
@@ -323,7 +450,7 @@ class Detection:
             if (
                 float(x_range) > float(large_lateral_x_range)
                 and float(median_height) < float(large_lateral_tiny_height)
-                and int(road_frames) >= 5
+                and int(road_frames) >= int(camera_min_road_frames_s)
                 and static_sx_range >= float(camera_static_sx)
                 and static_ratio >= float(camera_static_ratio)
                 and static_relx_range < 0.20
@@ -336,7 +463,7 @@ class Detection:
                 if float(x_speed) > float(max_crossing_speed_per_frame):
                     continue
 
-            if not Detection.is_valid_crossing(segment_df, uid):
+            if not Detection.is_valid_crossing(segment_df, uid, MIN_SHARED_FRAMES=min_static_shared_frames_s):
                 continue
 
             if uid not in pedestrian_ids:
