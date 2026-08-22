@@ -52,9 +52,7 @@ class Youtube_Helper:
         self.video_title (str): The title of the video.
         """
         self.tracking_model = common.get_configs("tracking_model")
-        self.segment_model = common.get_configs("segment_model")
         self.bbox_tracker = common.get_configs("bbox_tracker")
-        self.seg_tracker = common.get_configs("seg_tracker")
         self.resolution = None
         self.mapping = pd.read_csv(common.get_configs("mapping"))
         self.confidence = 0.0
@@ -65,9 +63,6 @@ class Youtube_Helper:
         self.save_tracked_img = common.get_configs("save_tracked_img")
         self.delete_labels = common.get_configs("delete_labels")
         self.delete_frames = common.get_configs("delete_frames")
-        self.update_package = common.get_configs("update_package")
-        self.need_authentication = common.get_configs("need_authentication")
-        self.client = common.get_configs("client")
 
     def download_videos_from_ftp(self, filename: str, base_url: Optional[str] = None, out_dir: str = ".",
                                  username: Optional[str] = None, password: Optional[str] = None,

@@ -82,7 +82,7 @@ file_results: str = "results.pickle"
 video_paths = common.get_configs("videos")
 
 # Common junk files/folders to ignore.
-MISC_FILES: Set[str] = {"DS_Store", "seg", "bbox"}
+MISC_FILES: Set[str] = {"DS_Store", "seg", "bbox", "._bbox"}
 
 
 class Analysis():
@@ -1755,6 +1755,144 @@ def log_rollups(df_mapping: "pl.DataFrame") -> None:
     logger.info(f"\nMAX:\n{_df_full_str(top_ctry_t)}\nMIN (non-zero):\n{_df_full_str(bot_ctry_t)}")
 
 
+def _environment_truthy(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable without adding command parsing."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return default
+
+
+def _build_integrated_speed_sources(
+    df_mapping_source: "pl.DataFrame",
+    crossing_tracks: Dict[str, object],
+) -> list[dict[str, object]]:
+    """Map processed CROWD bbox CSV files to their city and crossing IDs."""
+    csv_by_source: Dict[str, str] = {}
+    for data_root in common.get_configs("data"):
+        bbox_root = os.path.join(os.fspath(data_root), "bbox")
+        if not os.path.isdir(bbox_root):
+            continue
+        for file_name in os.listdir(bbox_root):
+            if not file_name.lower().endswith(".csv"):
+                continue
+            clean_name = tools.clean_csv_filename(file_name)
+            source_id = os.path.splitext(clean_name)[0]
+            csv_by_source[source_id] = os.path.join(bbox_root, file_name)
+
+    aspect_ratio_text = os.environ.get("CROWD_BBOX_ASPECT_RATIO", str(16.0 / 9.0))
+    try:
+        aspect_ratio = float(aspect_ratio_text)
+    except (TypeError, ValueError):
+        aspect_ratio = 16.0 / 9.0
+    if not math.isfinite(aspect_ratio) or aspect_ratio <= 0.0:
+        aspect_ratio = 16.0 / 9.0
+
+    output: list[dict[str, object]] = []
+    for source_id, payload in crossing_tracks.items():
+        bbox_csv = csv_by_source.get(str(source_id))
+        if bbox_csv is None:
+            logger.warning(
+                f"Crossing motion report cannot find the bbox CSV for {source_id}; skipping."
+            )
+            continue
+        try:
+            video_id, start_text, fps_text = str(source_id).rsplit("_", 2)
+            start_index = int(float(start_text))
+            fps = float(fps_text)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Crossing motion report expected video_start_fps but received {source_id}; skipping."
+            )
+            continue
+        locality_id = geo.find_locality_id(df_mapping_source, video_id, start_index)
+        if locality_id is None:
+            logger.warning(
+                f"Crossing motion report cannot map {source_id} to a CROWD city; skipping."
+            )
+            continue
+        location = df_mapping_source.filter(pl.col("id") == locality_id).head(1)
+        if location.height == 0:
+            continue
+        row = location.row(0, named=True)
+        ids: object = []
+        if isinstance(payload, dict):
+            ids = payload.get("ids", [])
+        if ids is None:
+            ids = []
+        elif not isinstance(ids, (list, tuple, set)):
+            ids = [ids]
+        output.append(
+            {
+                "source_id": str(source_id),
+                "bbox_csv": bbox_csv,
+                "fps": fps,
+                "aspect_ratio": aspect_ratio,
+                "locality": row.get("locality") or "Unknown",
+                "state": row.get("state") or "",
+                "country": row.get("country") or "Unknown",
+                "crossing_track_ids": list(ids),
+            }
+        )
+    return output
+
+
+def _run_integrated_speed_reporting(
+    df_mapping_source: "pl.DataFrame",
+    crossing_tracks: Dict[str, object],
+) -> None:
+    """Create CROWD city reports and optional processed Waymo figures."""
+    if not _environment_truthy("CROWD_SPEED_REPORT", True):
+        logger.info("Integrated crossing motion report disabled by CROWD_SPEED_REPORT.")
+        return
+    try:
+        from utils.crossing.metrics import (
+            ensure_waymo_processed,
+            run_integrated_speed_report,
+        )
+
+        output_root = os.environ.get(
+            "CROWD_SPEED_REPORT_OUTPUT",
+            os.path.join(common.output_dir, "crossing_speed"),
+        )
+        waymo_roots = ensure_waymo_processed(
+            raw_dataset_path=common.get_configs("waymo_dataset_path"),
+            repository_root=common.root_dir,
+            output_root=common.output_dir,
+            process_if_missing=bool(
+                common.get_configs("process_waymo_if_missing")
+            ),
+            log=lambda message: logger.info(message),
+        )
+        summary = run_integrated_speed_report(
+            crowd_sources=_build_integrated_speed_sources(
+                df_mapping_source,
+                crossing_tracks,
+            ),
+            repository_root=common.root_dir,
+            output_root=output_root,
+            waymo_roots=waymo_roots or None,
+            force=_environment_truthy("CROWD_SPEED_REPORT_FORCE", False),
+            log=lambda message: logger.info(message),
+        )
+        crowd_summary = summary.get("crowd", {})
+        logger.info(
+            "CROWD crossing motion report: "
+            f"cities={crowd_summary.get('cities_analysed', 0)}, "
+            f"crossings={crowd_summary.get('detected_crossing_tracks', 0)}, "
+            f"valid={crowd_summary.get('valid_relative_motion_tracks', 0)}."
+        )
+        if summary.get("waymo", {}).get("status") == "skipped":
+            logger.info("Waymo report skipped because processed Waymo files were not found.")
+    except Exception as error:
+        logger.error(f"Integrated crossing motion reporting failed: {error}")
+
+
 # Execute analysis
 if __name__ == "__main__":
     logger.info("Analysis started.")
@@ -3425,6 +3563,10 @@ if __name__ == "__main__":
     os.makedirs(common.output_dir, exist_ok=True)
     df_mapping.write_csv(os.path.join(common.output_dir, "mapping_updated.csv"))
 
+    # CROWD is always analysed. Optional Waymo preparation is controlled by
+    # config and cannot stop the CROWD report when Waymo is unavailable.
+    _run_integrated_speed_reporting(df_mapping_raw, pedestrian_crossing_count)
+
     logger.info("Detected:")
     logger.info(f"person: {person_counter}; bicycle: {bicycle_counter}; car: {car_counter}")
     logger.info(f"motorcycle: {motorcycle_counter}; bus: {bus_counter}; truck: {truck_counter}")
@@ -3611,7 +3753,7 @@ if __name__ == "__main__":
                            order_by="alphabetical",
                            metric="speed",
                            data_view="combined",
-                           title_text="Mean speed of crossing (in m/s)",
+                           title_text="Mean relative crossing motion index",
                            filename="speed_crossing_alphabetical",
                            font_size_captions=common.get_configs("font_size") + 8,
                            left_margin=80,
@@ -3622,7 +3764,7 @@ if __name__ == "__main__":
                            order_by="alphabetical",
                            metric="speed",
                            data_view="day",
-                           title_text="Mean speed of crossing (in m/s)",
+                           title_text="Mean relative crossing motion index",
                            filename="speed_crossing_alphabetical_day",
                            font_size_captions=common.get_configs("font_size") + 8,
                            left_margin=80,
@@ -3633,7 +3775,7 @@ if __name__ == "__main__":
                            order_by="alphabetical",
                            metric="speed",
                            data_view="night",
-                           title_text="Mean speed of crossing (in m/s)",
+                           title_text="Mean relative crossing motion index",
                            filename="speed_crossing_alphabetical_night",
                            font_size_captions=common.get_configs("font_size") + 8,
                            left_margin=80,
@@ -3644,7 +3786,7 @@ if __name__ == "__main__":
                            order_by="average",
                            metric="speed",
                            data_view="combined",
-                           title_text="Mean speed of crossing (in m/s)",
+                           title_text="Mean relative crossing motion index",
                            filename="speed_crossing_avg",
                            font_size_captions=common.get_configs("font_size") + 8,
                            left_margin=10,
@@ -3655,7 +3797,7 @@ if __name__ == "__main__":
                            order_by="average",
                            metric="speed",
                            data_view="day",
-                           title_text="Mean speed of crossing (in m/s)",
+                           title_text="Mean relative crossing motion index",
                            filename="speed_crossing_avg_day",
                            font_size_captions=common.get_configs("font_size") + 8,
                            left_margin=10,
@@ -3666,7 +3808,7 @@ if __name__ == "__main__":
                            order_by="average",
                            metric="speed",
                            data_view="night",
-                           title_text="Mean speed of crossing (in m/s)",
+                           title_text="Mean relative crossing motion index",
                            filename="speed_crossing_avg_night",
                            font_size_captions=common.get_configs("font_size") + 8,
                            left_margin=10,
@@ -3691,7 +3833,7 @@ if __name__ == "__main__":
                           y="time_crossing",
                           color="continent",
                           text="locality",
-                          xaxis_title='Speed of crossing (in m/s)',
+                          xaxis_title='Relative crossing motion index',
                           yaxis_title='Crossing initiation time (in s)',
                           pretty_text=False,
                           marker_size=10,
@@ -3715,7 +3857,7 @@ if __name__ == "__main__":
                           y="time_crossing_day",
                           color="continent",
                           text="locality",
-                          xaxis_title='Crossing speed during daytime (in m/s)',
+                          xaxis_title='Relative crossing motion index during daytime',
                           yaxis_title='Crossing initiation time during daytime (in s)',
                           pretty_text=False,
                           marker_size=10,
@@ -3738,7 +3880,7 @@ if __name__ == "__main__":
                           y="time_crossing_night",
                           color="continent",
                           text="locality",
-                          xaxis_title='Crossing speed during night time (in m/s)',
+                          xaxis_title='Relative crossing motion index during night time',
                           yaxis_title='Crossing initiation time during night time (in s)',
                           pretty_text=False,
                           marker_size=10,
@@ -3784,7 +3926,7 @@ if __name__ == "__main__":
                           y="population_locality",
                           color="continent",
                           text="locality",
-                          xaxis_title='Mean speed of crossing (in m/s)',
+                          xaxis_title='Mean relative crossing motion index',
                           yaxis_title='Population of locality',
                           pretty_text=False,
                           marker_size=10,
@@ -3830,7 +3972,7 @@ if __name__ == "__main__":
                           y="traffic_mortality",
                           color="continent",
                           text="locality",
-                          xaxis_title='Mean speed of crossing (in m/s)',
+                          xaxis_title='Mean relative crossing motion index',
                           yaxis_title='National traffic mortality rate (per 100,000 of population)',
                           pretty_text=False,
                           marker_size=10,
@@ -3876,7 +4018,7 @@ if __name__ == "__main__":
                           y="literacy_rate",
                           color="continent",
                           text="locality",
-                          xaxis_title='Mean speed of crossing (in m/s)',
+                          xaxis_title='Mean relative crossing motion index',
                           yaxis_title='Literacy rate',
                           pretty_text=False,
                           marker_size=10,
@@ -3922,7 +4064,7 @@ if __name__ == "__main__":
                           y="gini",
                           color="continent",
                           text="locality",
-                          xaxis_title='Mean speed of crossing (in m/s)',
+                          xaxis_title='Mean relative crossing motion index',
                           yaxis_title='Gini coefficient',
                           pretty_text=False,
                           marker_size=10,
@@ -3969,7 +4111,7 @@ if __name__ == "__main__":
                           y="traffic_index",
                           color="continent",
                           text="locality",
-                          xaxis_title='Mean speed of crossing (in m/s)',
+                          xaxis_title='Mean relative crossing motion index',
                           yaxis_title='Traffic index',
                           pretty_text=False,
                           marker_size=10,
@@ -4015,7 +4157,7 @@ if __name__ == "__main__":
                           y="cellphone_normalised",
                           color="continent",
                           text="locality",
-                          xaxis_title='Mean speed of crossing (in m/s)',
+                          xaxis_title='Mean relative crossing motion index',
                           yaxis_title='Mobile phones detected (normalised over time)',
                           pretty_text=False,
                           marker_size=10,
@@ -4246,7 +4388,7 @@ if __name__ == "__main__":
                                    order_by="condition",
                                    metric="speed",
                                    data_view="combined",
-                                   title_text="Mean speed of crossing (in m/s)",
+                                   title_text="Mean relative crossing motion index",
                                    filename="crossing_speed_combined_country",
                                    font_size_captions=common.get_configs("font_size") + 28,
                                    legend_x=0.92,
@@ -4274,7 +4416,7 @@ if __name__ == "__main__":
                                    order_by="condition",
                                    metric="speed",
                                    data_view="combined",
-                                   title_text="Mean speed of crossing (in m/s)",
+                                   title_text="Mean relative crossing motion index",
                                    filename="crossing_speed_combined_country_raw",
                                    font_size_captions=common.get_configs("font_size") + 28,
                                    raw=True,
@@ -4316,7 +4458,7 @@ if __name__ == "__main__":
                                    order_by="average",
                                    metric="speed",
                                    data_view="combined",
-                                   title_text="Mean speed of crossing (in m/s)",
+                                   title_text="Mean relative crossing motion index",
                                    filename="crossing_speed_avg_country",
                                    font_size_captions=common.get_configs("font_size") + 8,
                                    legend_x=0.87,
@@ -4328,7 +4470,7 @@ if __name__ == "__main__":
                                    order_by="alphabetical",
                                    metric="speed",
                                    data_view="combined",
-                                   title_text="Mean speed of crossing (in m/s)",
+                                   title_text="Mean relative crossing motion index",
                                    filename="crossing_speed_alphabetical_country",
                                    font_size_captions=common.get_configs("font_size"),
                                    legend_x=0.94,
@@ -4359,7 +4501,7 @@ if __name__ == "__main__":
                                    order_by="average",
                                    metric="speed",
                                    data_view="day",
-                                   title_text="Mean speed of crossing (in m/s)",
+                                   title_text="Mean relative crossing motion index",
                                    filename="crossing_speed_avg_day_country",
                                    font_size_captions=common.get_configs("font_size"),
                                    top_margin=100)
@@ -4368,7 +4510,7 @@ if __name__ == "__main__":
                                    order_by="alphabetical",
                                    metric="speed",
                                    data_view="day",
-                                   title_text="Mean speed of crossing (in m/s)",
+                                   title_text="Mean relative crossing motion index",
                                    filename="crossing_speed_alphabetical_day_country",
                                    font_size_captions=common.get_configs("font_size"),
                                    top_margin=100)
@@ -4395,7 +4537,7 @@ if __name__ == "__main__":
                                    order_by="average",
                                    metric="speed",
                                    data_view="night",
-                                   title_text="Mean speed of crossing (in m/s)",
+                                   title_text="Mean relative crossing motion index",
                                    filename="crossing_speed_avg_night_country",
                                    font_size_captions=common.get_configs("font_size"),
                                    top_margin=100)
@@ -4404,7 +4546,7 @@ if __name__ == "__main__":
                                    order_by="alphabetical",
                                    metric="speed",
                                    data_view="night",
-                                   title_text="Mean speed of crossing (in m/s)",
+                                   title_text="Mean relative crossing motion index",
                                    filename="crossing_speed_alphabetical_night_country",
                                    font_size_captions=common.get_configs("font_size"),
                                    top_margin=100)
@@ -4433,7 +4575,7 @@ if __name__ == "__main__":
                           y="time_crossing_day_night_country_avg",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Mean speed of crossing (in m/s)',
+                          xaxis_title='Mean relative crossing motion index',
                           yaxis_title='Crossing initiation time (s)',
                           pretty_text=False,
                           marker_size=10,
@@ -4456,7 +4598,7 @@ if __name__ == "__main__":
                           y="time_crossing_day_country",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Crossing speed during daytime (in m/s)',
+                          xaxis_title='Relative crossing motion index during daytime',
                           yaxis_title='Crossing initiation time during daytime (in s)',
                           pretty_text=False,
                           marker_size=10,
@@ -4479,7 +4621,7 @@ if __name__ == "__main__":
                           y="time_crossing_night_country",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Crossing speed during night time (in m/s)',
+                          xaxis_title='Relative crossing motion index during night time',
                           yaxis_title='Crossing initiation time during night time (in s)',
                           pretty_text=False,
                           marker_size=10,
@@ -4525,7 +4667,7 @@ if __name__ == "__main__":
                           y="population_country",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Mean speed of crossing (in m/s)',
+                          xaxis_title='Mean relative crossing motion index',
                           yaxis_title='Population of country',
                           pretty_text=False,
                           marker_size=10,
@@ -4571,7 +4713,7 @@ if __name__ == "__main__":
                           y="traffic_mortality",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Mean speed of crossing (in m/s)',
+                          xaxis_title='Mean relative crossing motion index',
                           yaxis_title='National traffic mortality rate (per 100,000 of population)',
                           pretty_text=False,
                           marker_size=10,
@@ -4617,7 +4759,7 @@ if __name__ == "__main__":
                           y="literacy_rate",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Mean speed of crossing (in m/s)',
+                          xaxis_title='Mean relative crossing motion index',
                           yaxis_title='Literacy rate',
                           pretty_text=False,
                           marker_size=10,
@@ -4663,7 +4805,7 @@ if __name__ == "__main__":
                           y="gini",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Mean speed of crossing (in m/s)',
+                          xaxis_title='Mean relative crossing motion index',
                           yaxis_title='Gini coefficient',
                           pretty_text=False,
                           marker_size=10,
@@ -4710,7 +4852,7 @@ if __name__ == "__main__":
                           y="med_age",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Mean speed of crossing (in m/s)',
+                          xaxis_title='Mean relative crossing motion index',
                           yaxis_title='Median age (in years)',
                           pretty_text=False,
                           marker_size=10,
@@ -4758,7 +4900,7 @@ if __name__ == "__main__":
                           y="cellphone_normalised",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Mean speed of crossing (in m/s)',
+                          xaxis_title='Mean relative crossing motion index',
                           yaxis_title='Mobile phones detected (normalised over time)',
                           pretty_text=False,
                           marker_size=10,
@@ -4775,7 +4917,7 @@ if __name__ == "__main__":
         # Mean speed of crossing (used to be plots_class.map)
         maps.map_world(df=df_countries.to_pandas(),
                        color="speed_crossing_day_night_country_avg",
-                       title="Mean speed of crossing (in m/s)",
+                       title="Mean relative crossing motion index",
                        show_colorbar=True,
                        colorbar_title="",                 # keep your empty title behavior
                        filter_zero_nan=True,              # preserves old map() filtering
@@ -4895,8 +5037,14 @@ if __name__ == "__main__":
             else:
                 logger.info("No non-zero speed rows found; cannot compute min non-zero speed.")
 
-            logger.info(f"Mean speed while crossing (non-zero): {float(speed_mean) if speed_mean is not None else float('nan'):.2f}")  # noqa: E501
-            logger.info(f"Standard deviation of speed while crossing (non-zero): {float(speed_std) if speed_std is not None else float('nan'):.2f}")  # noqa: E501
+            logger.info(
+                "Mean relative crossing motion index (non-zero): "
+                f"{float(speed_mean) if speed_mean is not None else float('nan'):.2f}"
+            )
+            logger.info(
+                "Standard deviation of relative crossing motion index (non-zero): "
+                f"{float(speed_std) if speed_std is not None else float('nan'):.2f}"
+            )
 
             if max_time_idx is not None:
                 max_time_country = _row_value(df_countries, int(max_time_idx), "country")

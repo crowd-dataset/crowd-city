@@ -96,7 +96,7 @@ class Crossings:
                 locality_state = grouping_class.process_locality_string(locality, df_mapping)
                 logger.info(f"{locality_state}: {diff}")
         else:
-            logger.info("No valid speed_0 and speed_1 values found for comparison.")
+            logger.info("No valid relative crossing motion values found for comparison.")
 
         # Extract all valid time_0 and time_1 values along with their corresponding cities
         diff_time_values = [(locality, abs(data['time_0'] - data['time_1']))
@@ -134,8 +134,16 @@ class Crossings:
             max_speed_value_0 = filtered_dict_s_0[max_speed_locality_0]["speed_0"]
             min_speed_value_0 = filtered_dict_s_0[min_speed_locality_0]["speed_0"]
 
-            logger.info(f"locality with max speed at day: {grouping_class.process_locality_string(max_speed_locality_0, df_mapping)} with speed of {max_speed_value_0} m/s")  # noqa:E501
-            logger.info(f"locality with min speed at day: {grouping_class.process_locality_string(min_speed_locality_0, df_mapping)} with speed of {min_speed_value_0} m/s")  # noqa:E501
+            logger.info(
+                "locality with maximum relative crossing motion during daytime: "
+                f"{grouping_class.process_locality_string(max_speed_locality_0, df_mapping)} "
+                f"with index {max_speed_value_0}"
+            )
+            logger.info(
+                "locality with minimum relative crossing motion during daytime: "
+                f"{grouping_class.process_locality_string(min_speed_locality_0, df_mapping)} "
+                f"with index {min_speed_value_0}"
+            )
 
         if filtered_dict_s_1:
             max_speed_locality_1 = max(filtered_dict_s_1, key=lambda locality: filtered_dict_s_1[locality]["speed_1"])
@@ -143,8 +151,16 @@ class Crossings:
             max_speed_value_1 = filtered_dict_s_1[max_speed_locality_1]["speed_1"]
             min_speed_value_1 = filtered_dict_s_1[min_speed_locality_1]["speed_1"]
 
-            logger.info(f"locality with max speed at night: {grouping_class.process_locality_string(max_speed_locality_1, df_mapping)} with speed of {max_speed_value_1} m/s")  # noqa:E501
-            logger.info(f"locality with min speed at night: {grouping_class.process_locality_string(min_speed_locality_1, df_mapping)} with speed of {min_speed_value_1} m/s")  # noqa:E501
+            logger.info(
+                "locality with maximum relative crossing motion at night: "
+                f"{grouping_class.process_locality_string(max_speed_locality_1, df_mapping)} "
+                f"with index {max_speed_value_1}"
+            )
+            logger.info(
+                "locality with minimum relative crossing motion at night: "
+                f"{grouping_class.process_locality_string(min_speed_locality_1, df_mapping)} "
+                f"with index {min_speed_value_1}"
+            )
 
         # Find locality with max and min time_0 and time_1
         if filtered_dict_t_0:
@@ -174,18 +190,18 @@ class Crossings:
         if speed_0_values:
             mean_speed_0 = statistics.mean(speed_0_values)
             sd_speed_0 = statistics.stdev(speed_0_values) if len(speed_0_values) > 1 else 0
-            logger.info(f"Mean of speed during day time: {mean_speed_0}")
-            logger.info(f"Standard deviation of speed during day time: {sd_speed_0}")
+            logger.info(f"Mean relative crossing motion during daytime: {mean_speed_0}")
+            logger.info(f"Standard deviation of relative crossing motion during daytime: {sd_speed_0}")
         else:
-            logger.error("No valid speed during day time values found.")
+            logger.error("No valid relative crossing motion values found for daytime.")
 
         if speed_1_values:
             mean_speed_1 = statistics.mean(speed_1_values)
             sd_speed_1 = statistics.stdev(speed_1_values) if len(speed_1_values) > 1 else 0
-            logger.info(f"Mean of speed during night time: {mean_speed_1}")
-            logger.info(f"Standard deviation of speed during night time: {sd_speed_1}")
+            logger.info(f"Mean relative crossing motion at night: {mean_speed_1}")
+            logger.info(f"Standard deviation of relative crossing motion at night: {sd_speed_1}")
         else:
-            logger.error("No valid speed during night time values found.")
+            logger.error("No valid relative crossing motion values found for night.")
 
         if time_0_values:
             mean_time_0 = statistics.mean(time_0_values)
@@ -427,7 +443,7 @@ class Crossings:
 
         # Set the x-axis labels (title_text) only for the last row and the first row
         fig.update_xaxes(
-            title=dict(text="Mean speed of crossing (in m/s)", font=dict(size=font_size_captions)),
+            title=dict(text="Mean relative crossing motion index", font=dict(size=font_size_captions)),
             tickfont=dict(size=font_size_captions),
             ticks='outside',
             ticklen=10,
@@ -437,7 +453,7 @@ class Crossings:
             col=1
         )
         fig.update_xaxes(
-            title=dict(text="Mean speed of crossing (in m/s)", font=dict(size=font_size_captions)),
+            title=dict(text="Mean relative crossing motion index", font=dict(size=font_size_captions)),
             tickfont=dict(size=font_size_captions),
             ticks='outside',
             ticklen=10,
@@ -506,8 +522,8 @@ class Crossings:
 
         # Define the legend items
         legend_items = [
-            {"name": "Crossing speed during daytime", "color": C.BAR_COLOR_1},
-            {"name": "Crossing speed during night time", "color": C.BAR_COLOR_2},
+            {"name": "Relative crossing motion during daytime", "color": C.BAR_COLOR_1},
+            {"name": "Relative crossing motion during night time", "color": C.BAR_COLOR_2},
             {"name": "Crossing decision time during daytime", "color": C.BAR_COLOR_3},
             {"name": "Crossing decision time during night time", "color": C.BAR_COLOR_4},
         ]
@@ -698,7 +714,7 @@ class Crossings:
             for country, diff in top_5_min_speed:
                 logger.info(f"{grouping_class.format_locality_state(country)}: {diff}")
         else:
-            logger.info("No valid speed_0 and speed_1 values found for comparison.")
+            logger.info("No valid relative crossing motion values found for comparison.")
 
         # Extract all valid time_0 and time_1 values along with their corresponding countries
         diff_time_values = [(country, abs(data['time_0'] - data['time_1']))
@@ -734,8 +750,16 @@ class Crossings:
             max_speed_value_0 = filtered_dict_s_0[max_speed_country_0]["speed_0"]
             min_speed_value_0 = filtered_dict_s_0[min_speed_country_0]["speed_0"]
 
-            logger.info(f"Country with max speed at day: {grouping_class.format_locality_state(max_speed_country_0)} with speed of {max_speed_value_0} m/s")  # noqa:E501
-            logger.info(f"Country with min speed at day: {grouping_class.format_locality_state(min_speed_country_0)} with speed of {min_speed_value_0} m/s")  # noqa:E501
+            logger.info(
+                "Country with maximum relative crossing motion during daytime: "
+                f"{grouping_class.format_locality_state(max_speed_country_0)} "
+                f"with index {max_speed_value_0}"
+            )
+            logger.info(
+                "Country with minimum relative crossing motion during daytime: "
+                f"{grouping_class.format_locality_state(min_speed_country_0)} "
+                f"with index {min_speed_value_0}"
+            )
 
         if filtered_dict_s_1:
             max_speed_country_1 = max(filtered_dict_s_1, key=lambda country: filtered_dict_s_1[country]["speed_1"])
@@ -743,8 +767,16 @@ class Crossings:
             max_speed_value_1 = filtered_dict_s_1[max_speed_country_1]["speed_1"]
             min_speed_value_1 = filtered_dict_s_1[min_speed_country_1]["speed_1"]
 
-            logger.info(f"Country with max speed at night: {grouping_class.format_locality_state(max_speed_country_1)} with speed of {max_speed_value_1} m/s")  # noqa:E501
-            logger.info(f"Country with min speed at night: {grouping_class.format_locality_state(min_speed_country_1)} with speed of {min_speed_value_1} m/s")  # noqa:E501
+            logger.info(
+                "Country with maximum relative crossing motion at night: "
+                f"{grouping_class.format_locality_state(max_speed_country_1)} "
+                f"with index {max_speed_value_1}"
+            )
+            logger.info(
+                "Country with minimum relative crossing motion at night: "
+                f"{grouping_class.format_locality_state(min_speed_country_1)} "
+                f"with index {min_speed_value_1}"
+            )
 
         # Find country with max and min time_0 and time_1
         if filtered_dict_t_0:
@@ -774,18 +806,18 @@ class Crossings:
         if speed_0_values:
             mean_speed_0 = statistics.mean(speed_0_values)
             sd_speed_0 = statistics.stdev(speed_0_values) if len(speed_0_values) > 1 else 0
-            logger.info(f"Mean of speed during day time: {mean_speed_0}")
-            logger.info(f"Standard deviation of speed during day time: {sd_speed_0}")
+            logger.info(f"Mean relative crossing motion during daytime: {mean_speed_0}")
+            logger.info(f"Standard deviation of relative crossing motion during daytime: {sd_speed_0}")
         else:
-            logger.error("No valid speed during day time values found.")
+            logger.error("No valid relative crossing motion values found for daytime.")
 
         if speed_1_values:
             mean_speed_1 = statistics.mean(speed_1_values)
             sd_speed_1 = statistics.stdev(speed_1_values) if len(speed_1_values) > 1 else 0
-            logger.info(f"Mean of speed during night time: {mean_speed_1}")
-            logger.info(f"Standard deviation of speed during night time: {sd_speed_1}")
+            logger.info(f"Mean relative crossing motion at night: {mean_speed_1}")
+            logger.info(f"Standard deviation of relative crossing motion at night: {sd_speed_1}")
         else:
-            logger.error("No valid speed during night time values found.")
+            logger.error("No valid relative crossing motion values found for night.")
 
         if time_0_values:
             mean_time_0 = statistics.mean(time_0_values)
@@ -1016,7 +1048,7 @@ class Crossings:
 
         # Set the x-axis labels (title_text) only for the last row and the first row
         fig.update_xaxes(
-            title=dict(text="Mean speed of crossing (in m/s)", font=dict(size=font_size_captions)),
+            title=dict(text="Mean relative crossing motion index", font=dict(size=font_size_captions)),
             tickfont=dict(size=font_size_captions),
             ticks='outside',
             ticklen=10,
@@ -1026,7 +1058,7 @@ class Crossings:
             col=1
         )
         fig.update_xaxes(
-            title=dict(text="Mean speed of crossing (in m/s)", font=dict(size=font_size_captions)),
+            title=dict(text="Mean relative crossing motion index", font=dict(size=font_size_captions)),
             tickfont=dict(size=font_size_captions),
             ticks='outside',
             ticklen=10,
@@ -1095,8 +1127,8 @@ class Crossings:
 
         # Define the legend items
         legend_items = [
-            {"name": "Mean speed of crossing during day (in m/s)", "color": C.BAR_COLOR_1},
-            {"name": "Mean speed of crossing during night (in m/s)", "color": C.BAR_COLOR_2},
+            {"name": "Mean relative crossing motion during day", "color": C.BAR_COLOR_1},
+            {"name": "Mean relative crossing motion during night", "color": C.BAR_COLOR_2},
             {"name": "Mean time to start crossing during day (in s)", "color": C.BAR_COLOR_3},
             {"name": "Mean time to start crossing during night (in s) ", "color": C.BAR_COLOR_4},
         ]
