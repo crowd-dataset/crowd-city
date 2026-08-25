@@ -1,15 +1,15 @@
-"""Crossing duration, relative motion, and optional Waymo evaluation.
+"""CROWD crossing metrics with algorithm selected Waymo speed calibration.
 
-The production input is a YOLO plus BoT SORT bounding box CSV. CROWD has no
-metric road plane or camera pose, so this module reports a within video relative
-apparent motion index for CROWD. Waymo metric labels are used only to evaluate
-how informative that bounding box measure is.
+The production input remains a YOLO plus BoT SORT bounding box CSV and FPS.
+Metric values are exposed only when the frozen bbox model passes untouched
+Waymo validation; otherwise the output remains an explicitly relative index.
 """
 
 import csv
 import json
 import math
 import os
+import pickle
 import re
 import shlex
 import subprocess
@@ -28,9 +28,69 @@ from utils.core.grouping import Grouping
 from utils.core.metadata import MetaData
 
 
-METRICS_BUILD_ID = "crowd_bbox_relative_motion_v24_20260822"
+METRICS_BUILD_ID = "crowd_algorithm_selected_waymo_speed_v32_20260825"
 metadata_class = MetaData()
 grouping_class = Grouping()
+
+_PIPELINE_MODEL: Dict[str, Any] = {}
+_SPEED_MODEL: Dict[str, Any] = {}
+
+
+def load_tuned_pipeline_model(path: os.PathLike[str] | str) -> Dict[str, Any]:
+    """Load the frozen Waymo parameters used by the CROWD CSV analysis."""
+    global _PIPELINE_MODEL, _SPEED_MODEL
+    model_path = Path(path).expanduser().resolve()
+    if not model_path.is_file():
+        _PIPELINE_MODEL = {}
+        _SPEED_MODEL = {}
+        return {}
+    with model_path.open("r", encoding="utf-8") as handle:
+        model = json.load(handle)
+    if model.get("schema") not in {
+        "crowd_waymo_pipeline_model_v32",
+        "crowd_waymo_pipeline_model_v31",
+        "crowd_waymo_pipeline_model_v30",
+        "crowd_waymo_pipeline_model_v29",
+        "crowd_waymo_pipeline_model_v28",
+        "crowd_waymo_pipeline_model_v27",
+    }:
+        raise ValueError(f"Unsupported Waymo pipeline model schema: {model.get('schema')!r}")
+    _PIPELINE_MODEL = model
+    _SPEED_MODEL = {}
+    speed_path_text = str(model.get("speed_production_model_path") or "").strip()
+    if speed_path_text:
+        speed_path = Path(speed_path_text).expanduser()
+        if not speed_path.is_absolute():
+            speed_path = model_path.parent / speed_path
+        elif not speed_path.is_file():
+            # The complete waymo_processed directory may have been moved from
+            # the repository output directory to the raw Waymo dataset.  The
+            # production model always lives at this stable location relative
+            # to the frozen pipeline model.
+            relocated_speed_path = (
+                model_path.parent / "speed_validation" / "production_model.json"
+            )
+            if relocated_speed_path.is_file():
+                speed_path = relocated_speed_path
+        if speed_path.is_file():
+            with speed_path.open("r", encoding="utf-8") as handle:
+                speed_model = json.load(handle)
+            if truthy(speed_model.get("calibration_qualified"), False) and truthy(
+                speed_model.get("external_test_passed"),
+                False,
+            ):
+                _SPEED_MODEL = speed_model
+    os.environ["CROWD_CROSSING_SPEED_UNIT"] = "m/s" if _SPEED_MODEL else "relative"
+    return dict(_PIPELINE_MODEL)
+
+
+def tuned_crossing_parameters() -> Dict[str, Any]:
+    parameters = _PIPELINE_MODEL.get("crossing_parameters", {})
+    return dict(parameters) if isinstance(parameters, dict) else {}
+
+
+def metric_speed_is_qualified() -> bool:
+    return bool(_SPEED_MODEL)
 
 
 class Metrics:
@@ -113,12 +173,7 @@ class Metrics:
         df: pl.DataFrame,
         data: dict,
     ):
-        """Return relative crossing motion using the legacy result structure.
-
-        The method name is retained because analysis.py and saved result files use
-        it. Values are dimensionless within video indices, never metres per
-        second.
-        """
+        """Return frozen metric speed when qualified, otherwise relative motion."""
         if not data or not any(data.values()):
             return None
         source_id = next(iter(data))
@@ -139,11 +194,35 @@ class Metrics:
         aspect_ratio = safe_float(os.environ.get("CROWD_BBOX_ASPECT_RATIO"))
         if aspect_ratio is None or aspect_ratio <= 0.0:
             aspect_ratio = DEFAULT_ASPECT_RATIO
+        if _SPEED_MODEL:
+            person_tracks = group_tracks(
+                row for row in rows if row.class_id == PERSON_CLASS_ID
+            )
+            scene_profile = build_scene_motion_profile(rows, float(fps))
+            features_by_track = contextual_track_features(
+                person_tracks,
+                float(fps),
+                str(source_id),
+                aspect_ratio,
+                scene_profile,
+            )
+            values: Dict[str, float] = {}
+            for track_id in selected_ids:
+                features = features_by_track.get(track_id)
+                if features is None:
+                    continue
+                prediction = _predict_metric_speed(features, _SPEED_MODEL)
+                if prediction.get("speed_status") == "valid":
+                    values[track_id] = float(prediction["estimated_speed_mps"])
+            if not values:
+                return None
+            return grouping_class.locality_country_wrapper(
+                input_dict={str(source_id): values},
+                mapping=df_mapping,
+            )
+
         relative_rows, _ = predict_relative_bbox_rows(
-            rows,
-            float(fps),
-            str(source_id),
-            aspect_ratio,
+            rows, float(fps), str(source_id), aspect_ratio
         )
         person_track_count = len(
             {row.track_id for row in rows if row.class_id == PERSON_CLASS_ID}
@@ -344,6 +423,12 @@ SCENE_MOTION_SETTINGS: Dict[str, float] = {
     "outlier_mad_multiplier": 4.0,
 }
 
+SOURCE_CONTEXT_SETTINGS: Dict[str, float] = {
+    "minimum_reference_tracks": 3,
+    "minimum_proxy_mps": 0.001,
+    "maximum_absolute_log_ratio": 2.00,
+}
+
 BASE_GATES: Dict[str, float] = {
     "minimum_rows": 8,
     "minimum_duration_seconds": 0.50,
@@ -414,7 +499,7 @@ class SceneMotionProfile:
         return centre, support
 
 
-@dataclass(frozen=True)
+@dataclass
 class TrackFeatures:
     source_id: str
     prediction_track_id: str
@@ -461,6 +546,13 @@ class TrackFeatures:
     log_height_ratio: float
     log_duration: float
     log_median_height: float
+    source_context_tracks: float = 0.0
+    source_context_available: float = 0.0
+    source_relative_log_raw_proxy: float = 0.0
+    source_relative_log_q_proxy: float = 0.0
+    source_relative_log_robust_proxy: float = 0.0
+    source_relative_log_compensated_robust_proxy: float = 0.0
+    source_compensated_robust_percentile: float = 0.5
 
 
 def _default_log(message: str) -> None:
@@ -990,12 +1082,450 @@ def base_rejection_reason(features: TrackFeatures) -> str:
     return ""
 
 
+def apply_source_context(
+    features_by_track: Dict[str, TrackFeatures],
+) -> Dict[str, TrackFeatures]:
+    """Construct the V31 label-free context from one complete bbox CSV."""
+    reference = [
+        features
+        for features in features_by_track.values()
+        if base_rejection_reason(features) == ""
+    ]
+    reference_count = len(reference)
+    minimum_count = int(SOURCE_CONTEXT_SETTINGS["minimum_reference_tracks"])
+    context_available = reference_count >= minimum_count
+    for features in features_by_track.values():
+        features.source_context_tracks = float(reference_count)
+        features.source_context_available = 1.0 if context_available else 0.0
+        features.source_relative_log_raw_proxy = 0.0
+        features.source_relative_log_q_proxy = 0.0
+        features.source_relative_log_robust_proxy = 0.0
+        features.source_relative_log_compensated_robust_proxy = 0.0
+        features.source_compensated_robust_percentile = 0.5
+    if not context_available:
+        return features_by_track
+
+    minimum_proxy = float(SOURCE_CONTEXT_SETTINGS["minimum_proxy_mps"])
+    maximum_log_ratio = float(
+        SOURCE_CONTEXT_SETTINGS["maximum_absolute_log_ratio"]
+    )
+    proxy_fields = {
+        "source_relative_log_raw_proxy": "raw_speed_proxy_mps",
+        "source_relative_log_q_proxy": "q_speed_proxy_mps",
+        "source_relative_log_robust_proxy": "robust_speed_proxy_mps",
+        "source_relative_log_compensated_robust_proxy": (
+            "compensated_robust_speed_proxy_mps"
+        ),
+    }
+    medians = {
+        output_field: float(
+            np.median(
+                [
+                    max(float(getattr(features, input_field)), minimum_proxy)
+                    for features in reference
+                ]
+            )
+        )
+        for output_field, input_field in proxy_fields.items()
+    }
+    rank_values = np.asarray(
+        [
+            max(
+                float(features.compensated_robust_speed_proxy_mps),
+                minimum_proxy,
+            )
+            for features in reference
+        ],
+        dtype=float,
+    )
+    for features in features_by_track.values():
+        for output_field, input_field in proxy_fields.items():
+            value = max(float(getattr(features, input_field)), minimum_proxy)
+            ratio = math.log(value / max(medians[output_field], minimum_proxy))
+            setattr(
+                features,
+                output_field,
+                float(np.clip(ratio, -maximum_log_ratio, maximum_log_ratio)),
+            )
+        rank_value = max(
+            float(features.compensated_robust_speed_proxy_mps),
+            minimum_proxy,
+        )
+        less = float(np.sum(rank_values < rank_value))
+        equal = float(np.sum(rank_values == rank_value))
+        features.source_compensated_robust_percentile = float(
+            (less + 0.5 * equal) / max(len(rank_values), 1)
+        )
+    return features_by_track
+
+
+def contextual_track_features(
+    tracks: Dict[str, List[BBoxRow]],
+    fps: float,
+    source_id: str,
+    aspect_ratio: float,
+    scene_motion_profile: SceneMotionProfile,
+) -> Dict[str, TrackFeatures]:
+    features_by_track: Dict[str, TrackFeatures] = {}
+    for track_id in sorted(tracks, key=str):
+        features = track_features(
+            tracks[track_id],
+            fps,
+            source_id,
+            aspect_ratio,
+            scene_motion_profile,
+        )
+        if features is not None:
+            features_by_track[track_id] = features
+    return apply_source_context(features_by_track)
+
+
 def reliability_rejection_reason(features: TrackFeatures) -> str:
     if features.duration_seconds < RELIABILITY_GATES["minimum_duration_seconds"]:
         return "duration_below_reliable_minimum"
     if features.x_fit_r2 < RELIABILITY_GATES["minimum_x_fit_r2"]:
         return "horizontal_fit_below_reliable_minimum"
     return ""
+
+
+def _direct_proxy_prediction(features: TrackFeatures, name: str) -> float:
+    values = {
+        "direct_raw": [features.raw_speed_proxy_mps],
+        "direct_q": [features.q_speed_proxy_mps],
+        "direct_robust": [features.robust_speed_proxy_mps],
+        "direct_median": [
+            features.raw_speed_proxy_mps,
+            features.q_speed_proxy_mps,
+            features.robust_speed_proxy_mps,
+        ],
+        "direct_compensated_raw": [features.compensated_raw_speed_proxy_mps],
+        "direct_compensated_q": [features.compensated_q_speed_proxy_mps],
+        "direct_compensated_robust": [features.compensated_robust_speed_proxy_mps],
+        "direct_compensated_median": [
+            features.compensated_raw_speed_proxy_mps,
+            features.compensated_q_speed_proxy_mps,
+            features.compensated_robust_speed_proxy_mps,
+        ],
+    }
+    selected = values.get(name)
+    if not selected:
+        raise ValueError(f"Unsupported direct bbox proxy: {name}")
+    return float(np.median(selected))
+
+
+def _linear_spline_basis(value: float, knots: np.ndarray) -> np.ndarray:
+    knot_values = np.asarray(knots, dtype=float).reshape(-1)
+    if knot_values.size < 2 or bool(np.any(np.diff(knot_values) <= 0.0)):
+        raise ValueError("invalid_monotonic_spline_knots")
+    basis = np.zeros(knot_values.size, dtype=float)
+    if value <= knot_values[0]:
+        basis[0] = 1.0
+        return basis
+    if value >= knot_values[-1]:
+        basis[-1] = 1.0
+        return basis
+    right = int(np.searchsorted(knot_values, value, side="right"))
+    left = right - 1
+    fraction = (value - knot_values[left]) / (
+        knot_values[right] - knot_values[left]
+    )
+    basis[left] = 1.0 - fraction
+    basis[right] = fraction
+    return basis
+
+
+def _monotonic_spline_prediction_design(
+    feature_values: Mapping[str, Any],
+    model: Mapping[str, Any],
+) -> np.ndarray:
+    primary_feature = str(model.get("primary_feature", ""))
+    primary_value = float(feature_values[primary_feature])
+    knots = np.asarray(model.get("spline_knots", []), dtype=float)
+    basis = _linear_spline_basis(primary_value, knots)
+    cumulative = (
+        np.arange(knots.size)[:, None]
+        > np.arange(max(knots.size - 1, 0))[None, :]
+    ).astype(float)
+    design = np.concatenate([[1.0], basis @ cumulative])
+    quality_features = [
+        str(value) for value in model.get("quality_features", [])
+    ]
+    if quality_features:
+        quality = np.asarray(
+            [float(feature_values[name]) for name in quality_features],
+            dtype=float,
+        )
+        centre = np.asarray(model.get("quality_centre", []), dtype=float)
+        scale = np.asarray(model.get("quality_scale", []), dtype=float)
+        if len(quality) != len(centre) or len(quality) != len(scale):
+            raise ValueError("invalid_monotonic_spline_quality_dimensions")
+        scale = np.where(np.abs(scale) > 1e-12, scale, 1.0)
+        design = np.concatenate([design, (quality - centre) / scale])
+    return design
+
+
+def _bounded_variance_prediction(
+    base_prediction: float,
+    model: Mapping[str, Any],
+) -> Tuple[float, float]:
+    prediction_centre = float(model["variance_prediction_centre_mps"])
+    target_centre = float(model["variance_target_centre_mps"])
+    expansion_factor = float(model["variance_expansion_factor"])
+    cap = max(float(model["variance_correction_cap_mps"]), 0.0)
+    delta = float(base_prediction) - prediction_centre
+    unbounded_correction = (expansion_factor - 1.0) * delta
+    correction = float(np.clip(unbounded_correction, -cap, cap))
+    derivative = (
+        expansion_factor
+        if abs(unbounded_correction) < cap
+        else 1.0
+    )
+    return target_centre + delta + correction, derivative
+
+
+def _extra_trees_prediction(
+    raw_vector: np.ndarray,
+    model: Mapping[str, Any],
+) -> Tuple[float, float]:
+    """Evaluate the portable JSON tree ensemble without scikit-learn."""
+    predictions: List[float] = []
+    trees = model.get("extra_trees", [])
+    if not isinstance(trees, list) or not trees:
+        raise ValueError("invalid_extra_trees_model")
+    for tree in trees:
+        if not isinstance(tree, dict):
+            raise ValueError("invalid_extra_trees_model")
+        left = tree["children_left"]
+        right = tree["children_right"]
+        feature = tree["feature"]
+        threshold = tree["threshold"]
+        value = tree["value"]
+        node = 0
+        while int(left[node]) >= 0:
+            feature_index = int(feature[node])
+            node = (
+                int(left[node])
+                if float(raw_vector[feature_index])
+                <= float(threshold[node])
+                else int(right[node])
+            )
+        predictions.append(float(value[node]))
+    values = np.asarray(predictions, dtype=float)
+    dispersion = (
+        float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+    )
+    return float(np.mean(values)), dispersion
+
+
+def _predict_metric_speed(
+    features: TrackFeatures,
+    model: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Apply the qualified harness model without importing the CLI module."""
+    reason = base_rejection_reason(features) or reliability_rejection_reason(features)
+    feature_values = asdict(features)
+    feature_names = [str(value) for value in model.get("feature_names", [])]
+    try:
+        raw_vector = np.asarray(
+            [float(feature_values[name]) for name in feature_names],
+            dtype=float,
+        )
+    except (KeyError, TypeError, ValueError):
+        return {
+            "estimated_speed_mps": None,
+            "speed_status": "rejected",
+            "reject_reason": "unsupported_model_features",
+        }
+    centre = np.asarray(model.get("feature_centre", []), dtype=float)
+    scale = np.asarray(model.get("feature_scale", []), dtype=float)
+    coefficients = np.asarray(model.get("coefficients", []), dtype=float)
+    if len(raw_vector) != len(centre) or len(raw_vector) != len(scale):
+        return {
+            "estimated_speed_mps": None,
+            "speed_status": "rejected",
+            "reject_reason": "invalid_model_dimensions",
+        }
+    scale = np.where(np.abs(scale) > 1e-12, scale, 1.0)
+    design = np.concatenate([[1.0], (raw_vector - centre) / scale])
+    variance_derivative = 1.0
+    tree_prediction_dispersion = 0.0
+    if model.get("prediction_mode") == "direct_proxy":
+        prediction = _direct_proxy_prediction(
+            features,
+            str(model.get("direct_proxy_name", "")),
+        )
+    elif model.get("prediction_mode") in {
+        "extra_trees_regression",
+        "extra_trees_bounded_variance",
+    }:
+        try:
+            prediction, tree_prediction_dispersion = (
+                _extra_trees_prediction(raw_vector, model)
+            )
+        except (IndexError, KeyError, TypeError, ValueError):
+            return {
+                "estimated_speed_mps": None,
+                "speed_status": "rejected",
+                "reject_reason": "invalid_extra_trees_model",
+            }
+        design = np.empty(0, dtype=float)
+        if model.get("prediction_mode") == "extra_trees_bounded_variance":
+            try:
+                prediction, variance_derivative = (
+                    _bounded_variance_prediction(prediction, model)
+                )
+            except (KeyError, TypeError, ValueError):
+                return {
+                    "estimated_speed_mps": None,
+                    "speed_status": "rejected",
+                    "reject_reason": "invalid_variance_calibration_model",
+                }
+    elif model.get("prediction_mode") in {
+        "monotonic_spline_gam",
+        "monotonic_spline_physics_blend",
+        "bounded_variance_calibration",
+    }:
+        try:
+            design = _monotonic_spline_prediction_design(
+                feature_values,
+                model,
+            )
+        except (KeyError, TypeError, ValueError):
+            return {
+                "estimated_speed_mps": None,
+                "speed_status": "rejected",
+                "reject_reason": "invalid_monotonic_spline_model",
+            }
+        if len(coefficients) != len(design):
+            return {
+                "estimated_speed_mps": None,
+                "speed_status": "rejected",
+                "reject_reason": "invalid_model_coefficients",
+            }
+        spline_prediction = float(design @ coefficients)
+        if model.get("prediction_mode") in {
+            "monotonic_spline_physics_blend",
+            "bounded_variance_calibration",
+        }:
+            blend_weight = float(model.get("blend_weight", 0.0))
+            blend_proxy_feature = str(model.get("blend_proxy_feature", ""))
+            try:
+                proxy_prediction = float(
+                    feature_values[blend_proxy_feature]
+                )
+            except (KeyError, TypeError, ValueError):
+                return {
+                    "estimated_speed_mps": None,
+                    "speed_status": "rejected",
+                    "reject_reason": "invalid_physics_blend_model",
+                }
+            prediction = float(
+                (1.0 - blend_weight) * spline_prediction
+                + blend_weight * proxy_prediction
+            )
+            if model.get("prediction_mode") == (
+                "bounded_variance_calibration"
+            ):
+                try:
+                    prediction, variance_derivative = (
+                        _bounded_variance_prediction(prediction, model)
+                    )
+                except (KeyError, TypeError, ValueError):
+                    return {
+                        "estimated_speed_mps": None,
+                        "speed_status": "rejected",
+                        "reject_reason": "invalid_variance_calibration_model",
+                    }
+        else:
+            prediction = spline_prediction
+    else:
+        if len(coefficients) != len(design):
+            return {
+                "estimated_speed_mps": None,
+                "speed_status": "rejected",
+                "reject_reason": "invalid_model_coefficients",
+            }
+        prediction = float(design @ coefficients)
+    lower = np.asarray(model.get("feature_lower_bound", []), dtype=float)
+    upper = np.asarray(model.get("feature_upper_bound", []), dtype=float)
+    if (
+        not reason
+        and len(lower) == len(raw_vector)
+        and len(upper) == len(raw_vector)
+        and bool(np.any((raw_vector < lower) | (raw_vector > upper)))
+    ):
+        reason = "out_of_calibration_distribution"
+    covariance = np.asarray(model.get("covariance_basis", []), dtype=float)
+    residual = float(model.get("residual_sigma_mps", 0.0))
+    leverage = (
+        max(0.0, float(design @ covariance @ design))
+        if covariance.shape == (len(design), len(design))
+        else 0.0
+    )
+    if model.get("prediction_mode") in {
+        "monotonic_spline_physics_blend",
+        "bounded_variance_calibration",
+    }:
+        spline_weight = 1.0 - float(model.get("blend_weight", 0.0))
+        leverage *= spline_weight * spline_weight
+    leverage *= variance_derivative * variance_derivative
+    uncertainty = max(
+        residual * math.sqrt(1.0 + leverage),
+        tree_prediction_dispersion
+        / math.sqrt(
+            max(float(model.get("extra_trees_n_estimators", 1)), 1.0)
+        ),
+        float(model.get("conformal_absolute_uncertainty_mps", 0.0)),
+    )
+    maximum_uncertainty = safe_float(model.get("maximum_absolute_uncertainty_mps"))
+    if not reason and maximum_uncertainty is not None and uncertainty > maximum_uncertainty:
+        reason = "absolute_uncertainty_too_high"
+    gates = model.get("gates") if isinstance(model.get("gates"), dict) else {}
+    minimum_speed = float(gates.get("minimum_predicted_speed_mps", 0.10))
+    maximum_speed = float(gates.get("maximum_predicted_speed_mps", 3.50))
+    if not reason and prediction < minimum_speed:
+        reason = "predicted_speed_too_low"
+    if not reason and prediction > maximum_speed:
+        reason = "predicted_speed_too_high"
+    return {
+        "estimated_speed_mps": None if reason else float(prediction),
+        "speed_uncertainty_mps": float(uncertainty),
+        "speed_status": "rejected" if reason else "valid",
+        "reject_reason": reason,
+    }
+
+
+def _track_features_from_mapping(row: Mapping[str, Any]) -> Optional[TrackFeatures]:
+    integer_fields = {
+        "input_rows",
+        "clean_rows",
+        "removed_rows",
+        "first_frame",
+        "last_frame",
+    }
+    boolean_fields = {"crosses_image_midline", "overlaps_central_band"}
+    text_fields = {"source_id", "prediction_track_id", "direction"}
+    values: Dict[str, Any] = {}
+    for name in TrackFeatures.__dataclass_fields__:
+        raw = row.get(name)
+        if name in text_fields:
+            values[name] = str(raw or "")
+        elif name in boolean_fields:
+            values[name] = truthy(raw, False)
+        elif name in integer_fields:
+            parsed = safe_int(raw)
+            if parsed is None:
+                return None
+            values[name] = parsed
+        else:
+            parsed = safe_float(raw)
+            if parsed is None:
+                return None
+            values[name] = parsed
+    try:
+        return TrackFeatures(**values)
+    except TypeError:
+        return None
 
 
 def predict_relative_rows(
@@ -1024,13 +1554,16 @@ def predict_relative_bbox_rows(
         raise ValueError(f"FPS must be positive, received {fps}")
     person_tracks = group_tracks(row for row in rows if row.class_id == PERSON_CLASS_ID)
     scene_profile = build_scene_motion_profile(rows, fps)
+    features_by_track = contextual_track_features(
+        person_tracks,
+        fps,
+        source_id,
+        aspect_ratio,
+        scene_profile,
+    )
     prepared: List[Tuple[TrackFeatures, float, str]] = []
-    for track_id in sorted(person_tracks, key=str):
-        features = track_features(
-            person_tracks[track_id], fps, source_id, aspect_ratio, scene_profile
-        )
-        if features is None:
-            continue
+    for track_id in sorted(features_by_track, key=str):
+        features = features_by_track[track_id]
         if features.scene_motion_support >= int(
             SCENE_MOTION_SETTINGS["minimum_reference_tracks"]
         ):
@@ -1119,7 +1652,14 @@ def _quantile(values: Sequence[float], fraction: float) -> Optional[float]:
 
 def _source_cache_is_current(cache_path: Path, input_path: Path) -> bool:
     try:
-        return cache_path.is_file() and cache_path.stat().st_mtime >= input_path.stat().st_mtime
+        if not (
+            cache_path.is_file()
+            and cache_path.stat().st_mtime >= input_path.stat().st_mtime
+        ):
+            return False
+        with cache_path.open("r", encoding="utf-8-sig") as handle:
+            header = handle.readline()
+        return "source_relative_log_q_proxy" in header
     except OSError:
         return False
 
@@ -1191,6 +1731,7 @@ def analyse_crowd_sources(
             if normalise_id(row.get("prediction_track_id"))
         }
         valid_count = 0
+        reliable_speed_count = 0
         for track_id in sorted(crossing_ids, key=str):
             row = relative_by_track.get(track_id)
             if row is None:
@@ -1200,6 +1741,36 @@ def analyse_crowd_sources(
                     "relative_motion_status": "rejected",
                     "reject_reason": "feature_extraction_failed",
                     "speed_interpretation": "within-video bbox motion only; not metres per second",
+                }
+            if _SPEED_MODEL:
+                features = _track_features_from_mapping(row)
+                prediction = (
+                    _predict_metric_speed(features, _SPEED_MODEL)
+                    if features is not None
+                    else {
+                        "estimated_speed_mps": None,
+                        "speed_status": "rejected",
+                        "reject_reason": "feature_extraction_failed",
+                    }
+                )
+                row = {
+                    **row,
+                    "estimated_crossing_speed_mps": prediction.get("estimated_speed_mps"),
+                    "speed_uncertainty_mps": prediction.get("speed_uncertainty_mps"),
+                    "speed_status": prediction.get("speed_status"),
+                    "speed_reject_reason": prediction.get("reject_reason"),
+                    "metric_speed_qualified": 1,
+                }
+                if prediction.get("speed_status") == "valid":
+                    reliable_speed_count += 1
+            else:
+                row = {
+                    **row,
+                    "estimated_crossing_speed_mps": None,
+                    "speed_uncertainty_mps": None,
+                    "speed_status": "unavailable",
+                    "speed_reject_reason": "waymo_speed_model_not_qualified",
+                    "metric_speed_qualified": 0,
                 }
             output_row = {**base_source, **row, "detected_crossing": 1}
             output_row["prediction_track_id"] = track_id
@@ -1213,6 +1784,7 @@ def analyse_crowd_sources(
                 "detected_crossing_tracks": len(crossing_ids),
                 "analysed_crossing_tracks": valid_count,
                 "rejected_crossing_tracks": len(crossing_ids) - valid_count,
+                "reliable_metric_speed_tracks": reliable_speed_count,
             }
         )
         if index % 50 == 0 or index == len(sources):
@@ -1239,6 +1811,13 @@ def analyse_crowd_sources(
         ]
         values = _numeric_values(valid, "relative_motion_index")
         proxies = _numeric_values(valid, "bbox_motion_proxy")
+        reliable_speed_rows = [
+            row for row in city_tracks if str(row.get("speed_status", "")) == "valid"
+        ]
+        speed_values = _numeric_values(
+            reliable_speed_rows,
+            "estimated_crossing_speed_mps",
+        )
         categories = Counter(str(row.get("relative_motion_category", "")) for row in valid)
         rejection_counts = Counter(
             str(row.get("reject_reason", "unknown")) or "unknown"
@@ -1262,20 +1841,35 @@ def analyse_crowd_sources(
                 "relative_motion_index_q25": _quantile(values, 0.25),
                 "relative_motion_index_q75": _quantile(values, 0.75),
                 "median_bbox_motion_proxy": float(np.median(proxies)) if proxies else None,
+                "reliable_metric_speed_tracks": len(reliable_speed_rows),
+                "metric_speed_coverage": (
+                    len(reliable_speed_rows) / crossing_count if crossing_count else None
+                ),
+                "median_crossing_speed_mps": (
+                    float(np.median(speed_values)) if speed_values else None
+                ),
+                "crossing_speed_mps_q25": _quantile(speed_values, 0.25),
+                "crossing_speed_mps_q75": _quantile(speed_values, 0.75),
                 "slower_within_video": categories.get("slower_within_video", 0),
                 "typical_within_video": categories.get("typical_within_video", 0),
                 "faster_within_video": categories.get("faster_within_video", 0),
                 "top_rejection_reason": rejection_counts.most_common(1)[0][0]
                 if rejection_counts
                 else "",
-                "motion_unit": "relative index",
-                "interpretation": "within-video bbox motion only; not metres per second",
+                "motion_unit": "m/s" if _SPEED_MODEL else "relative index",
+                "interpretation": (
+                    "Waymo qualified bbox crossing speed"
+                    if _SPEED_MODEL
+                    else "within-video bbox motion only; not metres per second"
+                ),
             }
         )
 
     write_dict_csv(output_root / "crowd_crossing_relative_motion_tracks.csv", track_rows)
     write_dict_csv(output_root / "crowd_crossing_relative_motion_sources.csv", source_rows)
     write_dict_csv(output_root / "crowd_crossing_relative_motion_by_city.csv", city_rows)
+    write_dict_csv(output_root / "crowd_crossing_speed_tracks.csv", track_rows)
+    write_dict_csv(output_root / "crowd_crossing_speed_by_city.csv", city_rows)
     valid_tracks = [
         row for row in track_rows if str(row.get("relative_motion_status", "")) == "valid"
     ]
@@ -1292,14 +1886,22 @@ def analyse_crowd_sources(
         "person_tracks": sum(int(row["person_tracks"]) for row in source_rows),
         "detected_crossing_tracks": len(track_rows),
         "valid_relative_motion_tracks": len(valid_tracks),
+        "reliable_metric_speed_tracks": sum(
+            str(row.get("speed_status", "")) == "valid" for row in track_rows
+        ),
         "coverage": len(valid_tracks) / len(track_rows) if track_rows else 0.0,
         "relative_motion_categories": dict(
             Counter(str(row.get("relative_motion_category", "")) for row in valid_tracks)
         ),
         "rejection_counts": dict(rejections),
         "failures": failures,
-        "speed_unit": None,
-        "interpretation": "CROWD bbox CSV supports relative apparent crossing motion, not absolute metres per second",
+        "speed_unit": "m/s" if _SPEED_MODEL else None,
+        "metric_speed_qualified": bool(_SPEED_MODEL),
+        "interpretation": (
+            "Waymo qualified metric speed applied to CROWD crossing tracks"
+            if _SPEED_MODEL
+            else "CROWD bbox CSV supports relative apparent crossing motion; the Waymo speed model did not qualify"
+        ),
     }
     write_json(output_root / "crowd_crossing_relative_motion_summary.json", summary)
     return {"summary": summary, "city_rows": city_rows, "track_rows": track_rows}
@@ -1359,6 +1961,32 @@ def _resolve_waymo_output_path(
     if not text:
         return None
     candidate = Path(text).expanduser()
+
+    # Waymo exports are deliberately relocatable.  Older indices can contain
+    # paths rooted at Docker's /workspace or at the former repository
+    # _output/waymo_processed directory.  If the complete waymo_processed
+    # directory has been moved beside the raw TFRecords, recover the suffix
+    # below the training/validation directory before trying the old path.
+    split_name = index_path.parent.name
+    candidate_parts = candidate.parts
+    if split_name in candidate_parts:
+        split_position = len(candidate_parts) - 1 - list(
+            reversed(candidate_parts)
+        ).index(split_name)
+        relocated = index_path.parent.joinpath(
+            *candidate_parts[split_position + 1 :]
+        )
+        if relocated.exists() or relocated.parent.exists():
+            return relocated
+
+    # Pre-move indices may contain repository-relative
+    # data/speed_calibration/.../<source>/<file> values even though the whole
+    # processed tree now lives beside the raw Waymo dataset.
+    if len(candidate_parts) >= 2:
+        relocated = index_path.parent / candidate_parts[-2] / candidate_parts[-1]
+        if relocated.exists() or relocated.parent.exists():
+            return relocated
+
     if candidate.is_absolute():
         try:
             relative = candidate.relative_to("/workspace")
@@ -1383,16 +2011,14 @@ def _raw_waymo_files(split_root: Path) -> List[Path]:
     )
 
 
-def _waymo_split_is_ready(
+def _waymo_export_is_ready(
     repository_root: Path,
     raw_split_root: Path,
     processed_split_root: Path,
-    split_name: str,
 ) -> bool:
     index_path = processed_split_root / "waymo_sequence_index.csv"
-    manifest_path = processed_split_root / f"waymo_{split_name}_manifest.csv"
     raw_count = len(_raw_waymo_files(raw_split_root))
-    if not index_path.is_file() or not manifest_path.is_file():
+    if not index_path.is_file():
         return False
 
     summary_path = processed_split_root / "waymo_export_summary.json"
@@ -1409,27 +2035,44 @@ def _waymo_split_is_ready(
     if selected is None or completed != selected or (failed or 0) != 0:
         return False
 
+    return bool(index_rows)
+
+
+def _waymo_tracking_is_ready(
+    repository_root: Path,
+    processed_split_root: Path,
+) -> bool:
+    """Every exported video must have a prediction CSV, even if header only."""
+    index_path = processed_split_root / "waymo_sequence_index.csv"
+    if not index_path.is_file():
+        return False
+    try:
+        index_rows = read_dict_csv(index_path)
+    except OSError:
+        return False
     for row in index_rows:
-        if (safe_int(row.get("ground_truth_rows")) or 0) <= 0:
-            continue
         prediction = _resolve_waymo_output_path(
             repository_root,
             index_path,
             row.get("prediction_bbox_csv"),
         )
-        sequence_manifest = _resolve_waymo_output_path(
-            repository_root,
-            index_path,
-            row.get("manifest_csv"),
-        )
-        if (
-            prediction is None
-            or not prediction.is_file()
-            or sequence_manifest is None
-            or not sequence_manifest.is_file()
-        ):
+        if prediction is None or not prediction.is_file():
             return False
     return bool(index_rows)
+
+
+def _waymo_split_is_ready(
+    repository_root: Path,
+    raw_split_root: Path,
+    processed_split_root: Path,
+    split_name: str,
+) -> bool:
+    del split_name
+    return _waymo_export_is_ready(
+        repository_root,
+        raw_split_root,
+        processed_split_root,
+    ) and _waymo_tracking_is_ready(repository_root, processed_split_root)
 
 
 def _run_checked(command: Sequence[str], cwd: Path) -> None:
@@ -1443,14 +2086,22 @@ def _docker_waymo_export(
     split_name: str,
     log: Callable[[str], None],
 ) -> None:
+    """Export Waymo into the dataset adjacent waymo_processed directory."""
     raw_mount_root = raw_dataset_root.parent
     raw_container_path = Path("/waymo_source") / raw_dataset_root.name / split_name
-    output_relative = processed_split_root.relative_to(repository_root)
+    try:
+        output_relative = processed_split_root.relative_to(raw_mount_root)
+    except ValueError as error:
+        raise RuntimeError(
+            "The Waymo processed directory must be inside the configured "
+            f"dataset mount {raw_mount_root}: {processed_split_root}"
+        ) from error
+    output_container_path = Path("/waymo_source") / output_relative
     export_command = " ".join(
         [
             "python3 speed_estimation_harness.py waymo_export",
             shlex.quote(str(raw_container_path)),
-            shlex.quote(str(output_relative)),
+            shlex.quote(str(output_container_path)),
             "FRONT 10 0 false",
         ]
     )
@@ -1468,7 +2119,7 @@ def _docker_waymo_export(
         "--platform",
         "linux/amd64",
         "-v",
-        f"{raw_mount_root}:/waymo_source:ro",
+        f"{raw_mount_root}:/waymo_source",
         "-v",
         f"{repository_root}:/workspace",
         "-w",
@@ -1489,12 +2140,7 @@ def ensure_waymo_processed(
     process_if_missing: bool,
     log: Optional[Callable[[str], None]] = None,
 ) -> List[Path]:
-    """Prepare Waymo reports from configured raw TFRecords when requested.
-
-    Raw TFRecord decoding runs in the same TensorFlow Docker image used during
-    calibration. YOLO plus BoT SORT tracking and matching reuse the existing
-    speed_estimation_harness.py from the repository. No parser is introduced.
-    """
+    """Resume Waymo export/tracking, calibrate on training, then load the model."""
     logger = log or _default_log
     repository = Path(repository_root).expanduser().resolve()
     raw_path_text = os.path.expandvars(str(raw_dataset_path or "")).strip()
@@ -1503,30 +2149,198 @@ def ensure_waymo_processed(
         if raw_path_text
         else repository / "__waymo_dataset_not_configured__"
     )
-    processed_root = Path(output_root).expanduser().resolve() / "waymo_processed"
+    # Keep raw Waymo data and every derived artefact together.  When Waymo is
+    # configured this resolves to <waymo_dataset_path>/waymo_processed.  The
+    # repository output fallback is retained only for CROWD only installations
+    # where no Waymo dataset path has been configured.
+    processed_root = (
+        raw_root / "waymo_processed"
+        if raw_path_text
+        else Path(output_root).expanduser().resolve() / "waymo_processed"
+    )
     split_roots = {
         split: processed_root / split for split in ("training", "validation")
     }
-    combined_manifests = [
-        split_root / f"waymo_{split}_manifest.csv"
-        for split, split_root in split_roots.items()
-    ]
-    existing_manifests = [path for path in combined_manifests if path.is_file()]
-    ready = {
-        split: _waymo_split_is_ready(
-            repository,
-            raw_root / split,
-            processed_split,
-            split,
+    calibration_root = processed_root / "calibration_v32"
+    pipeline_model_path = calibration_root / "crowd_waymo_pipeline_model.json"
+
+    def log_speed_statistics() -> None:
+        summary_path = (
+            calibration_root
+            / "figures"
+            / "waymo_speed_distribution_statistics.json"
         )
-        for split, processed_split in split_roots.items()
-    }
-    if all(ready.values()):
-        logger(f"Reusing processed Waymo data: {processed_root}")
-        return [processed_root]
+        summary_pickle_path = (
+            calibration_root / "figures" / "waymo_diagnostics.pickle"
+        )
+        summary: Dict[str, Any] = {}
+        if summary_pickle_path.is_file():
+            try:
+                with summary_pickle_path.open("rb") as handle:
+                    loaded_summary = pickle.load(handle)
+                if isinstance(loaded_summary, dict):
+                    summary = loaded_summary
+            except (
+                OSError,
+                EOFError,
+                AttributeError,
+                ImportError,
+                IndexError,
+                ValueError,
+                pickle.PickleError,
+            ):
+                summary = {}
+        if not summary and summary_path.is_file():
+            try:
+                with summary_path.open("r", encoding="utf-8") as handle:
+                    loaded_summary = json.load(handle)
+                if isinstance(loaded_summary, dict):
+                    summary = loaded_summary
+            except (OSError, ValueError):
+                summary = {}
+        if not summary:
+            return
+
+        def format_value(value: Any) -> str:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return "NA"
+            return f"{numeric:.2f}" if math.isfinite(numeric) else "NA"
+
+        roles = summary.get("roles", {})
+        validation_role_error_logged = False
+        for role in (
+            "training_fit",
+            "training_cross_validation",
+            "untouched_validation_test",
+        ):
+            payload = roles.get(role, {})
+            if not isinstance(payload, Mapping):
+                continue
+            reference = payload.get("waymo_reference", {})
+            estimate = payload.get("algorithm_estimate", {})
+            error = payload.get("signed_error", {})
+            count = reference.get("count", 0)
+            if not count:
+                continue
+            label = payload.get("label", role.replace("_", " "))
+            logger(
+                f"Waymo speed distribution [{label}]: n={count}; "
+                "reference "
+                f"mean={format_value(reference.get('mean_mps'))}, "
+                f"SD={format_value(reference.get('sample_sd_mps'))}, "
+                f"median={format_value(reference.get('median_mps'))}, "
+                f"IQR={format_value(reference.get('iqr_mps'))} m/s; "
+                "algorithm "
+                f"mean={format_value(estimate.get('mean_mps'))}, "
+                f"SD={format_value(estimate.get('sample_sd_mps'))}, "
+                f"median={format_value(estimate.get('median_mps'))}, "
+                f"IQR={format_value(estimate.get('iqr_mps'))} m/s."
+            )
+            logger(
+                f"Waymo signed error [{label}]: "
+                f"mean={format_value(error.get('mean_mps'))}, "
+                f"SD={format_value(error.get('sample_sd_mps'))}, "
+                f"median={format_value(error.get('median_mps'))}, "
+                f"IQR={format_value(error.get('iqr_mps'))}, "
+                f"minimum={format_value(error.get('minimum_mps'))}, "
+                f"maximum={format_value(error.get('maximum_mps'))} m/s."
+            )
+            role_error_metrics = payload.get("error_metrics", {})
+            if isinstance(role_error_metrics, Mapping) and role_error_metrics:
+                role_error_label = {
+                    "training_fit": "Waymo training fit error",
+                    "training_cross_validation": (
+                        "Waymo test error "
+                        "[source held out training cross validation]"
+                    ),
+                    "untouched_validation_test": (
+                        "Waymo untouched validation error"
+                    ),
+                }.get(role, f"Waymo speed error [{label}]")
+                try:
+                    logger(
+                        f"{role_error_label}: "
+                        f"n={role_error_metrics.get('count', 0)}, "
+                        "MAE="
+                        f"{format_value(role_error_metrics.get('mae_mps'))}, "
+                        "RMSE="
+                        f"{format_value(role_error_metrics.get('rmse_mps'))}, "
+                        "bias="
+                        f"{format_value(role_error_metrics.get('bias_mps'))}, "
+                        "median absolute error="
+                        f"{format_value(role_error_metrics.get('median_absolute_error_mps'))} m/s, "
+                        "within 0.25 m/s="
+                        f"{format_value(100 * float(role_error_metrics.get('within_0_25_mps', 0)))}%, "
+                        "within 0.50 m/s="
+                        f"{format_value(100 * float(role_error_metrics.get('within_0_50_mps', 0)))}%."
+                    )
+                    if role == "untouched_validation_test":
+                        validation_role_error_logged = True
+                except (TypeError, ValueError):
+                    pass
+
+        metrics = summary.get("validation_error_metrics", {})
+        validation_metrics_path = (
+            calibration_root
+            / "figures"
+            / "waymo_validation_speed_metrics.json"
+        )
+        if not metrics and validation_metrics_path.is_file():
+            try:
+                with validation_metrics_path.open("r", encoding="utf-8") as handle:
+                    metrics = json.load(handle)
+            except (OSError, ValueError):
+                metrics = {}
+        if metrics and not validation_role_error_logged:
+            try:
+                logger(
+                    "Waymo untouched validation error: "
+                    f"n={metrics.get('count', 0)}, "
+                    f"MAE={format_value(metrics.get('mae_mps'))}, "
+                    f"RMSE={format_value(metrics.get('rmse_mps'))}, "
+                    f"bias={format_value(metrics.get('bias_mps'))}, "
+                    "median absolute error="
+                    f"{format_value(metrics.get('median_absolute_error_mps'))} m/s, "
+                    "within 0.25 m/s="
+                    f"{format_value(100 * float(metrics.get('within_0_25_mps', 0)))}%, "
+                    "within 0.50 m/s="
+                    f"{format_value(100 * float(metrics.get('within_0_50_mps', 0)))}%."
+                )
+            except (TypeError, ValueError):
+                pass
+
+    if pipeline_model_path.is_file():
+        load_tuned_pipeline_model(pipeline_model_path)
+        try:
+            from utils.crossing.waymo_calibration import (
+                refresh_waymo_diagnostic_figures,
+            )
+
+            refreshed_figures = refresh_waymo_diagnostic_figures(calibration_root)
+            if refreshed_figures:
+                logger(
+                    "Refreshed Waymo validation speed diagnostics: "
+                    f"{calibration_root / 'figures'}"
+                )
+            log_speed_statistics()
+        except (OSError, ValueError) as error:
+            logger(f"Waymo diagnostic figure refresh failed: {error}")
+        if raw_path_text and all(
+            _waymo_split_is_ready(
+                repository,
+                raw_root / split,
+                processed_split,
+                split,
+            )
+            for split, processed_split in split_roots.items()
+        ):
+            logger(f"Reusing frozen Waymo calibration: {pipeline_model_path}")
+            return [processed_root]
     if not process_if_missing:
-        if existing_manifests:
-            logger(f"Using available partial Waymo processed data: {processed_root}")
+        if processed_root.exists():
+            logger(f"Waymo processing disabled; using available files in {processed_root}")
             return [processed_root]
         logger("Waymo raw processing is disabled in config")
         return []
@@ -1555,9 +2369,6 @@ def ensure_waymo_processed(
     }
     for split_name, processed_split in split_roots.items():
         raw_split = raw_root / split_name
-        if ready[split_name]:
-            processing_summary["splits"][split_name] = {"status": "reused"}
-            continue
         if not _raw_waymo_files(raw_split):
             logger(f"No raw Waymo TFRecords found for {split_name}: {raw_split}")
             processing_summary["splits"][split_name] = {
@@ -1567,15 +2378,22 @@ def ensure_waymo_processed(
             continue
         processed_split.mkdir(parents=True, exist_ok=True)
         index_path = processed_split / "waymo_sequence_index.csv"
-        manifest_path = processed_split / f"waymo_{split_name}_manifest.csv"
         try:
-            _docker_waymo_export(
+            export_ready = _waymo_export_is_ready(
                 repository,
-                raw_root,
+                raw_split,
                 processed_split,
-                split_name,
-                logger,
             )
+            if not export_ready:
+                _docker_waymo_export(
+                    repository,
+                    raw_root,
+                    processed_split,
+                    split_name,
+                    logger,
+                )
+            else:
+                logger(f"Reusing complete Waymo {split_name} export")
             _run_checked(
                 [
                     sys.executable,
@@ -1585,17 +2403,7 @@ def ensure_waymo_processed(
                     "auto",
                     "0",
                     "false",
-                ],
-                repository,
-            )
-            _run_checked(
-                [
-                    sys.executable,
-                    str(harness_path),
-                    "match_index",
-                    str(index_path),
-                    str(manifest_path),
-                    "0",
+                    "true",
                 ],
                 repository,
             )
@@ -1606,14 +2414,14 @@ def ensure_waymo_processed(
                 split_name,
             ):
                 raise RuntimeError(
-                    f"Waymo {split_name} processing finished but completeness checks failed"
+                    f"Waymo {split_name} tracking did not produce one CSV per exported sequence"
                 )
             split_summary = {
                 "metrics_build_id": METRICS_BUILD_ID,
                 "status": "complete",
                 "raw_tfrecords": len(_raw_waymo_files(raw_split)),
                 "index": str(index_path),
-                "manifest": str(manifest_path),
+                "prediction_csvs_complete": True,
             }
             write_json(
                 processed_split / "waymo_processing_complete.json",
@@ -1626,10 +2434,51 @@ def ensure_waymo_processed(
                 "status": "failed",
                 "reason": str(error),
             }
+
+    training_ready = _waymo_split_is_ready(
+        repository,
+        raw_root / "training",
+        split_roots["training"],
+        "training",
+    )
+    validation_ready = _waymo_split_is_ready(
+        repository,
+        raw_root / "validation",
+        split_roots["validation"],
+        "validation",
+    )
+    if training_ready and validation_ready:
+        try:
+            _run_checked(
+                [
+                    sys.executable,
+                    str(harness_path),
+                    "calibrate_waymo_pipeline",
+                    str(split_roots["training"] / "waymo_sequence_index.csv"),
+                    str(split_roots["validation"] / "waymo_sequence_index.csv"),
+                    str(calibration_root),
+                ],
+                repository,
+            )
+            processing_summary["calibration"] = {
+                "status": "complete",
+                "model": str(pipeline_model_path),
+            }
+            load_tuned_pipeline_model(pipeline_model_path)
+            log_speed_statistics()
+        except (OSError, subprocess.CalledProcessError, ValueError) as error:
+            logger(f"Waymo calibration failed: {error}")
+            processing_summary["calibration"] = {
+                "status": "failed",
+                "reason": str(error),
+            }
+    else:
+        processing_summary["calibration"] = {
+            "status": "skipped",
+            "reason": "training_or_validation_tracking_incomplete",
+        }
     write_json(processed_root / "waymo_processing_summary.json", processing_summary)
-    if any(path.is_file() for path in combined_manifests):
-        return [processed_root]
-    return []
+    return [processed_root] if processed_root.exists() else []
 
 
 def discover_waymo_files(
@@ -1914,6 +2763,58 @@ def analyse_waymo(
     force: bool,
     log: Callable[[str], None],
 ) -> Dict[str, Any]:
+    search_roots = [
+        Path(value).expanduser().resolve()
+        for value in (explicit_roots or [])
+        if Path(value).expanduser().exists()
+    ]
+    calibration_reports = [
+        candidate
+        for root in search_roots
+        for version in (
+            "calibration_v32",
+            "calibration_v31",
+            "calibration_v30",
+            "calibration_v29",
+            "calibration_v28",
+        )
+        for candidate in root.rglob(
+            f"{version}/crossing_calibration_report.json"
+        )
+    ]
+    if calibration_reports:
+        report_path = max(calibration_reports, key=lambda path: path.stat().st_mtime)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        evaluation_path = report_path.parent / "speed_validation" / "evaluation_tracks.csv"
+        evaluation_rows = read_dict_csv(evaluation_path) if evaluation_path.is_file() else []
+        validation_tracks = []
+        for row in evaluation_rows:
+            prediction = (
+                row.get("model_speed_before_reliability_gate_mps")
+                or row.get("estimated_speed_mps")
+            )
+            validation_tracks.append({**row, "predicted_speed_mps": prediction})
+        summary = {
+            "status": "complete",
+            "strategy": "CROWD algorithm selects crossings; Waymo supplies matched speed only",
+            "waymo_crossing_label_used_for_speed_selection": False,
+            "roles": {
+                "training": report.get("training_speed_selection", {}),
+                "validation": report.get("validation_speed_selection", {}),
+            },
+            "independent_validation": report.get("speed_validation_metrics", {}),
+            "absolute_speed_model_qualified": bool(
+                report.get("metric_speed_qualified_for_crowd")
+            ),
+            "calibration_report": str(report_path),
+        }
+        write_json(output_root / "waymo_crossing_speed_summary.json", summary)
+        return {
+            "summary": summary,
+            "tracks": validation_tracks,
+            "validation_tracks": validation_tracks,
+        }
+
     files = discover_waymo_files(repository_root, explicit_roots)
     manifests: Dict[str, Path] = files["manifests"]
     if not manifests:
@@ -2064,150 +2965,6 @@ def analyse_waymo(
     }
 
 
-def _write_svg_bar(
-    path: Path,
-    labels: Sequence[str],
-    series: Mapping[str, Sequence[float]],
-    title: str,
-    y_label: str,
-) -> None:
-    width = max(900, 38 * len(labels) + 220)
-    height = 620
-    left, right, top, bottom = 90, 35, 80, 180
-    plot_width = width - left - right
-    plot_height = height - top - bottom
-    maximum = max([float(value) for values in series.values() for value in values] + [1.0])
-    colours = ["#0072B2", "#E69F00", "#009E73", "#CC79A7"]
-    group_width = plot_width / max(len(labels), 1)
-    bar_width = group_width * 0.78 / max(len(series), 1)
-    parts = [
-        (
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
-            f'height="{height}" viewBox="0 0 {width} {height}">'
-        ),
-        '<rect width="100%" height="100%" fill="white"/>',
-        (
-            f'<text x="{width / 2}" y="35" text-anchor="middle" '
-            f'font-family="Arial" font-size="22">{_xml(title)}</text>'
-        ),
-        (
-            f'<line x1="{left}" y1="{top + plot_height}" '
-            f'x2="{left + plot_width}" y2="{top + plot_height}" stroke="#333"/>'
-        ),
-        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height}" stroke="#333"/>',
-        (
-            f'<text transform="translate(24 {top + plot_height / 2}) rotate(-90)" '
-            f'text-anchor="middle" font-family="Arial" font-size="15">{_xml(y_label)}</text>'
-        ),
-    ]
-    for tick in range(6):
-        value = maximum * tick / 5.0
-        y_value = top + plot_height - plot_height * tick / 5.0
-        parts.append(
-            f'<line x1="{left}" y1="{y_value:.2f}" x2="{left + plot_width}" '
-            f'y2="{y_value:.2f}" stroke="#ddd"/>'
-        )
-        parts.append(
-            f'<text x="{left - 10}" y="{y_value + 5:.2f}" text-anchor="end" '
-            f'font-family="Arial" font-size="12">{value:.0f}</text>'
-        )
-    for label_index, label in enumerate(labels):
-        x_centre = left + group_width * (label_index + 0.5)
-        for series_index, (name, values) in enumerate(series.items()):
-            value = float(values[label_index])
-            bar_height = plot_height * value / maximum
-            x_value = x_centre - (len(series) * bar_width) / 2.0 + series_index * bar_width
-            y_value = top + plot_height - bar_height
-            parts.append(
-                f'<rect x="{x_value:.2f}" y="{y_value:.2f}" '
-                f'width="{bar_width * 0.90:.2f}" height="{bar_height:.2f}" '
-                f'fill="{colours[series_index % len(colours)]}"/>'
-            )
-        parts.append(
-            f'<text transform="translate({x_centre:.2f} {top + plot_height + 12}) rotate(55)" '
-            f'text-anchor="start" font-family="Arial" font-size="11">{_xml(label)}</text>'
-        )
-    legend_x = left
-    for index, name in enumerate(series):
-        parts.append(
-            f'<rect x="{legend_x}" y="{height - 32}" width="14" height="14" '
-            f'fill="{colours[index % len(colours)]}"/>'
-        )
-        parts.append(
-            f'<text x="{legend_x + 20}" y="{height - 20}" font-family="Arial" '
-            f'font-size="13">{_xml(name)}</text>'
-        )
-        legend_x += 150
-    parts.append("</svg>")
-    path.write_text("\n".join(parts), encoding="utf-8")
-
-
-def _write_svg_scatter(
-    path: Path,
-    truth: Sequence[float],
-    prediction: Sequence[float],
-    title: str,
-) -> None:
-    width, height = 760, 660
-    left, right, top, bottom = 85, 35, 75, 75
-    plot_width, plot_height = width - left - right, height - top - bottom
-    values = list(truth) + list(prediction)
-    minimum = min(values + [0.0])
-    maximum = max(values + [1.0])
-    padding = max((maximum - minimum) * 0.08, 0.1)
-    minimum -= padding
-    maximum += padding
-    x_pos = lambda value: left + (value - minimum) / (maximum - minimum) * plot_width
-    y_pos = lambda value: top + plot_height - (value - minimum) / (maximum - minimum) * plot_height
-    parts = [
-        (
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
-            f'height="{height}" viewBox="0 0 {width} {height}">'
-        ),
-        '<rect width="100%" height="100%" fill="white"/>',
-        (
-            f'<text x="{width / 2}" y="35" text-anchor="middle" '
-            f'font-family="Arial" font-size="22">{_xml(title)}</text>'
-        ),
-        (
-            f'<line x1="{left}" y1="{top + plot_height}" '
-            f'x2="{left + plot_width}" y2="{top + plot_height}" stroke="#333"/>'
-        ),
-        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height}" stroke="#333"/>',
-        (
-            f'<line x1="{x_pos(minimum):.2f}" y1="{y_pos(minimum):.2f}" '
-            f'x2="{x_pos(maximum):.2f}" y2="{y_pos(maximum):.2f}" '
-            'stroke="#777" stroke-dasharray="6 4"/>'
-        ),
-        (
-            f'<text x="{left + plot_width / 2}" y="{height - 20}" '
-            'text-anchor="middle" font-family="Arial" font-size="15">'
-            'Waymo ground truth speed (m/s)</text>'
-        ),
-        (
-            f'<text transform="translate(22 {top + plot_height / 2}) rotate(-90)" '
-            'text-anchor="middle" font-family="Arial" font-size="15">'
-            'Predicted speed (m/s)</text>'
-        ),
-    ]
-    for x_value, y_value in zip(truth, prediction):
-        parts.append(
-            f'<circle cx="{x_pos(x_value):.2f}" cy="{y_pos(y_value):.2f}" r="4.5" fill="#0072B2" fill-opacity="0.72"/>'
-        )
-    parts.append("</svg>")
-    path.write_text("\n".join(parts), encoding="utf-8")
-
-
-def _xml(value: Any) -> str:
-    return (
-        str(value)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-
-
 def write_figures(
     output_root: Path,
     crowd_result: Mapping[str, Any],
@@ -2222,38 +2979,6 @@ def write_figures(
         key=lambda row: int(row.get("detected_crossing_tracks", 0)),
         reverse=True,
     )[:30]
-    if city_rows:
-        path = figure_root / "crowd_city_crossing_coverage.svg"
-        _write_svg_bar(
-            path,
-            [str(row.get("locality", "Unknown")) for row in city_rows],
-            {
-                "Detected crossings": [float(row.get("detected_crossing_tracks", 0)) for row in city_rows],
-                "Valid relative motion": [float(row.get("analysed_crossing_tracks", 0)) for row in city_rows],
-            },
-            "CROWD crossing tracks by city (top 30)",
-            "Tracks",
-        )
-        written.append(str(path))
-
-    roles = waymo_result.get("summary", {}).get("roles", {})
-    if roles:
-        labels = [role.title() for role in sorted(roles)]
-        role_rows = [roles[role] for role in sorted(roles)]
-        path = figure_root / "waymo_crossing_pipeline_funnel.svg"
-        _write_svg_bar(
-            path,
-            labels,
-            {
-                "Confirmed GT": [float(row.get("confirmed_crossing_pedestrians") or 0) for row in role_rows],
-                "Matched": [float(row.get("matched_with_botsort") or 0) for row in role_rows],
-                "Eligible": [float(row.get("eligible_after_matching_and_motion_checks") or 0) for row in role_rows],
-                "Analysed": [float(row.get("analysed_with_valid_relative_motion") or 0) for row in role_rows],
-            },
-            "Waymo crossing analysis funnel",
-            "Pedestrian tracks",
-        )
-        written.append(str(path))
     validation = waymo_result.get("validation_tracks", [])
     validation_pairs = [
         (float(truth_value), float(prediction_value))
@@ -2263,13 +2988,30 @@ def write_figures(
     ]
     truth = [pair[0] for pair in validation_pairs]
     prediction = [pair[1] for pair in validation_pairs]
-    if validation_pairs:
-        path = figure_root / "waymo_validation_observed_vs_predicted.svg"
-        _write_svg_scatter(path, truth, prediction, "Waymo independent validation")
-        written.append(str(path))
-
     try:
         import plotly.graph_objects as go
+
+        def write_static_formats(
+            figure: Any,
+            file_stem: str,
+            width: int,
+            height: int,
+        ) -> None:
+            for suffix, scale in (("png", 2), ("eps", 1)):
+                try:
+                    image_path = figure_root / f"{file_stem}.{suffix}"
+                    figure.write_image(
+                        str(image_path),
+                        width=width,
+                        height=height,
+                        scale=scale,
+                    )
+                    written.append(str(image_path))
+                except Exception as error:
+                    log(
+                        f"{suffix.upper()} export skipped for "
+                        f"{file_stem}: {error}"
+                    )
 
         if city_rows:
             fig = go.Figure()
@@ -2291,14 +3033,18 @@ def write_figures(
                 yaxis_title="Tracks",
             )
             html_path = figure_root / "crowd_city_crossing_coverage.html"
-            fig.write_html(str(html_path), include_plotlyjs="cdn")
+            fig.write_html(
+                str(html_path),
+                include_plotlyjs="cdn",
+                auto_open=True,
+            )
             written.append(str(html_path))
-            try:
-                png_path = figure_root / "crowd_city_crossing_coverage.png"
-                fig.write_image(str(png_path), width=1800, height=900, scale=2)
-                written.append(str(png_path))
-            except Exception as error:
-                log(f"PNG export skipped for CROWD figure: {error}")
+            write_static_formats(
+                fig,
+                "crowd_city_crossing_coverage",
+                1800,
+                900,
+            )
         if validation_pairs:
             fig = go.Figure()
             fig.add_scatter(x=truth, y=prediction, mode="markers", name="Track")
@@ -2318,16 +3064,20 @@ def write_figures(
                 yaxis_title="Predicted speed (m/s)",
             )
             html_path = figure_root / "waymo_validation_observed_vs_predicted.html"
-            fig.write_html(str(html_path), include_plotlyjs="cdn")
+            fig.write_html(
+                str(html_path),
+                include_plotlyjs="cdn",
+                auto_open=True,
+            )
             written.append(str(html_path))
-            try:
-                png_path = figure_root / "waymo_validation_observed_vs_predicted.png"
-                fig.write_image(str(png_path), width=1000, height=900, scale=2)
-                written.append(str(png_path))
-            except Exception as error:
-                log(f"PNG export skipped for Waymo figure: {error}")
+            write_static_formats(
+                fig,
+                "waymo_validation_observed_vs_predicted",
+                1000,
+                900,
+            )
     except ImportError:
-        log("Plotly is unavailable; SVG figures were written instead")
+        log("Plotly is unavailable; HTML, PNG and EPS figures were skipped")
     return written
 
 
@@ -2356,10 +3106,21 @@ def run_integrated_speed_report(
     summary = {
         "report_build_id": REPORT_BUILD_ID,
         "scientific_scope": {
-            "crowd": "relative apparent crossing motion from YOLO plus BoT SORT bbox CSV",
-            "waymo": "metric ground truth evaluation of the bbox relative motion proxy",
-            "absolute_crowd_speed_mps": False,
-            "reason": "CROWD bbox CSV has no per video metric ground plane calibration or camera pose",
+            "crowd": (
+                "Waymo qualified bbox crossing speed from YOLO plus BoT SORT CSV"
+                if _SPEED_MODEL
+                else "relative apparent crossing motion from YOLO plus BoT SORT bbox CSV"
+            ),
+            "waymo": (
+                "CROWD algorithm selected crossings matched to Waymo planar speed; "
+                "training only speed fitting followed by frozen validation evaluation"
+            ),
+            "absolute_crowd_speed_mps": bool(_SPEED_MODEL),
+            "reason": (
+                "the frozen bbox model passed its Waymo validation gates"
+                if _SPEED_MODEL
+                else "the frozen bbox model did not pass all Waymo validation gates"
+            ),
         },
         "crowd": crowd_result["summary"],
         "waymo": waymo_result["summary"],

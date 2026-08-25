@@ -14,7 +14,7 @@ class IO:
     def save_plotly_figure(self, fig, filename, width=1600, height=900, scale=1, save_final=True, save_png=True,
                            save_eps=True):
         """
-        Saves a Plotly figure as HTML, PNG, SVG, and EPS formats.
+        Saves a Plotly figure as HTML, PNG and EPS formats.
 
         Args:
             fig (plotly.graph_objs.Figure): Plotly figure object.

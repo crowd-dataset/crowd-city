@@ -797,10 +797,10 @@ def overlay_video(
 # ============================================================
 # EDIT ONLY THIS SECTION (single video/csv; runs BOTH analyses)
 # ============================================================
-video_id = "3ai7SUaPoHM"
+video_id = "gYKMob1pfcQ"
 
 video_path = os.path.join("videos", f"{video_id}.mp4")
-csv_path = find_csv_for_video(video_id, common.get_configs("data"))
+csv_path = find_csv_for_video(video_id, data_dir="data/bbox")
 
 _, start_seconds, _fps_str = parse_csv_filename(csv_path)
 output_path = os.path.join("videos", f"{video_id}_overlay_{int(start_seconds)}s.mp4")

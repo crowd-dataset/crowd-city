@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="680">
+<rect width="100%" height="100%" fill="white"/>
+<text x="380" y="34" text-anchor="middle" font-family="Arial" font-size="21">Waymo validation speed residuals</text>
+<text x="380" y="56" text-anchor="middle" font-family="Arial" font-size="13">Error = estimated minus Waymo ground truth; bias -0.03 m/s</text>
+<line x1="90" y1="600" x2="725" y2="600" stroke="#333"/>
+<line x1="90" y1="70" x2="90" y2="600" stroke="#333"/>
+<line x1="90" y1="248.4" x2="725" y2="248.4" stroke="#777" stroke-dasharray="6 4"/>
+<text x="407.5" y="660" text-anchor="middle" font-family="Arial" font-size="15">Waymo ground truth speed (m/s)</text>
+<text transform="translate(22 335.0) rotate(-90)" text-anchor="middle" font-family="Arial" font-size="15">Signed error (m/s)</text>
+<circle cx="380.8" cy="114.2" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="348.6" cy="269.9" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="427.0" cy="264.5" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="434.7" cy="127.3" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="489.7" cy="241.9" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="503.7" cy="265.0" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="485.4" cy="245.5" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="447.0" cy="207.4" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="403.5" cy="295.7" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="340.0" cy="227.4" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="449.0" cy="244.2" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="439.0" cy="206.4" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="410.6" cy="185.7" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="397.9" cy="226.8" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="364.8" cy="216.0" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="362.2" cy="206.2" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="554.7" cy="299.6" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="443.8" cy="247.5" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="427.0" cy="216.7" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="403.2" cy="337.3" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="483.4" cy="264.7" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="522.6" cy="379.7" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="567.3" cy="420.8" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="393.1" cy="239.2" r="4" fill="#D55E00" fill-opacity="0.70"/>
+<circle cx="681.2" cy="555.8" r="4" fill="#D55E00" fill-opacity="0.70"/>
+</svg>

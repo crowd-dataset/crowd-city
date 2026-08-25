@@ -36,8 +36,14 @@ class IO:
                 - `logger`: Logging utility.
                 - `folder_path`: Path to search for CSV files.
         """
-        # Only process files ending with ".csv"
-        file = tools_class.clean_csv_filename(file)
+        # Reject macOS resource forks and non CSV entries before normalising
+        # the name. Cleaning ``._bbox`` first used to turn it into ``_bbox``
+        # and analysis.py then attempted to open a path that never existed.
+        original_file = os.fspath(file)
+        if original_file.startswith(".") or not original_file.lower().endswith(".csv"):
+            return None
+
+        file = tools_class.clean_csv_filename(original_file)
         if file.endswith(".csv"):
             filename = os.path.splitext(file)[0]
 
@@ -54,4 +60,6 @@ class IO:
                 if vehicle_type not in vehicle_list:
                     return None
 
-        return file
+            return original_file
+
+        return None

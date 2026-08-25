@@ -1,3 +1,4 @@
+import os
 import common
 import pandas as pd
 import numpy as np
@@ -13,6 +14,14 @@ plots_io_class = IO()
 grouping_class = Grouping()
 tools_class = Tools()
 logger = CustomLogger(__name__)  # use custom logger
+
+
+def crossing_metric_label() -> str:
+    return (
+        "Crossing speed (m/s)"
+        if os.environ.get("CROWD_CROSSING_SPEED_UNIT") == "m/s"
+        else "Relative crossing motion"
+    )
 
 
 class Correlations:
@@ -185,7 +194,7 @@ class Correlations:
 
         # Rename the variables in the correlation matrix
         rename_dict_1 = {
-            'avg_speed_0': 'Relative crossing motion', 'avg_speed_1': 'Relative crossing motion',
+            'avg_speed_0': crossing_metric_label(), 'avg_speed_1': crossing_metric_label(),
             'avg_time_0': 'Crossing initiation time', 'avg_time_1': 'Crossing initiation time',
             'ped_cross_locality_0': 'Crossing', 'ped_cross_locality_1': 'Crossing',
             'person_locality_0': 'Detected persons', 'person_locality_1': 'Detected persons',
@@ -306,7 +315,7 @@ class Correlations:
 
         # Rename the variables in the correlation matrix (example: renaming keys)
         rename_dict_2 = {
-            'avg_speed_val': 'Relative crossing motion', 'avg_time_val': 'Crossing initiation time',
+            'avg_speed_val': crossing_metric_label(), 'avg_time_val': 'Crossing initiation time',
             'ped_cross_locality': 'Crossing', 'person_locality': 'Detected persons',
             'bicycle_locality': 'Detected bicycles', 'car_locality': 'Detected cars',
             'motorcycle_locality': 'Detected motorcycles', 'bus_locality': 'Detected buses',
@@ -408,7 +417,7 @@ class Correlations:
 
             # Rename the variables in the correlation matrix (example: renaming keys)
             rename_dict_3 = {
-                'avg_speed_val': 'Relative crossing motion', 'avg_time_val': 'Crossing initiation time',
+                'avg_speed_val': crossing_metric_label(), 'avg_time_val': 'Crossing initiation time',
                 'ped_cross_locality': 'Crossing', 'person_locality': 'Detected persons',
                 'bicycle_locality': 'Detected bicycles', 'car_locality': 'Detected cars',
                 'motorcycle_locality': 'Detected motorcycles', 'bus_locality': 'Detected buses',
@@ -649,8 +658,8 @@ class Correlations:
 
         # Rename the variables in the correlation matrix
         rename_dict_1 = {
-            'avg_speed_0': 'Relative crossing motion',
-            'avg_speed_1': 'Relative crossing motion',
+            'avg_speed_0': crossing_metric_label(),
+            'avg_speed_1': crossing_metric_label(),
             'avg_time_0': 'Crossing initiation time',
             'avg_time_1': 'Crossing initiation time',
             'ped_cross_locality_0': 'Detected crossings',
@@ -829,7 +838,7 @@ class Correlations:
 
         # Rename the variables in the correlation matrix (example: renaming keys)
         rename_dict_2 = {
-            'avg_day_night_speed': 'Relative crossing motion',
+            'avg_day_night_speed': crossing_metric_label(),
             'avg_day_night_time': 'Crossing initiation time',
             'ped_cross_locality': 'Detected crossings',
             'person_locality': 'Detected persons',
@@ -965,7 +974,7 @@ class Correlations:
 
             # Rename the variables in the correlation matrix (example: renaming keys)
             rename_dict_3 = {
-                'avg_day_night_speed': 'Relative crossing motion',
+                'avg_day_night_speed': crossing_metric_label(),
                 "avg_day_night_time": 'Crossing initiation time',
                 'ped_cross_locality': 'Detected crossings',
                 'person_locality': 'Detected persons',

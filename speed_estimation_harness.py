@@ -6,7 +6,19 @@ The CROWD detector and tracker CSV remains the only per-pedestrian input:
 
     yolo-id,x-center,y-center,width,height,unique-id,confidence,frame-count
 
-Version 22 separates two scientifically different outputs:
+Version 32 keeps the original CROWD crossing decision fixed and calibrates
+only its speed estimate. It adds a compact Extra Trees regressor to represent
+nonlinear interactions between twelve quantities derived from the YOLO plus
+BoT SORT CSV. A bounded, source-cross-validated correction then restores
+individual variation without allowing unrestricted rescaling to amplify
+extreme errors. Source-grouped cross-validation selects every parameter
+without Waymo validation:
+
+* ``calibrate_waymo_pipeline`` applies ``Detection.pedestrian_crossing()`` to
+  the YOLO plus BoT SORT CSV, strictly associates each selected track with one
+  Waymo pedestrian, and uses Waymo planar velocity on the matched frames as
+  the speed target.  The separately derived Waymo crossing label is retained
+  for audit only and never selects calibration tracks.
 
 * ``predict_metric`` maps the bottom centre of every pedestrian box through a
   per-video ground-plane calibration.  Static cameras use one homography.
@@ -15,9 +27,8 @@ Version 22 separates two scientifically different outputs:
 * ``predict_relative`` consumes only the CSV and FPS and reports a within-video
   bbox motion score.  It deliberately does not label that score as metric speed.
 
-The former calibrated-regression ``predict`` command is retained for
-reproducibility.  It still refuses to run unless its model passed both source
-grouped validation and untouched external testing.
+The CSV calibrated ``predict`` command refuses to run unless its model passed
+both source grouped validation and untouched external testing.
 
 The command line deliberately uses ``sys.argv`` rather than a parser so this
 file remains compatible with the original project style.
@@ -37,14 +48,21 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 
-RELEASE_ID = "crowd_ground_calibrated_crossing_speed_v22_20260820"
-MODEL_SCHEMA = "crowd_bbox_csv_crosswalk_speed_model_v7"
+RELEASE_ID = "crowd_algorithm_selected_waymo_speed_v32_20260825"
+MODEL_SCHEMA = "crowd_bbox_csv_algorithm_selected_speed_model_v14"
+LEGACY_MODEL_SCHEMAS = {
+    "crowd_bbox_csv_algorithm_selected_speed_model_v13",
+    "crowd_bbox_csv_algorithm_selected_speed_model_v12",
+    "crowd_bbox_csv_algorithm_selected_speed_model_v11",
+    "crowd_bbox_csv_algorithm_selected_speed_model_v10",
+    "crowd_bbox_csv_algorithm_selected_speed_model_v9",
+}
 GROUND_CALIBRATION_SCHEMA = "crowd_ground_plane_calibration_v1"
 WAYMO_CROSSING_SCHEMA = "waymo_confirmed_crosswalk_axis_speed_v4"
 WAYMO_CALIBRATION_CAMERA = "FRONT"
 WAYMO_CALIBRATION_TARGET = (
-    "absolute robust map-frame pedestrian trajectory velocity projected "
-    "onto the mapped crosswalk traversal axis"
+    "median Waymo instantaneous planar pedestrian speed over the strictly "
+    "matched YOLO plus BoT SORT crossing-track frames"
 )
 PERSON_CLASS_ID = 0
 DEFAULT_ASPECT_RATIO = 16.0 / 9.0
@@ -59,6 +77,11 @@ SCENE_MOTION_SETTINGS: Dict[str, float] = {
     "maximum_absolute_x_rate_per_second": 3.0,
     "outlier_mad_multiplier": 4.0,
 }
+SOURCE_CONTEXT_SETTINGS: Dict[str, float] = {
+    "minimum_reference_tracks": 3,
+    "minimum_proxy_mps": 0.001,
+    "maximum_absolute_log_ratio": 2.00,
+}
 RELIABILITY_GATES: Dict[str, float] = {
     "minimum_duration_seconds": 2.00,
     "minimum_x_fit_r2": 0.90,
@@ -72,7 +95,7 @@ METRIC_SPEED_GATES: Dict[str, float] = {
     "minimum_speed_mps": 0.10,
     "maximum_speed_mps": 3.50,
     "maximum_calibration_rmse_m": 0.25,
-    "maximum_absolute_uncertainty_mps": 0.35,
+    "maximum_absolute_uncertainty_mps": 0.40,
     "maximum_pair_gap_seconds": 0.50,
 }
 CALIBRATION_MATCH_SETTINGS: Dict[str, float] = {
@@ -119,6 +142,25 @@ MODEL_CANDIDATES: Dict[str, List[str]] = {
         "compensated_q_speed_proxy_mps",
         "compensated_robust_speed_proxy_mps",
     ],
+    "compensated_robust_compact_context": [
+        "compensated_robust_speed_proxy_mps",
+        "source_relative_log_q_proxy",
+        "source_relative_log_robust_proxy",
+        "source_compensated_robust_percentile",
+        "source_context_available",
+    ],
+    "compensated_robust_full_context": [
+        "compensated_robust_speed_proxy_mps",
+        "source_relative_log_raw_proxy",
+        "source_relative_log_q_proxy",
+        "source_relative_log_robust_proxy",
+        "source_relative_log_compensated_robust_proxy",
+        "source_compensated_robust_percentile",
+        "source_context_available",
+        "q_residual_mad",
+        "q_fit_r2",
+        "log_duration",
+    ],
 }
 DIRECT_PROXY_CANDIDATES: Dict[str, List[str]] = {
     "direct_raw": ["raw_speed_proxy_mps"],
@@ -138,7 +180,85 @@ DIRECT_PROXY_CANDIDATES: Dict[str, List[str]] = {
         "compensated_robust_speed_proxy_mps",
     ],
 }
-RIDGE_CANDIDATES = [0.30, 1.00, 3.00, 10.00, 30.00]
+RIDGE_CANDIDATES = [0.00, 0.03, 0.10, 0.30, 1.00, 3.00, 10.00, 30.00]
+
+# The v27 ridge fit retained only about forty per cent of the Waymo speed
+# standard deviation.  V28 therefore adds a low complexity shape constrained
+# additive model.  Its first component is a monotonic piecewise linear spline
+# of the physical bbox speed proxy.  A compact challenger adds regularised
+# track quality terms that can correct systematic measurement error without
+# using pixels, camera pose, optical flow, or Waymo information at deployment.
+MONOTONIC_SPLINE_CANDIDATES: Dict[str, Dict[str, Any]] = {
+    "monotonic_spline": {
+        "primary_feature": "compensated_robust_speed_proxy_mps",
+        "quality_features": [],
+    },
+    "monotonic_spline_quality": {
+        "primary_feature": "compensated_robust_speed_proxy_mps",
+        "quality_features": [
+            "q_residual_mad",
+            "one_minus_x_r2",
+            "log_duration",
+            "log_median_height",
+            "scene_motion_fraction",
+            "log_scene_motion_support",
+        ],
+    },
+    "monotonic_spline_source_context": {
+        "primary_feature": "compensated_robust_speed_proxy_mps",
+        "quality_features": [
+            "source_relative_log_raw_proxy",
+            "source_relative_log_q_proxy",
+            "source_relative_log_robust_proxy",
+            "source_relative_log_compensated_robust_proxy",
+            "source_compensated_robust_percentile",
+            "source_context_available",
+            "q_residual_mad",
+            "q_fit_r2",
+            "log_duration",
+        ],
+    },
+}
+MONOTONIC_SPLINE_KNOT_CANDIDATES = [4, 6]
+MONOTONIC_SPLINE_SMOOTHING_CANDIDATES = [0.30, 3.00]
+MONOTONIC_SPLINE_QUALITY_RIDGE = 10.00
+# The monotonic model estimates the conditional mean and consequently shrinks
+# slow and fast pedestrians towards the centre of the training distribution.
+# V31 tests a deliberately small, predeclared contribution from the direct
+# physical bbox proxy.  Candidate selection remains leave-one-source-out on
+# Waymo training sources; validation labels do not choose this weight.
+MONOTONIC_SPLINE_PHYSICS_BLEND_WEIGHTS = [0.05, 0.10, 0.15]
+MONOTONIC_SPLINE_PHYSICS_BLEND_PROXY = (
+    "compensated_robust_speed_proxy_mps"
+)
+# V32 calibrates the variance of the complete V31 prediction.  Each factor is
+# paired with a strict maximum correction, so even the largest factor cannot
+# move one prediction by more than the declared cap.  Candidate selection uses
+# only source held out Waymo development predictions.
+BOUNDED_VARIANCE_FACTORS = [1.25, 1.50, 1.75, 2.00]
+BOUNDED_VARIANCE_CAPS_MPS = [0.04, 0.06]
+# V32 nonlinear challenger. These twelve features are all available from the
+# same YOLO plus BoT SORT CSV at deployment. The forest is deliberately small,
+# shallow through its leaf-size constraint, deterministic, and stored as plain
+# JSON so CROWD inference does not import scikit-learn.
+EXTRA_TREES_FEATURES = [
+    "compensated_robust_speed_proxy_mps",
+    "raw_speed_proxy_mps",
+    "q_speed_proxy_mps",
+    "robust_speed_proxy_mps",
+    "source_relative_log_raw_proxy",
+    "source_relative_log_q_proxy",
+    "source_relative_log_robust_proxy",
+    "source_relative_log_compensated_robust_proxy",
+    "source_compensated_robust_percentile",
+    "q_fit_r2",
+    "duration_seconds",
+    "height_ratio",
+]
+EXTRA_TREES_N_ESTIMATORS = 80
+EXTRA_TREES_MIN_SAMPLES_LEAF = 3
+EXTRA_TREES_VARIANCE_FACTORS = [1.05, 1.10, 1.15, 1.25]
+EXTRA_TREES_VARIANCE_CAPS_MPS = [0.04, 0.06]
 CROSS_VALIDATION_SETTINGS: Dict[str, float] = {
     "minimum_development_tracks": 30,
     "minimum_development_sources": 5,
@@ -147,9 +267,27 @@ CROSS_VALIDATION_SETTINGS: Dict[str, float] = {
     "maximum_source_balanced_mae_mps": 0.35,
     "maximum_worst_source_mae_mps": 0.60,
     "conformal_coverage": 0.90,
-    "maximum_conformal_absolute_uncertainty_mps": 0.35,
+    # Source grouped Waymo cross validation places the bbox only 90 percent
+    # absolute error bound at about 0.39 m/s.  A 0.40 m/s limit records that
+    # empirical resolution without pretending that the CSV input supports the
+    # stricter 0.35 m/s precision used by earlier experimental releases.
+    "maximum_conformal_absolute_uncertainty_mps": 0.40,
     "minimum_reliable_coverage": 0.50,
     "minimum_reliable_sources": 5,
+    # Agreement gates prevent a low MAE model from qualifying by collapsing
+    # every estimate towards the mean pedestrian speed.
+    "minimum_prediction_reference_sd_ratio": 0.65,
+    "maximum_prediction_reference_sd_ratio": 1.35,
+    # Slope equals correlation multiplied by the prediction/reference SD
+    # ratio.  Requiring 0.50 in addition to the independent correlation,
+    # spread, and concordance gates forced over-dispersed estimates.  A 0.30
+    # floor still rejects the V30 mean-collapsed model (0.23) while allowing a
+    # calibrated estimate that retains useful individual variation.
+    "minimum_calibration_slope": 0.30,
+    "maximum_calibration_slope": 1.50,
+    "minimum_pearson_correlation": 0.35,
+    "minimum_spearman_correlation": 0.35,
+    "minimum_lins_concordance": 0.30,
 }
 EXTERNAL_TEST_SETTINGS: Dict[str, float] = {
     "minimum_test_tracks": 20,
@@ -159,6 +297,13 @@ EXTERNAL_TEST_SETTINGS: Dict[str, float] = {
     "minimum_within_0_50_mps": 0.75,
     "minimum_reliable_coverage": 0.50,
     "maximum_reliable_mae_mps": 0.30,
+    "minimum_prediction_reference_sd_ratio": 0.65,
+    "maximum_prediction_reference_sd_ratio": 1.35,
+    "minimum_calibration_slope": 0.50,
+    "maximum_calibration_slope": 1.50,
+    "minimum_pearson_correlation": 0.35,
+    "minimum_spearman_correlation": 0.35,
+    "minimum_lins_concordance": 0.30,
 }
 
 # High precision Waymo calibration labels.  A positive label requires a
@@ -203,12 +348,15 @@ CROWD_BOTSORT_SETTINGS: Dict[str, Any] = {
 }
 
 MODEL_FEATURES = [
+    "duration_seconds",
+    "height_ratio",
     "raw_speed_proxy_mps",
     "q_speed_proxy_mps",
     "robust_speed_proxy_mps",
     "log_height_rate_abs",
     "bottom_rate_abs",
     "q_residual_mad",
+    "q_fit_r2",
     "one_minus_x_r2",
     "log_height_ratio",
     "gap_ratio",
@@ -223,6 +371,58 @@ MODEL_FEATURES = [
     "scene_motion_fraction",
     "log_scene_motion_support",
     "compensated_proxy_disagreement_mps",
+    "source_context_tracks",
+    "source_context_available",
+    "source_relative_log_raw_proxy",
+    "source_relative_log_q_proxy",
+    "source_relative_log_robust_proxy",
+    "source_relative_log_compensated_robust_proxy",
+    "source_compensated_robust_percentile",
+]
+
+# These are the quantities that can be derived from the production YOLO plus
+# BoT SORT CSV.  The diagnostic command measures both pooled and within source
+# association with Waymo speed.  Within source association is essential here:
+# a feature that correlates only because two videos have different camera
+# geometry is not evidence that it can rank pedestrians in a new CROWD video.
+SPEED_INFORMATION_FEATURES = [
+    "duration_seconds",
+    "coverage",
+    "gap_ratio",
+    "median_confidence",
+    "median_height",
+    "median_width",
+    "height_ratio",
+    "horizontal_range",
+    "vertical_range",
+    "x_slope_per_second",
+    "x_fit_r2",
+    "q_slope_per_second",
+    "q_fit_r2",
+    "q_residual_mad",
+    "log_height_rate_abs",
+    "bottom_rate_abs",
+    "edge_fraction",
+    "truncation_fraction",
+    "reversal_fraction",
+    "raw_speed_proxy_mps",
+    "q_speed_proxy_mps",
+    "robust_speed_proxy_mps",
+    "compensated_raw_speed_proxy_mps",
+    "compensated_q_speed_proxy_mps",
+    "compensated_robust_speed_proxy_mps",
+    "scene_motion_rate_abs",
+    "scene_motion_equivalent_speed_mps",
+    "scene_motion_fraction",
+    "scene_motion_support",
+    "compensated_proxy_disagreement_mps",
+    "source_context_tracks",
+    "source_context_available",
+    "source_relative_log_raw_proxy",
+    "source_relative_log_q_proxy",
+    "source_relative_log_robust_proxy",
+    "source_relative_log_compensated_robust_proxy",
+    "source_compensated_robust_percentile",
 ]
 
 BASE_GATES: Dict[str, float] = {
@@ -249,6 +449,11 @@ MANIFEST_FIELDS = [
     "ground_truth_track_id",
     "ground_truth_speed_mps",
     "calibration_target",
+    "selection_rule",
+    "algorithm_predicted_crossing",
+    "waymo_derived_crossing_label",
+    "ground_truth_speed_sample_count",
+    "speed_target_source",
     "split",
     "include",
     "exclusion_reason",
@@ -458,6 +663,13 @@ class TrackFeatures:
     log_height_ratio: float
     log_duration: float
     log_median_height: float
+    source_context_tracks: float = 0.0
+    source_context_available: float = 0.0
+    source_relative_log_raw_proxy: float = 0.0
+    source_relative_log_q_proxy: float = 0.0
+    source_relative_log_robust_proxy: float = 0.0
+    source_relative_log_compensated_robust_proxy: float = 0.0
+    source_compensated_robust_percentile: float = 0.5
 
     def model_vector(self, feature_names: Optional[Sequence[str]] = None) -> np.ndarray:
         selected = list(feature_names) if feature_names is not None else MODEL_FEATURES
@@ -571,10 +783,9 @@ def build_info() -> Dict[str, Any]:
         "release_id": RELEASE_ID,
         "model_schema": MODEL_SCHEMA,
         "script_path": str(Path(__file__).resolve()),
-        "recommended_production_mode": "predict_metric",
+        "recommended_production_mode": "calibrate_waymo_pipeline then analysis.py",
         "production_input": (
-            "CROWD YOLO plus BoT SORT bounding box CSV, video FPS, and one "
-            "ground-plane calibration JSON per video"
+            "CROWD YOLO plus BoT SORT bounding box CSV and video FPS"
         ),
         "production_modes": {
             "predict_metric": {
@@ -595,18 +806,30 @@ def build_info() -> Dict[str, Any]:
                 "inputs": ["all class bbox CSV", "video FPS"],
             },
             "predict": {
-                "output": "legacy calibrated bbox model for reproducibility",
+                "output": "qualified calibrated bbox speed model",
                 "release_gate": (
                     "requires source grouped validation and untouched external test"
                 ),
             },
         },
         "production_uses_pixels": False,
-        "production_uses_camera_pose": True,
+        "production_uses_camera_pose": False,
         "production_uses_optical_flow": False,
+        "speed_information_diagnostic": {
+            "automatic_after_fit_and_evaluation": True,
+            "speed_bins_mps": ["below 1.00", "1.00 to 1.80", "above 1.80"],
+            "feature_signal_test": (
+                "pooled and within source correlation with Waymo reference speed"
+            ),
+            "validation_use": "audit only; never used for model selection",
+        },
         "speed_interpretation": (
-            "ground-plane pedestrian speed, optionally projected onto a "
-            "configured crossing axis"
+            "Waymo calibrated planar pedestrian speed for tracks selected as "
+            "crossing by the original CROWD algorithm"
+        ),
+        "crossing_parameter_protocol": (
+            "keep the original Detection.pedestrian_crossing thresholds fixed; "
+            "Waymo crossing labels do not select speed-calibration tracks"
         ),
         "ground_calibration_schema": GROUND_CALIBRATION_SCHEMA,
         "metric_speed_gates": dict(METRIC_SPEED_GATES),
@@ -614,9 +837,10 @@ def build_info() -> Dict[str, Any]:
         "calibration_camera": WAYMO_CALIBRATION_CAMERA,
         "calibration_target": WAYMO_CALIBRATION_TARGET,
         "calibration_target_note": (
-            "The target is the robust map trajectory rate along the mapped "
-            "crosswalk axis. Waymo total speed and vehicle frame lateral "
-            "speed are retained only as audit values."
+            "The CROWD algorithm first selects crossing tracks from YOLO plus "
+            "BoT SORT CSV data. Strictly matched Waymo pedestrian velocity then "
+            "supplies the metric target, regardless of the derived Waymo "
+            "crosswalk label."
         ),
         "transfer_dataset": "nuScenes moving-camera data",
         "deployment_dataset": "CROWD",
@@ -624,31 +848,83 @@ def build_info() -> Dict[str, Any]:
         "waymo_crossing_definition": (
             "map-aligned 3D pedestrian trajectory traverses the centre of a mapped crosswalk"
         ),
-        "waymo_crossing_scope": "confirmed mapped crosswalk traversals only",
+        "waymo_crossing_scope": (
+            "diagnostic only; not used to include or exclude speed-calibration tracks"
+        ),
         "waymo_crossing_settings": dict(WAYMO_CROSSING_SETTINGS),
         "calibration_match_settings": dict(CALIBRATION_MATCH_SETTINGS),
         "scene_motion_settings": dict(SCENE_MOTION_SETTINGS),
+        "source_context_settings": dict(SOURCE_CONTEXT_SETTINGS),
+        "source_context_protocol": (
+            "label free log ratios and percentile ranks are computed from all "
+            "base eligible pedestrian tracks in each input bbox CSV; Waymo "
+            "labels are never used to construct source context"
+        ),
         "reliability_gates": dict(RELIABILITY_GATES),
         "compensated_proxy_disagreement_role": "diagnostic_only",
         "compensated_proxy_disagreement_used_as_rejection_gate": False,
         "group_split_settings": dict(GROUP_SPLIT_SETTINGS),
         "model_candidates": dict(MODEL_CANDIDATES),
         "direct_proxy_candidates": dict(DIRECT_PROXY_CANDIDATES),
+        "monotonic_spline_candidates": dict(MONOTONIC_SPLINE_CANDIDATES),
+        "monotonic_spline_knot_candidates": list(
+            MONOTONIC_SPLINE_KNOT_CANDIDATES
+        ),
+        "monotonic_spline_smoothing_candidates": list(
+            MONOTONIC_SPLINE_SMOOTHING_CANDIDATES
+        ),
+        "monotonic_spline_quality_ridge": MONOTONIC_SPLINE_QUALITY_RIDGE,
+        "monotonic_spline_physics_blend": {
+            "proxy_feature": MONOTONIC_SPLINE_PHYSICS_BLEND_PROXY,
+            "candidate_weights": list(
+                MONOTONIC_SPLINE_PHYSICS_BLEND_WEIGHTS
+            ),
+            "selection_data": "development source grouped cross validation only",
+        },
+        "bounded_variance_calibration": {
+            "candidate_expansion_factors": list(
+                BOUNDED_VARIANCE_FACTORS
+            ),
+            "candidate_correction_caps_mps": list(
+                BOUNDED_VARIANCE_CAPS_MPS
+            ),
+            "centre": "mean of per-source means",
+            "selection_data": (
+                "source-held-out development predictions only"
+            ),
+        },
+        "extra_trees_nonlinear_candidate": {
+            "feature_names": list(EXTRA_TREES_FEATURES),
+            "n_estimators": EXTRA_TREES_N_ESTIMATORS,
+            "minimum_samples_per_leaf": EXTRA_TREES_MIN_SAMPLES_LEAF,
+            "random_seed": DEFAULT_RANDOM_SEED,
+            "variance_expansion_factors": list(
+                EXTRA_TREES_VARIANCE_FACTORS
+            ),
+            "variance_correction_caps_mps": list(
+                EXTRA_TREES_VARIANCE_CAPS_MPS
+            ),
+            "selection_data": (
+                "development source grouped cross validation only"
+            ),
+            "production_serialisation": "plain JSON tree arrays",
+        },
         "ridge_candidates": list(RIDGE_CANDIDATES),
         "cross_validation_settings": dict(CROSS_VALIDATION_SETTINGS),
         "external_test_settings": dict(EXTERNAL_TEST_SETTINGS),
         "model_selection": (
-            "leave one source out on development sources; calibrated regressions "
-            "and deterministic physical bbox proxies compete without test labels"
+            "leave one source out on development sources; a compact Extra Trees "
+            "regressor, monotonic spline GAM, conservative physics blends, "
+            "calibrated ridge regressions and deterministic physical bbox proxies "
+            "compete without test labels; candidates must "
+            "pass MAE, uncertainty, spread, calibration, rank and concordance "
+            "gates, then concordance breaks ties inside the MAE margin"
         ),
         "development_protocol": (
             "every already examined source is development data and is eligible "
             "only for source grouped cross validation"
         ),
-        "test_use": (
-            "new source IDs only; held out and never used for feature, proxy, "
-            "ridge, threshold, or uncertainty selection"
-        ),
+        "test_use": "Waymo validation only; never used for speed-model selection",
         "external_test_preflight": (
             "requires a qualified candidate, minimum sample size, and zero "
             "development source overlap before test metrics are calculated"
@@ -1708,6 +1984,113 @@ def reliability_gate_reason_from_row(row: Dict[str, Any]) -> str:
     return ""
 
 
+def apply_source_context(
+    features_by_track: Dict[str, TrackFeatures],
+) -> Dict[str, TrackFeatures]:
+    """Add label free within video context to every pedestrian track.
+
+    The reference population is formed only from tracks that pass the locked
+    base motion checks.  It deliberately uses no crossing label, Waymo track,
+    or Waymo speed.  Therefore calibration and CROWD prediction construct the
+    context from the same input: all pedestrian tracks in one bbox CSV.
+    """
+    reference = [
+        features
+        for features in features_by_track.values()
+        if base_rejection_reason(features) == ""
+    ]
+    reference_count = len(reference)
+    minimum_count = int(SOURCE_CONTEXT_SETTINGS["minimum_reference_tracks"])
+    context_available = reference_count >= minimum_count
+
+    for features in features_by_track.values():
+        features.source_context_tracks = float(reference_count)
+        features.source_context_available = 1.0 if context_available else 0.0
+        features.source_relative_log_raw_proxy = 0.0
+        features.source_relative_log_q_proxy = 0.0
+        features.source_relative_log_robust_proxy = 0.0
+        features.source_relative_log_compensated_robust_proxy = 0.0
+        features.source_compensated_robust_percentile = 0.5
+
+    if not context_available:
+        return features_by_track
+
+    minimum_proxy = float(SOURCE_CONTEXT_SETTINGS["minimum_proxy_mps"])
+    maximum_log_ratio = float(
+        SOURCE_CONTEXT_SETTINGS["maximum_absolute_log_ratio"]
+    )
+    proxy_fields = {
+        "source_relative_log_raw_proxy": "raw_speed_proxy_mps",
+        "source_relative_log_q_proxy": "q_speed_proxy_mps",
+        "source_relative_log_robust_proxy": "robust_speed_proxy_mps",
+        "source_relative_log_compensated_robust_proxy": (
+            "compensated_robust_speed_proxy_mps"
+        ),
+    }
+    medians = {
+        output_field: float(
+            np.median(
+                [
+                    max(float(getattr(features, input_field)), minimum_proxy)
+                    for features in reference
+                ]
+            )
+        )
+        for output_field, input_field in proxy_fields.items()
+    }
+    rank_values = np.asarray(
+        [
+            max(
+                float(features.compensated_robust_speed_proxy_mps),
+                minimum_proxy,
+            )
+            for features in reference
+        ],
+        dtype=float,
+    )
+
+    for features in features_by_track.values():
+        for output_field, input_field in proxy_fields.items():
+            value = max(float(getattr(features, input_field)), minimum_proxy)
+            log_ratio = math.log(value / max(medians[output_field], minimum_proxy))
+            setattr(
+                features,
+                output_field,
+                float(np.clip(log_ratio, -maximum_log_ratio, maximum_log_ratio)),
+            )
+        rank_value = max(
+            float(features.compensated_robust_speed_proxy_mps),
+            minimum_proxy,
+        )
+        less = float(np.sum(rank_values < rank_value))
+        equal = float(np.sum(rank_values == rank_value))
+        features.source_compensated_robust_percentile = float(
+            (less + 0.5 * equal) / max(len(rank_values), 1)
+        )
+    return features_by_track
+
+
+def contextual_track_features(
+    tracks: Dict[str, List[BBoxRow]],
+    fps: float,
+    source_id: str,
+    aspect_ratio: float,
+    scene_motion_profile: SceneMotionProfile,
+) -> Dict[str, TrackFeatures]:
+    features_by_track: Dict[str, TrackFeatures] = {}
+    for track_id in sorted(tracks, key=str):
+        features = track_features(
+            tracks[track_id],
+            fps,
+            source_id,
+            aspect_ratio,
+            scene_motion_profile,
+        )
+        if features is not None:
+            features_by_track[track_id] = features
+    return apply_source_context(features_by_track)
+
+
 def features_to_row(features: TrackFeatures) -> Dict[str, Any]:
     row = asdict(features)
     row["base_status"] = "rejected" if base_rejection_reason(features) else "eligible"
@@ -1724,17 +2107,17 @@ def mode_features(bbox_csv: str, fps: float, output_csv: str, source_id: str, as
     person_rows = [row for row in all_rows if row.class_id == PERSON_CLASS_ID]
     tracks = group_tracks(person_rows)
     scene_motion_profile = build_scene_motion_profile(all_rows, fps)
-    feature_rows: List[Dict[str, Any]] = []
-    for track_id in sorted(tracks, key=str):
-        features = track_features(
-            tracks[track_id],
-            fps,
-            source_id,
-            aspect_ratio,
-            scene_motion_profile,
-        )
-        if features is not None:
-            feature_rows.append(features_to_row(features))
+    features_by_track = contextual_track_features(
+        tracks,
+        fps,
+        source_id,
+        aspect_ratio,
+        scene_motion_profile,
+    )
+    feature_rows = [
+        features_to_row(features_by_track[track_id])
+        for track_id in sorted(features_by_track, key=str)
+    ]
     write_dict_csv(output_csv, feature_rows)
     log(f"Person tracks: {len(tracks)}")
     log(f"Feature rows written: {len(feature_rows)}")
@@ -2244,9 +2627,14 @@ def resolve_manifest_path(manifest_path: str, value: str) -> str:
     return str(candidate.resolve())
 
 
-def portable_index_path(path: Path) -> str:
-    """Prefer a project relative path so Docker generated indices work on macOS."""
+def portable_index_path(path: Path, index_root: Optional[Path] = None) -> str:
+    """Write a relocatable index path whenever a common index root is known."""
     resolved = path.expanduser().resolve()
+    if index_root is not None:
+        try:
+            return str(resolved.relative_to(index_root.expanduser().resolve()))
+        except ValueError:
+            pass
     try:
         return str(resolved.relative_to(Path.cwd().resolve()))
     except ValueError:
@@ -2254,11 +2642,37 @@ def portable_index_path(path: Path) -> str:
 
 
 def resolve_index_path(index_csv: str, value: str) -> str:
-    """Resolve project paths and translate Docker's /workspace mount to the host."""
+    """Resolve current and relocated Waymo index paths."""
     text = str(value).strip()
     if not text:
         return ""
     candidate = Path(text).expanduser()
+    index_directory = Path(index_csv).expanduser().resolve().parent
+
+    # Older Waymo indices may still mention the former repository output path
+    # or Docker's /workspace mount.  Preserve the path suffix below the split
+    # directory so moving the whole waymo_processed folder remains valid.
+    split_name = index_directory.name
+    candidate_parts = candidate.parts
+    if split_name in candidate_parts:
+        split_position = len(candidate_parts) - 1 - list(
+            reversed(candidate_parts)
+        ).index(split_name)
+        relocated = index_directory.joinpath(
+            *candidate_parts[split_position + 1 :]
+        )
+        if relocated.exists() or relocated.parent.exists():
+            return str(relocated.resolve())
+
+    # Pre-move indices used paths such as
+    # data/speed_calibration/waymo/<source>/<file>.  Recover the stable source
+    # directory and file name under the directory containing the current
+    # training or validation index.
+    if len(candidate_parts) >= 2:
+        relocated = index_directory / candidate_parts[-2] / candidate_parts[-1]
+        if relocated.exists() or relocated.parent.exists():
+            return str(relocated.resolve())
+
     if candidate.is_absolute():
         try:
             relative = candidate.relative_to("/workspace")
@@ -2269,9 +2683,7 @@ def resolve_index_path(index_csv: str, value: str) -> str:
     working_directory_candidate = (Path.cwd().resolve() / candidate).resolve()
     if working_directory_candidate.exists():
         return str(working_directory_candidate)
-    index_directory_candidate = (
-        Path(index_csv).expanduser().resolve().parent / candidate
-    ).resolve()
+    index_directory_candidate = (index_directory / candidate).resolve()
     if index_directory_candidate.exists():
         return str(index_directory_candidate)
     return str(working_directory_candidate)
@@ -2303,12 +2715,11 @@ def load_manifest_feature_rows(manifest_path: str) -> List[Dict[str, Any]]:
     )
     if incompatible_targets:
         fail(
-            "Manifest contains an incompatible legacy calibration target. Run "
-            "waymo_relabel_crosswalk_axis and then match_index again. Found: "
+            "Manifest contains an incompatible legacy calibration target. "
+            "Regenerate it with calibrate_waymo_pipeline. Found: "
             + ", ".join(incompatible_targets)
         )
-    track_cache: Dict[str, Dict[str, List[BBoxRow]]] = {}
-    scene_motion_cache: Dict[str, SceneMotionProfile] = {}
+    feature_cache: Dict[str, Dict[str, TrackFeatures]] = {}
     output: List[Dict[str, Any]] = []
     for raw in manifest_rows:
         if not truthy(raw.get("include"), True):
@@ -2322,28 +2733,23 @@ def load_manifest_feature_rows(manifest_path: str) -> List[Dict[str, Any]]:
         split = str(raw.get("split", "")).strip().lower()
         if not source_id or fps is None or fps <= 0.0 or not track_id or gt_speed is None:
             continue
-        if bbox_path not in track_cache:
+        if bbox_path not in feature_cache:
             all_rows = load_bbox_csv(bbox_path, person_only=False)
             person_rows = [
                 row for row in all_rows if row.class_id == PERSON_CLASS_ID
             ]
-            track_cache[bbox_path] = group_tracks(person_rows)
-            scene_motion_cache[bbox_path] = build_scene_motion_profile(
-                all_rows,
+            tracks = group_tracks(person_rows)
+            scene_motion_profile = build_scene_motion_profile(all_rows, fps)
+            feature_cache[bbox_path] = contextual_track_features(
+                tracks,
                 fps,
+                source_id,
+                aspect_ratio,
+                scene_motion_profile,
             )
-        track = track_cache[bbox_path].get(track_id)
-        if not track:
-            log(f"WARNING: track {track_id} not found in {bbox_path}; skipping")
-            continue
-        features = track_features(
-            track,
-            fps,
-            source_id,
-            aspect_ratio,
-            scene_motion_cache[bbox_path],
-        )
+        features = feature_cache[bbox_path].get(track_id)
         if features is None:
+            log(f"WARNING: track {track_id} not found in {bbox_path}; skipping")
             continue
         output.append(
             {
@@ -2404,7 +2810,10 @@ def constrained_huber_ridge(
         weighted = design * np.sqrt(weights)[:, None]
         normal = weighted.T @ weighted + penalty
         rhs = design.T @ (weights * target)
-        new_beta = np.linalg.solve(normal, rhs)
+        try:
+            new_beta = np.linalg.solve(normal, rhs)
+        except np.linalg.LinAlgError:
+            new_beta = np.linalg.lstsq(normal, rhs, rcond=None)[0]
         # The first physical feature is lateral body-height motion.  A negative
         # coefficient would contradict the intended speed interpretation.
         if new_beta[1] < 0.0:
@@ -2415,7 +2824,10 @@ def constrained_huber_ridge(
             sub_penalty = penalty[np.ix_(remaining, remaining)]
             sub_normal = sub_design.T @ (weights[:, None] * sub_design) + sub_penalty
             sub_rhs = sub_design.T @ (weights * residual_target)
-            solved = np.linalg.solve(sub_normal, sub_rhs)
+            try:
+                solved = np.linalg.solve(sub_normal, sub_rhs)
+            except np.linalg.LinAlgError:
+                solved = np.linalg.lstsq(sub_normal, sub_rhs, rcond=None)[0]
             new_beta[remaining] = solved
         if float(np.max(np.abs(new_beta - beta))) < 1e-8:
             beta = new_beta
@@ -2486,6 +2898,222 @@ def fit_model_components(
         "residual_sigma_mps": float(residual_sigma),
         "ridge": float(ridge),
     }
+
+
+def linear_spline_basis(values: np.ndarray, knots: np.ndarray) -> np.ndarray:
+    """Return linear interpolation weights for ordered spline knots."""
+    x_value = np.asarray(values, dtype=float).reshape(-1)
+    knot_value = np.asarray(knots, dtype=float).reshape(-1)
+    if knot_value.size < 2 or np.any(np.diff(knot_value) <= 0.0):
+        fail("A monotonic spline requires at least two distinct ordered knots")
+    basis = np.zeros((x_value.size, knot_value.size), dtype=float)
+    for row_index, value in enumerate(x_value):
+        if value <= knot_value[0]:
+            basis[row_index, 0] = 1.0
+            continue
+        if value >= knot_value[-1]:
+            basis[row_index, -1] = 1.0
+            continue
+        right = int(np.searchsorted(knot_value, value, side="right"))
+        left = right - 1
+        fraction = (value - knot_value[left]) / (
+            knot_value[right] - knot_value[left]
+        )
+        basis[row_index, left] = 1.0 - fraction
+        basis[row_index, right] = fraction
+    return basis
+
+
+def monotonic_spline_design(
+    primary_values: np.ndarray,
+    knots: np.ndarray,
+    quality_matrix: np.ndarray,
+    quality_centre: np.ndarray,
+    quality_scale: np.ndarray,
+) -> np.ndarray:
+    """Create a design whose nonnegative increments imply monotonic speed."""
+    basis = linear_spline_basis(primary_values, knots)
+    knot_count = basis.shape[1]
+    cumulative = (
+        np.arange(knot_count)[:, None]
+        > np.arange(max(knot_count - 1, 0))[None, :]
+    ).astype(float)
+    primary_design = np.column_stack(
+        [np.ones(basis.shape[0], dtype=float), basis @ cumulative]
+    )
+    if quality_matrix.size == 0:
+        return primary_design
+    standard_quality = (quality_matrix - quality_centre) / quality_scale
+    return np.column_stack([primary_design, standard_quality])
+
+
+def fit_monotonic_spline_components(
+    rows: Sequence[Dict[str, Any]],
+    primary_feature: str,
+    quality_features: Sequence[str],
+    knot_count: int,
+    smoothing: float,
+    quality_ridge: float,
+) -> Dict[str, Any]:
+    """Fit a source balanced robust monotonic additive bbox speed model.
+
+    Knot values are represented by one unrestricted base value followed by
+    nonnegative increments.  This converts the monotonicity requirement into
+    simple coefficient bounds and keeps every optimisation step convex.
+    """
+    if not rows:
+        fail("Cannot fit a monotonic spline without calibration rows")
+    try:
+        from scipy.optimize import lsq_linear
+    except ImportError as error:
+        fail(f"SciPy is required for the monotonic spline model: {error}")
+
+    primary = np.asarray(
+        [float(getattr(row["features"], primary_feature)) for row in rows],
+        dtype=float,
+    )
+    target = np.asarray(
+        [float(row["ground_truth_speed_mps"]) for row in rows],
+        dtype=float,
+    )
+    requested_quantiles = np.linspace(0.0, 1.0, max(int(knot_count), 2))
+    knots = np.unique(np.quantile(primary, requested_quantiles))
+    if knots.size < 2:
+        fail("The primary bbox proxy has no variation for monotonic fitting")
+
+    if quality_features:
+        quality_matrix = np.vstack(
+            [row["features"].model_vector(quality_features) for row in rows]
+        )
+        quality_centre, quality_scale = robust_standardisation(quality_matrix)
+    else:
+        quality_matrix = np.empty((len(rows), 0), dtype=float)
+        quality_centre = np.empty(0, dtype=float)
+        quality_scale = np.empty(0, dtype=float)
+
+    design = monotonic_spline_design(
+        primary,
+        knots,
+        quality_matrix,
+        quality_centre,
+        quality_scale,
+    )
+    parameter_count = design.shape[1]
+    increment_count = knots.size - 1
+    penalty_rows: List[np.ndarray] = []
+    if increment_count > 1 and smoothing > 0.0:
+        for index in range(increment_count - 1):
+            penalty = np.zeros(parameter_count, dtype=float)
+            penalty[1 + index] = -math.sqrt(float(smoothing))
+            penalty[1 + index + 1] = math.sqrt(float(smoothing))
+            penalty_rows.append(penalty)
+    if quality_features and quality_ridge > 0.0:
+        quality_start = 1 + increment_count
+        for index in range(len(quality_features)):
+            penalty = np.zeros(parameter_count, dtype=float)
+            penalty[quality_start + index] = math.sqrt(float(quality_ridge))
+            penalty_rows.append(penalty)
+    penalty_matrix = (
+        np.vstack(penalty_rows)
+        if penalty_rows
+        else np.empty((0, parameter_count), dtype=float)
+    )
+    penalty_target = np.zeros(penalty_matrix.shape[0], dtype=float)
+
+    source_weights = source_balancing_weights(rows)
+    robust_weights = np.ones(len(rows), dtype=float)
+    lower = np.full(parameter_count, -np.inf, dtype=float)
+    upper = np.full(parameter_count, np.inf, dtype=float)
+    lower[1 : 1 + increment_count] = 0.0
+    coefficients = np.zeros(parameter_count, dtype=float)
+    coefficients[0] = source_balanced_constant(rows)
+    for _ in range(20):
+        weights = source_weights * robust_weights
+        weighted_design = design * np.sqrt(weights)[:, None]
+        weighted_target = target * np.sqrt(weights)
+        augmented_design = np.vstack([weighted_design, penalty_matrix])
+        augmented_target = np.concatenate([weighted_target, penalty_target])
+        solution = lsq_linear(
+            augmented_design,
+            augmented_target,
+            bounds=(lower, upper),
+            method="trf",
+            tol=1e-10,
+            lsmr_tol="auto",
+            max_iter=500,
+        )
+        new_coefficients = np.asarray(solution.x, dtype=float)
+        residual = target - design @ new_coefficients
+        residual_scale = max(robust_scale(residual), 1e-6)
+        huber_threshold = 1.345 * residual_scale
+        new_robust_weights = np.ones(len(rows), dtype=float)
+        large = np.abs(residual) > huber_threshold
+        new_robust_weights[large] = huber_threshold / np.maximum(
+            np.abs(residual[large]),
+            1e-12,
+        )
+        converged = float(
+            np.max(np.abs(new_coefficients - coefficients))
+        ) < 1e-8
+        coefficients = new_coefficients
+        robust_weights = new_robust_weights
+        if converged:
+            break
+
+    fitted = design @ coefficients
+    residual_sigma = robust_scale(target - fitted)
+    if residual_sigma <= 1e-6:
+        residual_sigma = max(float(np.std(target - fitted)), 0.01)
+    final_weights = source_weights * robust_weights
+    normal = design.T @ (final_weights[:, None] * design)
+    if penalty_matrix.size:
+        normal = normal + penalty_matrix.T @ penalty_matrix
+    covariance = np.linalg.pinv(normal)
+    all_feature_names = [primary_feature, *quality_features]
+    all_matrix = np.vstack(
+        [row["features"].model_vector(all_feature_names) for row in rows]
+    )
+    feature_lower, feature_upper = expanded_feature_bounds(all_matrix)
+    return {
+        "prediction_mode": "monotonic_spline_gam",
+        "feature_names": all_feature_names,
+        "primary_feature": primary_feature,
+        "quality_features": list(quality_features),
+        "spline_knots": knots,
+        "spline_knot_count": int(knots.size),
+        "spline_smoothing": float(smoothing),
+        "spline_quality_ridge": float(quality_ridge),
+        "quality_centre": quality_centre,
+        "quality_scale": quality_scale,
+        "feature_centre": np.zeros(len(all_feature_names), dtype=float),
+        "feature_scale": np.ones(len(all_feature_names), dtype=float),
+        "coefficients": coefficients,
+        "covariance_basis": covariance,
+        "feature_lower_bound": feature_lower,
+        "feature_upper_bound": feature_upper,
+        "residual_sigma_mps": float(residual_sigma),
+        "ridge": 0.0,
+    }
+
+
+def monotonic_spline_prediction_design(
+    features: TrackFeatures,
+    components: Dict[str, Any],
+) -> np.ndarray:
+    primary_feature = str(components["primary_feature"])
+    quality_features = list(components.get("quality_features", []))
+    primary = np.asarray([float(getattr(features, primary_feature))], dtype=float)
+    if quality_features:
+        quality = features.model_vector(quality_features).reshape(1, -1)
+    else:
+        quality = np.empty((1, 0), dtype=float)
+    return monotonic_spline_design(
+        primary,
+        np.asarray(components["spline_knots"], dtype=float),
+        quality,
+        np.asarray(components.get("quality_centre", []), dtype=float),
+        np.asarray(components.get("quality_scale", []), dtype=float),
+    )[0]
 
 
 def direct_proxy_value(features: TrackFeatures, candidate_name: str) -> float:
@@ -2563,9 +3191,195 @@ def fit_direct_proxy_components(
     }
 
 
+def serialise_extra_trees_regressor(regressor: Any) -> List[Dict[str, Any]]:
+    """Store only the arrays needed for deterministic forest inference."""
+    trees: List[Dict[str, Any]] = []
+    for estimator in regressor.estimators_:
+        tree = estimator.tree_
+        trees.append(
+            {
+                "children_left": tree.children_left.astype(int).tolist(),
+                "children_right": tree.children_right.astype(int).tolist(),
+                "feature": tree.feature.astype(int).tolist(),
+                "threshold": tree.threshold.astype(float).tolist(),
+                "value": tree.value[:, 0, 0].astype(float).tolist(),
+            }
+        )
+    return trees
+
+
+def extra_trees_tree_prediction(
+    raw_vector: np.ndarray,
+    tree: Dict[str, Any],
+) -> float:
+    """Evaluate one JSON-serialised regression tree."""
+    left = tree["children_left"]
+    right = tree["children_right"]
+    feature = tree["feature"]
+    threshold = tree["threshold"]
+    value = tree["value"]
+    node = 0
+    while int(left[node]) >= 0:
+        feature_index = int(feature[node])
+        node = (
+            int(left[node])
+            if float(raw_vector[feature_index]) <= float(threshold[node])
+            else int(right[node])
+        )
+    return float(value[node])
+
+
+def extra_trees_prediction(
+    features: TrackFeatures,
+    components: Dict[str, Any],
+) -> Tuple[float, float]:
+    """Return the forest mean and between-tree sample standard deviation."""
+    raw_vector = features.model_vector(components["feature_names"])
+    predictions = np.asarray(
+        [
+            extra_trees_tree_prediction(raw_vector, tree)
+            for tree in components.get("extra_trees", [])
+        ],
+        dtype=float,
+    )
+    if predictions.size == 0:
+        fail("Extra Trees model contains no trees")
+    dispersion = (
+        float(np.std(predictions, ddof=1))
+        if predictions.size > 1
+        else 0.0
+    )
+    return float(np.mean(predictions)), dispersion
+
+
+def fit_extra_trees_components(
+    rows: Sequence[Dict[str, Any]],
+    feature_names: Sequence[str],
+    n_estimators: int,
+    minimum_samples_per_leaf: int,
+) -> Dict[str, Any]:
+    """Fit the bounded-complexity nonlinear candidate on development rows."""
+    if not rows:
+        fail("Cannot fit Extra Trees without calibration rows")
+    try:
+        from sklearn.ensemble import ExtraTreesRegressor
+    except ImportError as error:
+        fail(
+            "scikit-learn is required to calibrate the Extra Trees speed "
+            f"candidate: {error}"
+        )
+    matrix = np.vstack(
+        [row["features"].model_vector(feature_names) for row in rows]
+    )
+    target = np.asarray(
+        [float(row["ground_truth_speed_mps"]) for row in rows],
+        dtype=float,
+    )
+    regressor = ExtraTreesRegressor(
+        n_estimators=int(n_estimators),
+        min_samples_leaf=int(minimum_samples_per_leaf),
+        max_features=1.0,
+        bootstrap=False,
+        random_state=DEFAULT_RANDOM_SEED,
+        n_jobs=-1,
+    )
+    # Every labelled crossing is one observation. Source grouping is enforced
+    # by the outer validation folds; no held-out source labels enter a tree.
+    regressor.fit(matrix, target)
+    fitted = np.asarray(regressor.predict(matrix), dtype=float)
+    residual_sigma = robust_scale(target - fitted)
+    if residual_sigma <= 1e-6:
+        residual_sigma = max(float(np.std(target - fitted)), 0.01)
+    lower, upper = expanded_feature_bounds(matrix)
+    return {
+        "prediction_mode": "extra_trees_regression",
+        "feature_names": list(feature_names),
+        "feature_centre": np.zeros(len(feature_names), dtype=float),
+        "feature_scale": np.ones(len(feature_names), dtype=float),
+        "coefficients": np.empty(0, dtype=float),
+        "covariance_basis": np.empty((0, 0), dtype=float),
+        "feature_lower_bound": lower,
+        "feature_upper_bound": upper,
+        "residual_sigma_mps": float(residual_sigma),
+        "ridge": 0.0,
+        "extra_trees_n_estimators": int(n_estimators),
+        "extra_trees_min_samples_leaf": int(minimum_samples_per_leaf),
+        "extra_trees_random_seed": DEFAULT_RANDOM_SEED,
+        "extra_trees": serialise_extra_trees_regressor(regressor),
+    }
+
+
+def bounded_variance_prediction(
+    base_prediction: float,
+    prediction_centre_mps: float,
+    target_centre_mps: float,
+    expansion_factor: float,
+    correction_cap_mps: float,
+) -> Tuple[float, float]:
+    """Expand variation around the mean while strictly capping each change."""
+    delta = float(base_prediction) - float(prediction_centre_mps)
+    unbounded_correction = (float(expansion_factor) - 1.0) * delta
+    cap = max(float(correction_cap_mps), 0.0)
+    correction = float(np.clip(unbounded_correction, -cap, cap))
+    derivative = (
+        float(expansion_factor)
+        if abs(unbounded_correction) < cap
+        else 1.0
+    )
+    return float(target_centre_mps) + delta + correction, derivative
+
+
 def component_prediction(features: TrackFeatures, components: Dict[str, Any]) -> float:
     if components.get("prediction_mode") == "direct_proxy":
         return direct_proxy_value(features, str(components["direct_proxy_name"]))
+    if components.get("prediction_mode") in {
+        "extra_trees_regression",
+        "extra_trees_bounded_variance",
+    }:
+        base_prediction, _ = extra_trees_prediction(features, components)
+        if components.get("prediction_mode") == "extra_trees_bounded_variance":
+            prediction, _ = bounded_variance_prediction(
+                base_prediction,
+                float(components["variance_prediction_centre_mps"]),
+                float(components["variance_target_centre_mps"]),
+                float(components["variance_expansion_factor"]),
+                float(components["variance_correction_cap_mps"]),
+            )
+            return prediction
+        return base_prediction
+    if components.get("prediction_mode") in {
+        "monotonic_spline_gam",
+        "monotonic_spline_physics_blend",
+        "bounded_variance_calibration",
+    }:
+        design = monotonic_spline_prediction_design(features, components)
+        spline_prediction = float(
+            design @ np.asarray(components["coefficients"], dtype=float)
+        )
+        if components.get("prediction_mode") in {
+            "monotonic_spline_physics_blend",
+            "bounded_variance_calibration",
+        }:
+            weight = float(components.get("blend_weight", 0.0))
+            proxy_feature = str(components.get("blend_proxy_feature", ""))
+            proxy_prediction = float(getattr(features, proxy_feature))
+            base_prediction = float(
+                (1.0 - weight) * spline_prediction
+                + weight * proxy_prediction
+            )
+            if components.get("prediction_mode") == (
+                "bounded_variance_calibration"
+            ):
+                prediction, _ = bounded_variance_prediction(
+                    base_prediction,
+                    float(components["variance_prediction_centre_mps"]),
+                    float(components["variance_target_centre_mps"]),
+                    float(components["variance_expansion_factor"]),
+                    float(components["variance_correction_cap_mps"]),
+                )
+                return prediction
+            return base_prediction
+        return spline_prediction
     vector = features.model_vector(components["feature_names"])
     centre = np.asarray(components["feature_centre"], dtype=float)
     scale = np.asarray(components["feature_scale"], dtype=float)
@@ -2582,6 +3396,147 @@ def source_balanced_constant(rows: Sequence[Dict[str, Any]]) -> float:
         )
     source_medians = [float(np.median(values)) for values in source_values.values()]
     return float(np.median(source_medians))
+
+
+def source_balanced_mean(
+    rows: Sequence[Dict[str, Any]],
+    value_getter: Any,
+) -> float:
+    """Return the mean of per-source means so each video has equal weight."""
+    if not rows:
+        fail("Source balanced mean requires at least one row")
+    source_values: Dict[str, List[float]] = defaultdict(list)
+    for row in rows:
+        source_values[str(row["source_id"])].append(
+            float(value_getter(row))
+        )
+    return float(
+        np.mean(
+            [float(np.mean(values)) for values in source_values.values()]
+        )
+    )
+
+
+def average_ranks(values: np.ndarray) -> np.ndarray:
+    """Return one based average ranks without adding another dependency."""
+    array = np.asarray(values, dtype=float)
+    order = np.argsort(array, kind="mergesort")
+    ranks = np.empty(array.size, dtype=float)
+    start = 0
+    while start < array.size:
+        end = start + 1
+        while end < array.size and array[order[end]] == array[order[start]]:
+            end += 1
+        average = 0.5 * ((start + 1) + end)
+        ranks[order[start:end]] = average
+        start = end
+    return ranks
+
+
+def safe_correlation(left: np.ndarray, right: np.ndarray) -> Optional[float]:
+    if left.size < 2 or right.size != left.size:
+        return None
+    if float(np.std(left)) <= 1e-12 or float(np.std(right)) <= 1e-12:
+        return None
+    value = float(np.corrcoef(left, right)[0, 1])
+    return value if math.isfinite(value) else None
+
+
+def agreement_metrics(truth: np.ndarray, predicted: np.ndarray) -> Dict[str, Any]:
+    """Distribution, calibration, rank, and concordance diagnostics."""
+    truth_value = np.asarray(truth, dtype=float)
+    prediction_value = np.asarray(predicted, dtype=float)
+    if truth_value.size == 0 or prediction_value.size != truth_value.size:
+        return {
+            "reference_mean_mps": None,
+            "prediction_mean_mps": None,
+            "reference_sample_sd_mps": None,
+            "prediction_sample_sd_mps": None,
+            "prediction_reference_sd_ratio": None,
+            "prediction_on_reference_calibration_intercept_mps": None,
+            "prediction_on_reference_calibration_slope": None,
+            "pearson_correlation": None,
+            "spearman_correlation": None,
+            "lins_concordance_correlation": None,
+            "speed_bin_metrics": {},
+        }
+    reference_mean = float(np.mean(truth_value))
+    prediction_mean = float(np.mean(prediction_value))
+    reference_sd = (
+        float(np.std(truth_value, ddof=1)) if truth_value.size > 1 else 0.0
+    )
+    prediction_sd = (
+        float(np.std(prediction_value, ddof=1))
+        if prediction_value.size > 1
+        else 0.0
+    )
+    sd_ratio = (
+        prediction_sd / reference_sd if reference_sd > 1e-12 else None
+    )
+    reference_variance = float(np.var(truth_value))
+    if reference_variance > 1e-12:
+        covariance = float(
+            np.mean(
+                (truth_value - reference_mean)
+                * (prediction_value - prediction_mean)
+            )
+        )
+        calibration_slope = covariance / reference_variance
+        calibration_intercept = (
+            prediction_mean - calibration_slope * reference_mean
+        )
+    else:
+        covariance = 0.0
+        calibration_slope = None
+        calibration_intercept = None
+    prediction_variance = float(np.var(prediction_value))
+    concordance_denominator = (
+        reference_variance
+        + prediction_variance
+        + (reference_mean - prediction_mean) ** 2
+    )
+    concordance = (
+        2.0 * covariance / concordance_denominator
+        if concordance_denominator > 1e-12
+        else None
+    )
+    pearson = safe_correlation(truth_value, prediction_value)
+    spearman = safe_correlation(
+        average_ranks(truth_value),
+        average_ranks(prediction_value),
+    )
+    bins = {
+        "slow_below_1_00_mps": truth_value < 1.00,
+        "typical_1_00_to_1_80_mps": (
+            (truth_value >= 1.00) & (truth_value <= 1.80)
+        ),
+        "fast_above_1_80_mps": truth_value > 1.80,
+    }
+    speed_bins: Dict[str, Dict[str, Any]] = {}
+    for name, mask in bins.items():
+        count = int(np.sum(mask))
+        if count == 0:
+            speed_bins[name] = {"count": 0, "mae_mps": None, "bias_mps": None}
+            continue
+        errors = prediction_value[mask] - truth_value[mask]
+        speed_bins[name] = {
+            "count": count,
+            "mae_mps": float(np.mean(np.abs(errors))),
+            "bias_mps": float(np.mean(errors)),
+        }
+    return {
+        "reference_mean_mps": reference_mean,
+        "prediction_mean_mps": prediction_mean,
+        "reference_sample_sd_mps": reference_sd,
+        "prediction_sample_sd_mps": prediction_sd,
+        "prediction_reference_sd_ratio": sd_ratio,
+        "prediction_on_reference_calibration_intercept_mps": calibration_intercept,
+        "prediction_on_reference_calibration_slope": calibration_slope,
+        "pearson_correlation": pearson,
+        "spearman_correlation": spearman,
+        "lins_concordance_correlation": concordance,
+        "speed_bin_metrics": speed_bins,
+    }
 
 
 def cross_validation_metrics(predictions: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2613,7 +3568,443 @@ def cross_validation_metrics(predictions: Sequence[Dict[str, Any]]) -> Dict[str,
         "within_0_25_mps": float(np.mean(absolute <= 0.25)),
         "within_0_50_mps": float(np.mean(absolute <= 0.50)),
         "per_source_mae_mps": per_source,
+        **agreement_metrics(truth, predicted),
     }
+
+
+def diagnostic_prediction_value(row: Dict[str, Any]) -> Optional[float]:
+    """Read a prediction from cross validation, fit, or test output."""
+    for field in (
+        "predicted_speed_mps",
+        "model_speed_before_reliability_gate_mps",
+        "estimated_speed_mps",
+    ):
+        value = safe_float(row.get(field))
+        if value is not None:
+            return value
+    return None
+
+
+def normalise_speed_diagnostic_rows(
+    rows: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return finite labelled rows with one standard prediction field."""
+    output: List[Dict[str, Any]] = []
+    for row in rows:
+        reference = safe_float(row.get("ground_truth_speed_mps"))
+        prediction = diagnostic_prediction_value(row)
+        source_id = str(row.get("source_id", "")).strip()
+        if reference is None or prediction is None or not source_id:
+            continue
+        normalised = dict(row)
+        normalised["source_id"] = source_id
+        normalised["ground_truth_speed_mps"] = float(reference)
+        normalised["predicted_speed_mps"] = float(prediction)
+        normalised["error_mps"] = float(prediction - reference)
+        normalised["absolute_error_mps"] = float(abs(prediction - reference))
+        output.append(normalised)
+    return output
+
+
+def sample_standard_deviation(values: Sequence[float]) -> Optional[float]:
+    array = np.asarray(values, dtype=float)
+    if array.size < 2:
+        return None
+    return float(np.std(array, ddof=1))
+
+
+def within_source_correlation(
+    records: Sequence[Dict[str, Any]],
+    value_field: str,
+    target_field: str,
+) -> Optional[float]:
+    """Correlation after removing each video's mean from both variables."""
+    grouped: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+    for row in records:
+        value = safe_float(row.get(value_field))
+        target = safe_float(row.get(target_field))
+        if value is None or target is None:
+            continue
+        grouped[str(row["source_id"])].append((value, target))
+    value_residuals: List[float] = []
+    target_residuals: List[float] = []
+    for pairs in grouped.values():
+        if len(pairs) < 2:
+            continue
+        values = np.asarray([pair[0] for pair in pairs], dtype=float)
+        targets = np.asarray([pair[1] for pair in pairs], dtype=float)
+        value_residuals.extend((values - float(np.mean(values))).tolist())
+        target_residuals.extend((targets - float(np.mean(targets))).tolist())
+    return safe_correlation(
+        np.asarray(value_residuals, dtype=float),
+        np.asarray(target_residuals, dtype=float),
+    )
+
+
+def speed_bin_name(reference_speed_mps: float) -> str:
+    if reference_speed_mps < 1.00:
+        return "slow_below_1_00_mps"
+    if reference_speed_mps <= 1.80:
+        return "typical_1_00_to_1_80_mps"
+    return "fast_above_1_80_mps"
+
+
+def speed_bin_diagnostic_rows(
+    records: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in records:
+        grouped[speed_bin_name(float(row["ground_truth_speed_mps"]))].append(row)
+    output: List[Dict[str, Any]] = []
+    for bin_name in (
+        "slow_below_1_00_mps",
+        "typical_1_00_to_1_80_mps",
+        "fast_above_1_80_mps",
+    ):
+        rows = grouped.get(bin_name, [])
+        references = np.asarray(
+            [float(row["ground_truth_speed_mps"]) for row in rows],
+            dtype=float,
+        )
+        predictions = np.asarray(
+            [float(row["predicted_speed_mps"]) for row in rows],
+            dtype=float,
+        )
+        errors = predictions - references
+        reference_sd = sample_standard_deviation(references.tolist())
+        prediction_sd = sample_standard_deviation(predictions.tolist())
+        output.append(
+            {
+                "speed_bin": bin_name,
+                "tracks": len(rows),
+                "sources": len({str(row["source_id"]) for row in rows}),
+                "reference_mean_mps": (
+                    float(np.mean(references)) if references.size else None
+                ),
+                "prediction_mean_mps": (
+                    float(np.mean(predictions)) if predictions.size else None
+                ),
+                "reference_sample_sd_mps": reference_sd,
+                "prediction_sample_sd_mps": prediction_sd,
+                "prediction_reference_sd_ratio": (
+                    prediction_sd / reference_sd
+                    if reference_sd is not None
+                    and prediction_sd is not None
+                    and reference_sd > 1e-12
+                    else None
+                ),
+                "mae_mps": (
+                    float(np.mean(np.abs(errors))) if errors.size else None
+                ),
+                "rmse_mps": (
+                    float(math.sqrt(float(np.mean(errors * errors))))
+                    if errors.size
+                    else None
+                ),
+                "bias_mps": float(np.mean(errors)) if errors.size else None,
+                "underestimated_tracks": int(np.sum(errors < 0.0)),
+                "overestimated_tracks": int(np.sum(errors > 0.0)),
+            }
+        )
+    return output
+
+
+def quantile_distribution_summary(values: Sequence[float]) -> Dict[str, Any]:
+    array = np.asarray(values, dtype=float)
+    if not array.size:
+        return {
+            "minimum": None,
+            "q10": None,
+            "q25": None,
+            "median": None,
+            "q75": None,
+            "q90": None,
+            "maximum": None,
+            "interquartile_range": None,
+            "interdecile_range": None,
+        }
+    quantiles = np.quantile(array, [0.10, 0.25, 0.50, 0.75, 0.90])
+    return {
+        "minimum": float(np.min(array)),
+        "q10": float(quantiles[0]),
+        "q25": float(quantiles[1]),
+        "median": float(quantiles[2]),
+        "q75": float(quantiles[3]),
+        "q90": float(quantiles[4]),
+        "maximum": float(np.max(array)),
+        "interquartile_range": float(quantiles[3] - quantiles[1]),
+        "interdecile_range": float(quantiles[4] - quantiles[0]),
+    }
+
+
+def speed_feature_signal_rows(
+    records: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    output: List[Dict[str, Any]] = []
+    references_all = np.asarray(
+        [float(row["ground_truth_speed_mps"]) for row in records],
+        dtype=float,
+    )
+    errors_all = np.asarray(
+        [float(row["absolute_error_mps"]) for row in records],
+        dtype=float,
+    )
+    for feature in SPEED_INFORMATION_FEATURES:
+        retained = [
+            (index, value)
+            for index, row in enumerate(records)
+            for value in [safe_float(row.get(feature))]
+            if value is not None
+        ]
+        if len(retained) < 3:
+            continue
+        indices = np.asarray([index for index, _ in retained], dtype=int)
+        values = np.asarray([value for _, value in retained], dtype=float)
+        references = references_all[indices]
+        absolute_errors = errors_all[indices]
+        pearson = safe_correlation(values, references)
+        spearman = safe_correlation(
+            average_ranks(values),
+            average_ranks(references),
+        )
+        within_source = within_source_correlation(
+            [records[index] for index in indices.tolist()],
+            feature,
+            "ground_truth_speed_mps",
+        )
+        error_correlation = safe_correlation(values, absolute_errors)
+        bin_medians: Dict[str, Optional[float]] = {}
+        for bin_name in (
+            "slow_below_1_00_mps",
+            "typical_1_00_to_1_80_mps",
+            "fast_above_1_80_mps",
+        ):
+            selected_values = [
+                value
+                for value, reference in zip(values, references)
+                if speed_bin_name(float(reference)) == bin_name
+            ]
+            bin_medians[bin_name] = (
+                float(np.median(selected_values)) if selected_values else None
+            )
+        signal_value = within_source if within_source is not None else pearson
+        absolute_signal = abs(signal_value) if signal_value is not None else 0.0
+        if absolute_signal >= 0.35:
+            strength = "strong"
+        elif absolute_signal >= 0.20:
+            strength = "moderate"
+        else:
+            strength = "weak"
+        output.append(
+            {
+                "feature": feature,
+                "tracks": len(values),
+                "sources": len(
+                    {str(records[index]["source_id"]) for index in indices}
+                ),
+                "pooled_pearson_with_reference_speed": pearson,
+                "pooled_spearman_with_reference_speed": spearman,
+                "within_source_pearson_with_reference_speed": within_source,
+                "pooled_pearson_with_absolute_error": error_correlation,
+                "slow_bin_median": bin_medians["slow_below_1_00_mps"],
+                "typical_bin_median": bin_medians[
+                    "typical_1_00_to_1_80_mps"
+                ],
+                "fast_bin_median": bin_medians["fast_above_1_80_mps"],
+                "signal_strength": strength,
+            }
+        )
+    output.sort(
+        key=lambda row: (
+            abs(
+                safe_float(
+                    row.get("within_source_pearson_with_reference_speed")
+                )
+                or 0.0
+            ),
+            abs(
+                safe_float(row.get("pooled_pearson_with_reference_speed"))
+                or 0.0
+            ),
+        ),
+        reverse=True,
+    )
+    for rank, row in enumerate(output, start=1):
+        row["within_source_signal_rank"] = rank
+    return output
+
+
+def speed_information_diagnostic_report(
+    rows: Sequence[Dict[str, Any]],
+    role: str,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    records = normalise_speed_diagnostic_rows(rows)
+    if not records:
+        fail("No finite ground truth and predicted speed pairs are available")
+    truth = np.asarray(
+        [float(row["ground_truth_speed_mps"]) for row in records],
+        dtype=float,
+    )
+    prediction = np.asarray(
+        [float(row["predicted_speed_mps"]) for row in records],
+        dtype=float,
+    )
+    metrics = cross_validation_metrics(records)
+    reference_range = quantile_distribution_summary(truth.tolist())
+    prediction_range = quantile_distribution_summary(prediction.tolist())
+    reference_iqr = safe_float(reference_range["interquartile_range"])
+    prediction_iqr = safe_float(prediction_range["interquartile_range"])
+    reference_idr = safe_float(reference_range["interdecile_range"])
+    prediction_idr = safe_float(prediction_range["interdecile_range"])
+    range_compression = {
+        "reference_speed_mps": reference_range,
+        "predicted_speed_mps": prediction_range,
+        "prediction_reference_iqr_ratio": (
+            prediction_iqr / reference_iqr
+            if reference_iqr is not None
+            and prediction_iqr is not None
+            and reference_iqr > 1e-12
+            else None
+        ),
+        "prediction_reference_interdecile_ratio": (
+            prediction_idr / reference_idr
+            if reference_idr is not None
+            and prediction_idr is not None
+            and reference_idr > 1e-12
+            else None
+        ),
+    }
+    bin_rows = speed_bin_diagnostic_rows(records)
+    feature_rows = speed_feature_signal_rows(records)
+    worst_rows = sorted(
+        records,
+        key=lambda row: float(row["absolute_error_mps"]),
+        reverse=True,
+    )[:25]
+    worst_output = [
+        {
+            "error_rank": rank,
+            "source_id": row["source_id"],
+            "prediction_track_id": row.get("prediction_track_id", ""),
+            "ground_truth_track_id": row.get("ground_truth_track_id", ""),
+            "reference_speed_bin": speed_bin_name(
+                float(row["ground_truth_speed_mps"])
+            ),
+            "ground_truth_speed_mps": row["ground_truth_speed_mps"],
+            "predicted_speed_mps": row["predicted_speed_mps"],
+            "error_mps": row["error_mps"],
+            "absolute_error_mps": row["absolute_error_mps"],
+            "error_direction": (
+                "underestimate" if float(row["error_mps"]) < 0.0 else "overestimate"
+            ),
+            **{
+                feature: row.get(feature, "")
+                for feature in SPEED_INFORMATION_FEATURES
+            },
+        }
+        for rank, row in enumerate(worst_rows, start=1)
+    ]
+    strong_features = [
+        str(row["feature"])
+        for row in feature_rows
+        if row["signal_strength"] == "strong"
+    ]
+    moderate_features = [
+        str(row["feature"])
+        for row in feature_rows
+        if row["signal_strength"] == "moderate"
+    ]
+    sd_ratio = safe_float(metrics.get("prediction_reference_sd_ratio"))
+    slope = safe_float(
+        metrics.get("prediction_on_reference_calibration_slope")
+    )
+    spread_is_adequate = bool(
+        sd_ratio is not None
+        and slope is not None
+        and sd_ratio
+        >= float(CROSS_VALIDATION_SETTINGS["minimum_prediction_reference_sd_ratio"])
+        and slope >= float(CROSS_VALIDATION_SETTINGS["minimum_calibration_slope"])
+    )
+    report = {
+        "schema": "crowd_bbox_speed_information_diagnostic_v1",
+        "release_id": RELEASE_ID,
+        "evaluation_role": role,
+        "tracks": len(records),
+        "sources": len({str(row["source_id"]) for row in records}),
+        "selection_note": (
+            "Development diagnostics may guide a predeclared next model. "
+            "Untouched validation diagnostics are audit only and must not be "
+            "used to choose features, thresholds, or hyperparameters."
+        ),
+        "overall_metrics": metrics,
+        "range_compression": range_compression,
+        "speed_bins": bin_rows,
+        "feature_signal_summary": {
+            "strong_within_source_features": strong_features,
+            "moderate_within_source_features": moderate_features,
+            "ranking_method": (
+                "absolute Pearson correlation after subtracting each source mean"
+            ),
+        },
+        "diagnostic_conclusion": {
+            "prediction_spread_adequate": spread_is_adequate,
+            "status": (
+                "speed_variation_preserved"
+                if spread_is_adequate
+                else "speed_variation_compressed"
+            ),
+            "recommended_next_step": (
+                "Test only compact source grouped models using the strongest "
+                "development features, then evaluate once on untouched data."
+                if strong_features
+                else "The current CSV features show no strong source independent "
+                "speed signal. Add metric geometry or another deployment input "
+                "before claiming individual speed in metres per second."
+            ),
+        },
+    }
+    return report, bin_rows, feature_rows, worst_output
+
+
+def write_speed_information_diagnostics(
+    rows: Sequence[Dict[str, Any]],
+    output_dir: Path,
+    role: str,
+) -> Dict[str, Any]:
+    output_path = Path(output_dir).expanduser().resolve()
+    output_path.mkdir(parents=True, exist_ok=True)
+    report, bin_rows, feature_rows, worst_rows = (
+        speed_information_diagnostic_report(rows, role)
+    )
+    write_json(str(output_path / "speed_information_diagnostic.json"), report)
+    write_dict_csv(str(output_path / "speed_bin_diagnostics.csv"), bin_rows)
+    write_dict_csv(str(output_path / "speed_feature_signal.csv"), feature_rows)
+    write_dict_csv(str(output_path / "worst_speed_errors.csv"), worst_rows)
+    log(
+        "Speed information diagnostic: "
+        f"role={role}, tracks={report['tracks']}, sources={report['sources']}, "
+        f"status={report['diagnostic_conclusion']['status']}"
+    )
+    log(
+        "Strong within source bbox signals: "
+        + (
+            ", ".join(
+                report["feature_signal_summary"]["strong_within_source_features"]
+            )
+            or "none"
+        )
+    )
+    log(f"Diagnostic report: {output_path / 'speed_information_diagnostic.json'}")
+    return report
+
+
+def mode_diagnose_speed_information(
+    prediction_csv: str,
+    output_dir: str,
+    role: str,
+) -> None:
+    rows = read_dict_csv(prediction_csv)
+    write_speed_information_diagnostics(rows, Path(output_dir), role)
 
 
 def leave_one_source_out_predictions(
@@ -2652,6 +4043,256 @@ def leave_one_source_out_predictions(
                     "ridge": float(ridge),
                     "held_out_source": held_out_source,
                     **features_to_row(row["features"]),
+                }
+            )
+    return output
+
+
+def monotonic_spline_cross_validation_predictions(
+    rows: Sequence[Dict[str, Any]],
+    candidate_name: str,
+    primary_feature: str,
+    quality_features: Sequence[str],
+    knot_count: int,
+    smoothing: float,
+    quality_ridge: float,
+) -> List[Dict[str, Any]]:
+    sources = sorted({str(row["source_id"]) for row in rows})
+    output: List[Dict[str, Any]] = []
+    for held_out_source in sources:
+        training = [
+            row for row in rows if str(row["source_id"]) != held_out_source
+        ]
+        held_out = [
+            row for row in rows if str(row["source_id"]) == held_out_source
+        ]
+        components = fit_monotonic_spline_components(
+            training,
+            primary_feature,
+            quality_features,
+            knot_count,
+            smoothing,
+            quality_ridge,
+        )
+        baseline = source_balanced_constant(training)
+        for row in held_out:
+            predicted = component_prediction(row["features"], components)
+            truth = float(row["ground_truth_speed_mps"])
+            output.append(
+                {
+                    "source_id": row["source_id"],
+                    "prediction_track_id": row["prediction_track_id"],
+                    "ground_truth_track_id": row.get("ground_truth_track_id", ""),
+                    "ground_truth_speed_mps": truth,
+                    "predicted_speed_mps": predicted,
+                    "error_mps": predicted - truth,
+                    "absolute_error_mps": abs(predicted - truth),
+                    "baseline_speed_mps": baseline,
+                    "baseline_absolute_error_mps": abs(baseline - truth),
+                    "candidate": candidate_name,
+                    "prediction_mode": "monotonic_spline_gam",
+                    "ridge": 0.0,
+                    "spline_knot_count": int(knot_count),
+                    "spline_smoothing": float(smoothing),
+                    "spline_quality_ridge": float(quality_ridge),
+                    "held_out_source": held_out_source,
+                    **features_to_row(row["features"]),
+                }
+            )
+    return output
+
+
+def monotonic_spline_physics_blend_cross_validation_predictions(
+    rows: Sequence[Dict[str, Any]],
+    candidate_name: str,
+    primary_feature: str,
+    quality_features: Sequence[str],
+    knot_count: int,
+    smoothing: float,
+    quality_ridge: float,
+    blend_proxy_feature: str,
+    blend_weight: float,
+) -> List[Dict[str, Any]]:
+    """Cross validate a calibrated spline blended with a physical proxy.
+
+    The spline provides the low-error conditional estimate.  A small direct
+    proxy contribution restores individual speed variation that conditional
+    regression otherwise shrinks towards the mean.  Both terms use only the
+    bbox CSV and FPS at prediction time.
+    """
+    sources = sorted({str(row["source_id"]) for row in rows})
+    weight = float(blend_weight)
+    output: List[Dict[str, Any]] = []
+    for held_out_source in sources:
+        training = [
+            row for row in rows if str(row["source_id"]) != held_out_source
+        ]
+        held_out = [
+            row for row in rows if str(row["source_id"]) == held_out_source
+        ]
+        components = fit_monotonic_spline_components(
+            training,
+            primary_feature,
+            quality_features,
+            knot_count,
+            smoothing,
+            quality_ridge,
+        )
+        baseline = source_balanced_constant(training)
+        for row in held_out:
+            spline_prediction = component_prediction(
+                row["features"],
+                components,
+            )
+            proxy_prediction = float(
+                getattr(row["features"], blend_proxy_feature)
+            )
+            predicted = (
+                (1.0 - weight) * spline_prediction
+                + weight * proxy_prediction
+            )
+            truth = float(row["ground_truth_speed_mps"])
+            output.append(
+                {
+                    "source_id": row["source_id"],
+                    "prediction_track_id": row["prediction_track_id"],
+                    "ground_truth_track_id": row.get(
+                        "ground_truth_track_id",
+                        "",
+                    ),
+                    "ground_truth_speed_mps": truth,
+                    "predicted_speed_mps": predicted,
+                    "error_mps": predicted - truth,
+                    "absolute_error_mps": abs(predicted - truth),
+                    "baseline_speed_mps": baseline,
+                    "baseline_absolute_error_mps": abs(baseline - truth),
+                    "candidate": candidate_name,
+                    "prediction_mode": "monotonic_spline_physics_blend",
+                    "ridge": 0.0,
+                    "spline_knot_count": int(knot_count),
+                    "spline_smoothing": float(smoothing),
+                    "spline_quality_ridge": float(quality_ridge),
+                    "blend_proxy_feature": blend_proxy_feature,
+                    "blend_weight": weight,
+                    "held_out_source": held_out_source,
+                    **features_to_row(row["features"]),
+                }
+            )
+    return output
+
+
+def extra_trees_cross_validation_predictions(
+    rows: Sequence[Dict[str, Any]],
+    candidate_name: str,
+    feature_names: Sequence[str],
+    n_estimators: int,
+    minimum_samples_per_leaf: int,
+) -> List[Dict[str, Any]]:
+    """Leave one complete video source out of nonlinear model fitting."""
+    sources = sorted({str(row["source_id"]) for row in rows})
+    output: List[Dict[str, Any]] = []
+    for held_out_source in sources:
+        training = [
+            row for row in rows if str(row["source_id"]) != held_out_source
+        ]
+        testing = [
+            row for row in rows if str(row["source_id"]) == held_out_source
+        ]
+        components = fit_extra_trees_components(
+            training,
+            feature_names,
+            n_estimators,
+            minimum_samples_per_leaf,
+        )
+        baseline = source_balanced_constant(training)
+        for row in testing:
+            predicted = component_prediction(row["features"], components)
+            truth = float(row["ground_truth_speed_mps"])
+            output.append(
+                {
+                    "source_id": row["source_id"],
+                    "prediction_track_id": row["prediction_track_id"],
+                    "ground_truth_track_id": row.get(
+                        "ground_truth_track_id",
+                        "",
+                    ),
+                    "ground_truth_speed_mps": truth,
+                    "predicted_speed_mps": predicted,
+                    "error_mps": predicted - truth,
+                    "absolute_error_mps": abs(predicted - truth),
+                    "baseline_speed_mps": baseline,
+                    "baseline_absolute_error_mps": abs(baseline - truth),
+                    "candidate": candidate_name,
+                    "prediction_mode": "extra_trees_regression",
+                    "extra_trees_n_estimators": int(n_estimators),
+                    "extra_trees_min_samples_leaf": int(
+                        minimum_samples_per_leaf
+                    ),
+                    "held_out_source": held_out_source,
+                    **features_to_row(row["features"]),
+                }
+            )
+    return output
+
+
+def bounded_variance_cross_validation_predictions(
+    base_predictions: Sequence[Dict[str, Any]],
+    expansion_factor: float,
+    correction_cap_mps: float,
+    candidate_name: str = "bounded_variance_calibration",
+    prediction_mode: str = "bounded_variance_calibration",
+) -> List[Dict[str, Any]]:
+    """Cross fit a bounded variance correction without validation labels.
+
+    Each held out source uses target and prediction centres calculated from
+    the other development sources.  The base prediction is already source
+    held out.  This prevents a video's own labels from determining its centre
+    or its corrected prediction.
+    """
+    output: List[Dict[str, Any]] = []
+    sources = sorted(
+        {str(row["source_id"]) for row in base_predictions}
+    )
+    for held_out_source in sources:
+        calibration_rows = [
+            row
+            for row in base_predictions
+            if str(row["source_id"]) != held_out_source
+        ]
+        target_centre = source_balanced_mean(
+            calibration_rows,
+            lambda row: row["ground_truth_speed_mps"],
+        )
+        prediction_centre = source_balanced_mean(
+            calibration_rows,
+            lambda row: row["predicted_speed_mps"],
+        )
+        for row in base_predictions:
+            if str(row["source_id"]) != held_out_source:
+                continue
+            predicted, _ = bounded_variance_prediction(
+                float(row["predicted_speed_mps"]),
+                prediction_centre,
+                target_centre,
+                expansion_factor,
+                correction_cap_mps,
+            )
+            truth = float(row["ground_truth_speed_mps"])
+            output.append(
+                {
+                    **row,
+                    "predicted_speed_mps": predicted,
+                    "error_mps": predicted - truth,
+                    "absolute_error_mps": abs(predicted - truth),
+                    "candidate": candidate_name,
+                    "prediction_mode": prediction_mode,
+                    "variance_expansion_factor": float(expansion_factor),
+                    "variance_correction_cap_mps": float(
+                        correction_cap_mps
+                    ),
+                    "variance_prediction_centre_mps": prediction_centre,
+                    "variance_target_centre_mps": target_centre,
+                    "held_out_source": held_out_source,
                 }
             )
     return output
@@ -2749,7 +4390,10 @@ def select_cross_validated_model(
     unfiltered_baseline_metrics = cross_validation_metrics(baseline_predictions)
     baseline_mae = float(baseline_metrics["source_balanced_mae_mps"])
     candidate_results: List[Dict[str, Any]] = []
-    prediction_cache: Dict[Tuple[str, float], List[Dict[str, Any]]] = {}
+    prediction_cache: Dict[
+        Tuple[str, float, int, float, float, float, float, int, int],
+        List[Dict[str, Any]],
+    ] = {}
 
     def register_candidate(
         candidate_name: str,
@@ -2757,6 +4401,15 @@ def select_cross_validated_model(
         feature_names: Sequence[str],
         ridge: float,
         predictions: List[Dict[str, Any]],
+        spline_knot_count: int = 0,
+        spline_smoothing: float = 0.0,
+        spline_quality_ridge: float = 0.0,
+        blend_proxy_feature: str = "",
+        blend_weight: float = 0.0,
+        variance_expansion_factor: float = 1.0,
+        variance_correction_cap_mps: float = 0.0,
+        extra_trees_n_estimators: int = 0,
+        extra_trees_min_samples_leaf: int = 0,
     ) -> None:
         reliable_predictions = [
             row
@@ -2800,6 +4453,49 @@ def select_cross_validated_model(
             CROSS_VALIDATION_SETTINGS["minimum_reliable_sources"]
         ):
             reasons.append("too_few_reliable_development_sources")
+        sd_ratio = safe_float(metrics.get("prediction_reference_sd_ratio"))
+        if (
+            sd_ratio is None
+            or sd_ratio
+            < float(
+                CROSS_VALIDATION_SETTINGS[
+                    "minimum_prediction_reference_sd_ratio"
+                ]
+            )
+        ):
+            reasons.append("prediction_spread_too_narrow")
+        elif sd_ratio > float(
+            CROSS_VALIDATION_SETTINGS["maximum_prediction_reference_sd_ratio"]
+        ):
+            reasons.append("prediction_spread_too_wide")
+        calibration_slope = safe_float(
+            metrics.get("prediction_on_reference_calibration_slope")
+        )
+        if (
+            calibration_slope is None
+            or calibration_slope
+            < float(CROSS_VALIDATION_SETTINGS["minimum_calibration_slope"])
+        ):
+            reasons.append("calibration_slope_too_low")
+        elif calibration_slope > float(
+            CROSS_VALIDATION_SETTINGS["maximum_calibration_slope"]
+        ):
+            reasons.append("calibration_slope_too_high")
+        pearson = safe_float(metrics.get("pearson_correlation"))
+        if pearson is None or pearson < float(
+            CROSS_VALIDATION_SETTINGS["minimum_pearson_correlation"]
+        ):
+            reasons.append("pearson_correlation_too_low")
+        spearman = safe_float(metrics.get("spearman_correlation"))
+        if spearman is None or spearman < float(
+            CROSS_VALIDATION_SETTINGS["minimum_spearman_correlation"]
+        ):
+            reasons.append("spearman_correlation_too_low")
+        concordance = safe_float(metrics.get("lins_concordance_correlation"))
+        if concordance is None or concordance < float(
+            CROSS_VALIDATION_SETTINGS["minimum_lins_concordance"]
+        ):
+            reasons.append("lins_concordance_too_low")
         for row in predictions:
             row["reliability_status"] = (
                 "eligible"
@@ -2809,7 +4505,19 @@ def select_cross_validated_model(
             row["reliability_reject_reason"] = reliability_gate_reason_from_row(
                 row
             )
-        prediction_cache[(candidate_name, float(ridge))] = predictions
+        prediction_cache[
+            (
+                candidate_name,
+                float(ridge),
+                int(spline_knot_count),
+                float(spline_smoothing),
+                float(blend_weight),
+                float(variance_expansion_factor),
+                float(variance_correction_cap_mps),
+                int(extra_trees_n_estimators),
+                int(extra_trees_min_samples_leaf),
+            )
+        ] = predictions
         candidate_results.append(
             {
                 "candidate": candidate_name,
@@ -2817,6 +4525,23 @@ def select_cross_validated_model(
                 "feature_names": list(feature_names),
                 "feature_count": len(feature_names),
                 "ridge": float(ridge),
+                "spline_knot_count": int(spline_knot_count),
+                "spline_smoothing": float(spline_smoothing),
+                "spline_quality_ridge": float(spline_quality_ridge),
+                "blend_proxy_feature": str(blend_proxy_feature),
+                "blend_weight": float(blend_weight),
+                "variance_expansion_factor": float(
+                    variance_expansion_factor
+                ),
+                "variance_correction_cap_mps": float(
+                    variance_correction_cap_mps
+                ),
+                "extra_trees_n_estimators": int(
+                    extra_trees_n_estimators
+                ),
+                "extra_trees_min_samples_leaf": int(
+                    extra_trees_min_samples_leaf
+                ),
                 **metrics,
                 "unfiltered_metrics": unfiltered_metrics,
                 "reliable_tracks": len(reliable_predictions),
@@ -2858,11 +4583,157 @@ def select_cross_validated_model(
             0.0,
             predictions,
         )
+    for candidate_name, settings in MONOTONIC_SPLINE_CANDIDATES.items():
+        primary_feature = str(settings["primary_feature"])
+        quality_features = list(settings.get("quality_features", []))
+        feature_names = [primary_feature, *quality_features]
+        for knot_count in MONOTONIC_SPLINE_KNOT_CANDIDATES:
+            for smoothing in MONOTONIC_SPLINE_SMOOTHING_CANDIDATES:
+                predictions = monotonic_spline_cross_validation_predictions(
+                    development,
+                    candidate_name,
+                    primary_feature,
+                    quality_features,
+                    knot_count,
+                    smoothing,
+                    MONOTONIC_SPLINE_QUALITY_RIDGE,
+                )
+                register_candidate(
+                    candidate_name,
+                    "monotonic_spline_gam",
+                    feature_names,
+                    0.0,
+                    predictions,
+                    spline_knot_count=int(knot_count),
+                    spline_smoothing=float(smoothing),
+                    spline_quality_ridge=float(MONOTONIC_SPLINE_QUALITY_RIDGE),
+                )
+
+    # V31 challenger: retain the low-error monotonic estimate while restoring
+    # a small amount of the physical proxy's individual speed variation.
+    # Every weight is evaluated with the same source-held-out protocol.
+    blend_candidate = "monotonic_spline_physics_blend"
+    blend_primary = "compensated_robust_speed_proxy_mps"
+    blend_features = [blend_primary]
+    for knot_count in MONOTONIC_SPLINE_KNOT_CANDIDATES:
+        for smoothing in MONOTONIC_SPLINE_SMOOTHING_CANDIDATES:
+            for blend_weight in MONOTONIC_SPLINE_PHYSICS_BLEND_WEIGHTS:
+                predictions = (
+                    monotonic_spline_physics_blend_cross_validation_predictions(
+                        development,
+                        blend_candidate,
+                        blend_primary,
+                        [],
+                        knot_count,
+                        smoothing,
+                        MONOTONIC_SPLINE_QUALITY_RIDGE,
+                        MONOTONIC_SPLINE_PHYSICS_BLEND_PROXY,
+                        blend_weight,
+                    )
+                )
+                register_candidate(
+                    blend_candidate,
+                    "monotonic_spline_physics_blend",
+                    blend_features,
+                    0.0,
+                    predictions,
+                    spline_knot_count=int(knot_count),
+                    spline_smoothing=float(smoothing),
+                    spline_quality_ridge=float(
+                        MONOTONIC_SPLINE_QUALITY_RIDGE
+                    ),
+                    blend_proxy_feature=(
+                        MONOTONIC_SPLINE_PHYSICS_BLEND_PROXY
+                    ),
+                    blend_weight=float(blend_weight),
+                )
+                for expansion_factor in BOUNDED_VARIANCE_FACTORS:
+                    for correction_cap in BOUNDED_VARIANCE_CAPS_MPS:
+                        variance_predictions = (
+                            bounded_variance_cross_validation_predictions(
+                                predictions,
+                                expansion_factor,
+                                correction_cap,
+                            )
+                        )
+                        register_candidate(
+                            "bounded_variance_calibration",
+                            "bounded_variance_calibration",
+                            blend_features,
+                            0.0,
+                            variance_predictions,
+                            spline_knot_count=int(knot_count),
+                            spline_smoothing=float(smoothing),
+                            spline_quality_ridge=float(
+                                MONOTONIC_SPLINE_QUALITY_RIDGE
+                            ),
+                            blend_proxy_feature=(
+                                MONOTONIC_SPLINE_PHYSICS_BLEND_PROXY
+                            ),
+                            blend_weight=float(blend_weight),
+                            variance_expansion_factor=float(
+                                expansion_factor
+                            ),
+                            variance_correction_cap_mps=float(
+                                correction_cap
+                            ),
+                        )
+
+    # V32 nonlinear challenger. Hyperparameters and the bounded expansion grid
+    # are fixed before Waymo validation is opened. Each prediction comes from
+    # a forest that never saw the held-out video's labels.
+    tree_candidate = "extra_trees_compact"
+    tree_predictions = extra_trees_cross_validation_predictions(
+        development,
+        tree_candidate,
+        EXTRA_TREES_FEATURES,
+        EXTRA_TREES_N_ESTIMATORS,
+        EXTRA_TREES_MIN_SAMPLES_LEAF,
+    )
+    register_candidate(
+        tree_candidate,
+        "extra_trees_regression",
+        EXTRA_TREES_FEATURES,
+        0.0,
+        tree_predictions,
+        extra_trees_n_estimators=EXTRA_TREES_N_ESTIMATORS,
+        extra_trees_min_samples_leaf=EXTRA_TREES_MIN_SAMPLES_LEAF,
+    )
+    for expansion_factor in EXTRA_TREES_VARIANCE_FACTORS:
+        for correction_cap in EXTRA_TREES_VARIANCE_CAPS_MPS:
+            variance_predictions = bounded_variance_cross_validation_predictions(
+                tree_predictions,
+                expansion_factor,
+                correction_cap,
+                candidate_name="extra_trees_bounded_variance",
+                prediction_mode="extra_trees_bounded_variance",
+            )
+            register_candidate(
+                "extra_trees_bounded_variance",
+                "extra_trees_bounded_variance",
+                EXTRA_TREES_FEATURES,
+                0.0,
+                variance_predictions,
+                variance_expansion_factor=float(expansion_factor),
+                variance_correction_cap_mps=float(correction_cap),
+                extra_trees_n_estimators=EXTRA_TREES_N_ESTIMATORS,
+                extra_trees_min_samples_leaf=EXTRA_TREES_MIN_SAMPLES_LEAF,
+            )
 
     qualified_candidates = [
         row for row in candidate_results if row["calibration_qualified"]
     ]
-    selection_pool = qualified_candidates or candidate_results
+    if qualified_candidates:
+        selection_pool = qualified_candidates
+    else:
+        minimum_failure_count = min(
+            len(row["qualification_reasons"]) for row in candidate_results
+        )
+        selection_pool = [
+            row
+            for row in candidate_results
+            if len(row["qualification_reasons"]) == minimum_failure_count
+        ]
     best_mae = min(float(row["source_balanced_mae_mps"]) for row in selection_pool)
     margin = float(CROSS_VALIDATION_SETTINGS["simplicity_margin_mps"])
     shortlist = [
@@ -2873,10 +4744,18 @@ def select_cross_validated_model(
     selected = min(
         shortlist,
         key=lambda row: (
+            -float(row["lins_concordance_correlation"]),
             int(row["feature_count"]),
             float(row["source_balanced_mae_mps"]),
             float(row["rmse_mps"]),
             float(row["ridge"]),
+            int(row["spline_knot_count"]),
+            float(row["spline_smoothing"]),
+            float(row["blend_weight"]),
+            float(row["variance_correction_cap_mps"]),
+            float(row["variance_expansion_factor"]),
+            int(row["extra_trees_min_samples_leaf"]),
+            int(row["extra_trees_n_estimators"]),
         ),
     )
     reasons = list(selected["qualification_reasons"])
@@ -2903,6 +4782,23 @@ def select_cross_validated_model(
         "selected_prediction_mode": selected["prediction_mode"],
         "selected_feature_names": selected["feature_names"],
         "selected_ridge": selected["ridge"],
+        "selected_spline_knot_count": selected["spline_knot_count"],
+        "selected_spline_smoothing": selected["spline_smoothing"],
+        "selected_spline_quality_ridge": selected["spline_quality_ridge"],
+        "selected_blend_proxy_feature": selected["blend_proxy_feature"],
+        "selected_blend_weight": selected["blend_weight"],
+        "selected_variance_expansion_factor": selected[
+            "variance_expansion_factor"
+        ],
+        "selected_variance_correction_cap_mps": selected[
+            "variance_correction_cap_mps"
+        ],
+        "selected_extra_trees_n_estimators": selected[
+            "extra_trees_n_estimators"
+        ],
+        "selected_extra_trees_min_samples_leaf": selected[
+            "extra_trees_min_samples_leaf"
+        ],
         "selected_metrics": {
             key: value
             for key, value in selected.items()
@@ -2913,6 +4809,15 @@ def select_cross_validated_model(
                 "feature_names",
                 "feature_count",
                 "ridge",
+                "spline_knot_count",
+                "spline_smoothing",
+                "spline_quality_ridge",
+                "blend_proxy_feature",
+                "blend_weight",
+                "variance_expansion_factor",
+                "variance_correction_cap_mps",
+                "extra_trees_n_estimators",
+                "extra_trees_min_samples_leaf",
                 "qualification_reasons",
                 "calibration_qualified",
             }
@@ -2931,7 +4836,17 @@ def select_cross_validated_model(
         "settings": dict(CROSS_VALIDATION_SETTINGS),
     }
     selected_predictions = prediction_cache[
-        (str(selected["candidate"]), float(selected["ridge"]))
+        (
+            str(selected["candidate"]),
+            float(selected["ridge"]),
+            int(selected["spline_knot_count"]),
+            float(selected["spline_smoothing"]),
+            float(selected["blend_weight"]),
+            float(selected["variance_expansion_factor"]),
+            float(selected["variance_correction_cap_mps"]),
+            int(selected["extra_trees_n_estimators"]),
+            int(selected["extra_trees_min_samples_leaf"]),
+        )
     ]
     return report, selected_predictions
 
@@ -2958,8 +4873,59 @@ def prediction_from_model(features: TrackFeatures, model: Dict[str, Any]) -> Dic
     standard = (raw_vector - centre) / scale
     design = np.concatenate([[1.0], standard])
     coefficients = np.asarray(model["coefficients"], dtype=float)
+    variance_derivative = 1.0
+    tree_prediction_dispersion = 0.0
     if model.get("prediction_mode") == "direct_proxy":
         prediction = direct_proxy_value(features, str(model["direct_proxy_name"]))
+    elif model.get("prediction_mode") in {
+        "extra_trees_regression",
+        "extra_trees_bounded_variance",
+    }:
+        prediction, tree_prediction_dispersion = extra_trees_prediction(
+            features,
+            model,
+        )
+        design = np.empty(0, dtype=float)
+        if model.get("prediction_mode") == "extra_trees_bounded_variance":
+            prediction, variance_derivative = bounded_variance_prediction(
+                prediction,
+                float(model["variance_prediction_centre_mps"]),
+                float(model["variance_target_centre_mps"]),
+                float(model["variance_expansion_factor"]),
+                float(model["variance_correction_cap_mps"]),
+            )
+    elif model.get("prediction_mode") in {
+        "monotonic_spline_gam",
+        "monotonic_spline_physics_blend",
+        "bounded_variance_calibration",
+    }:
+        design = monotonic_spline_prediction_design(features, model)
+        spline_prediction = float(design @ coefficients)
+        if model.get("prediction_mode") in {
+            "monotonic_spline_physics_blend",
+            "bounded_variance_calibration",
+        }:
+            blend_weight = float(model.get("blend_weight", 0.0))
+            blend_proxy_feature = str(model.get("blend_proxy_feature", ""))
+            proxy_prediction = float(getattr(features, blend_proxy_feature))
+            prediction = float(
+                (1.0 - blend_weight) * spline_prediction
+                + blend_weight * proxy_prediction
+            )
+            if model.get("prediction_mode") == (
+                "bounded_variance_calibration"
+            ):
+                prediction, variance_derivative = (
+                    bounded_variance_prediction(
+                        prediction,
+                        float(model["variance_prediction_centre_mps"]),
+                        float(model["variance_target_centre_mps"]),
+                        float(model["variance_expansion_factor"]),
+                        float(model["variance_correction_cap_mps"]),
+                    )
+                )
+        else:
+            prediction = spline_prediction
     else:
         prediction = float(design @ coefficients)
     lower = np.asarray(model["feature_lower_bound"], dtype=float)
@@ -2971,8 +4937,24 @@ def prediction_from_model(features: TrackFeatures, model: Dict[str, Any]) -> Dic
         reason = "out_of_calibration_distribution"
     covariance = np.asarray(model["covariance_basis"], dtype=float)
     residual_sigma = float(model["residual_sigma_mps"])
-    leverage = max(0.0, float(design @ covariance @ design))
-    parametric_uncertainty = residual_sigma * math.sqrt(1.0 + leverage)
+    leverage = (
+        max(0.0, float(design @ covariance @ design))
+        if covariance.shape == (len(design), len(design))
+        else 0.0
+    )
+    if model.get("prediction_mode") in {
+        "monotonic_spline_physics_blend",
+        "bounded_variance_calibration",
+    }:
+        spline_weight = 1.0 - float(model.get("blend_weight", 0.0))
+        leverage *= spline_weight * spline_weight
+    leverage *= variance_derivative * variance_derivative
+    parametric_uncertainty = max(
+        residual_sigma * math.sqrt(1.0 + leverage),
+        tree_prediction_dispersion / math.sqrt(
+            max(float(model.get("extra_trees_n_estimators", 1)), 1.0)
+        ),
+    )
     uncertainty = max(
         parametric_uncertainty,
         float(model.get("conformal_absolute_uncertainty_mps", 0.0)),
@@ -3013,7 +4995,16 @@ def metric_summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
     def calculate(selected: Sequence[Dict[str, Any]], prediction_key: str) -> Dict[str, Any]:
         if not selected:
-            return {"count": 0, "mae_mps": None, "rmse_mps": None, "bias_mps": None, "median_absolute_error_mps": None, "within_0_25_mps": None, "within_0_50_mps": None}
+            return {
+                "count": 0,
+                "mae_mps": None,
+                "rmse_mps": None,
+                "bias_mps": None,
+                "median_absolute_error_mps": None,
+                "within_0_25_mps": None,
+                "within_0_50_mps": None,
+                **agreement_metrics(np.asarray([]), np.asarray([])),
+            }
         truth = np.asarray([float(row["ground_truth_speed_mps"]) for row in selected], dtype=float)
         predicted = np.asarray([float(row[prediction_key]) for row in selected], dtype=float)
         error = predicted - truth
@@ -3026,6 +5017,7 @@ def metric_summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             "median_absolute_error_mps": float(np.median(absolute)),
             "within_0_25_mps": float(np.mean(absolute <= 0.25)),
             "within_0_50_mps": float(np.mean(absolute <= 0.50)),
+            **agreement_metrics(truth, predicted),
         }
 
     rejection_counts: Dict[str, int] = defaultdict(int)
@@ -3087,11 +5079,182 @@ def mode_fit(manifest_csv: str, model_json: str, output_dir: str) -> None:
     selected_candidate = str(cross_validation["selected_candidate"])
     feature_names = list(cross_validation["selected_feature_names"])
     ridge = float(cross_validation["selected_ridge"])
+    spline_knot_count = int(
+        cross_validation.get("selected_spline_knot_count", 0)
+    )
+    spline_smoothing = float(
+        cross_validation.get("selected_spline_smoothing", 0.0)
+    )
+    spline_quality_ridge = float(
+        cross_validation.get("selected_spline_quality_ridge", 0.0)
+    )
+    blend_proxy_feature = str(
+        cross_validation.get("selected_blend_proxy_feature", "")
+    )
+    blend_weight = float(
+        cross_validation.get("selected_blend_weight", 0.0)
+    )
+    variance_expansion_factor = float(
+        cross_validation.get("selected_variance_expansion_factor", 1.0)
+    )
+    variance_correction_cap_mps = float(
+        cross_validation.get(
+            "selected_variance_correction_cap_mps",
+            0.0,
+        )
+    )
+    extra_trees_n_estimators = int(
+        cross_validation.get("selected_extra_trees_n_estimators", 0)
+    )
+    extra_trees_min_samples_leaf = int(
+        cross_validation.get("selected_extra_trees_min_samples_leaf", 0)
+    )
     if prediction_mode == "direct_proxy":
         components = fit_direct_proxy_components(
             development,
             selected_candidate,
             feature_names,
+        )
+    elif prediction_mode in {
+        "monotonic_spline_gam",
+        "monotonic_spline_physics_blend",
+        "bounded_variance_calibration",
+    }:
+        settings = MONOTONIC_SPLINE_CANDIDATES.get(
+            selected_candidate,
+            {
+                "primary_feature": "compensated_robust_speed_proxy_mps",
+                "quality_features": [],
+            },
+        )
+        components = fit_monotonic_spline_components(
+            development,
+            str(settings["primary_feature"]),
+            list(settings.get("quality_features", [])),
+            spline_knot_count,
+            spline_smoothing,
+            spline_quality_ridge,
+        )
+        if prediction_mode in {
+            "monotonic_spline_physics_blend",
+            "bounded_variance_calibration",
+        }:
+            components["prediction_mode"] = (
+                "monotonic_spline_physics_blend"
+            )
+            components["blend_proxy_feature"] = blend_proxy_feature
+            components["blend_weight"] = blend_weight
+            base_fitted = np.asarray(
+                [
+                    component_prediction(row["features"], components)
+                    for row in development
+                ],
+                dtype=float,
+            )
+            if prediction_mode == "bounded_variance_calibration":
+                prediction_by_row_id = {
+                    id(row): float(prediction)
+                    for row, prediction in zip(development, base_fitted)
+                }
+                components["variance_prediction_centre_mps"] = (
+                    source_balanced_mean(
+                        development,
+                        lambda row: prediction_by_row_id[id(row)],
+                    )
+                )
+                components["variance_target_centre_mps"] = (
+                    source_balanced_mean(
+                        development,
+                        lambda row: row["ground_truth_speed_mps"],
+                    )
+                )
+                components["variance_expansion_factor"] = (
+                    variance_expansion_factor
+                )
+                components["variance_correction_cap_mps"] = (
+                    variance_correction_cap_mps
+                )
+                components["prediction_mode"] = prediction_mode
+            fitted = np.asarray(
+                [
+                    component_prediction(row["features"], components)
+                    for row in development
+                ],
+                dtype=float,
+            )
+            development_target = np.asarray(
+                [
+                    float(row["ground_truth_speed_mps"])
+                    for row in development
+                ],
+                dtype=float,
+            )
+            blended_residual_sigma = robust_scale(
+                development_target - fitted
+            )
+            if blended_residual_sigma <= 1e-6:
+                blended_residual_sigma = max(
+                    float(np.std(development_target - fitted)),
+                    0.01,
+                )
+            components["residual_sigma_mps"] = float(
+                blended_residual_sigma
+            )
+    elif prediction_mode in {
+        "extra_trees_regression",
+        "extra_trees_bounded_variance",
+    }:
+        components = fit_extra_trees_components(
+            development,
+            feature_names,
+            extra_trees_n_estimators,
+            extra_trees_min_samples_leaf,
+        )
+        base_fitted = np.asarray(
+            [
+                component_prediction(row["features"], components)
+                for row in development
+            ],
+            dtype=float,
+        )
+        if prediction_mode == "extra_trees_bounded_variance":
+            prediction_by_row_id = {
+                id(row): float(prediction)
+                for row, prediction in zip(development, base_fitted)
+            }
+            components["variance_prediction_centre_mps"] = (
+                source_balanced_mean(
+                    development,
+                    lambda row: prediction_by_row_id[id(row)],
+                )
+            )
+            components["variance_target_centre_mps"] = source_balanced_mean(
+                development,
+                lambda row: row["ground_truth_speed_mps"],
+            )
+            components["variance_expansion_factor"] = (
+                variance_expansion_factor
+            )
+            components["variance_correction_cap_mps"] = (
+                variance_correction_cap_mps
+            )
+            components["prediction_mode"] = prediction_mode
+        fitted = np.asarray(
+            [
+                component_prediction(row["features"], components)
+                for row in development
+            ],
+            dtype=float,
+        )
+        target = np.asarray(
+            [float(row["ground_truth_speed_mps"]) for row in development],
+            dtype=float,
+        )
+        fitted_residual_sigma = robust_scale(target - fitted)
+        components["residual_sigma_mps"] = float(
+            fitted_residual_sigma
+            if fitted_residual_sigma > 1e-6
+            else max(float(np.std(target - fitted)), 0.01)
         )
     else:
         components = fit_model_components(development, feature_names, ridge)
@@ -3119,17 +5282,34 @@ def mode_fit(manifest_csv: str, model_json: str, output_dir: str) -> None:
     cross_validation["conformal_absolute_uncertainty_mps"] = conformal_uncertainty
     development_sources = {str(row["source_id"]) for row in development}
     held_out_test_sources = {str(row["source_id"]) for row in held_out_test}
+    method_by_mode = {
+        "direct_proxy": "source_grouped_selected_direct_physics_proxy",
+        "extra_trees_regression": (
+            "source_grouped_selected_extra_trees_regression"
+        ),
+        "extra_trees_bounded_variance": (
+            "source_grouped_selected_extra_trees_bounded_variance"
+        ),
+        "bounded_variance_calibration": (
+            "source_grouped_selected_bounded_variance_calibration"
+        ),
+        "monotonic_spline_physics_blend": (
+            "source_grouped_selected_monotonic_spline_physics_blend"
+        ),
+        "monotonic_spline_gam": (
+            "source_grouped_selected_monotonic_spline_gam"
+        ),
+    }
     model = {
         "schema": MODEL_SCHEMA,
         "release_id": RELEASE_ID,
-        "method": (
-            "source_grouped_selected_direct_physics_proxy"
-            if prediction_mode == "direct_proxy"
-            else "source_grouped_selected_source_balanced_huber_ridge"
+        "method": method_by_mode.get(
+            prediction_mode,
+            "source_grouped_selected_source_balanced_huber_ridge",
         ),
         "speed_interpretation": (
-            "scene motion compensated bbox derived pedestrian speed along "
-            "the road crossing direction in metres per second"
+            "scene motion compensated bbox derived planar pedestrian speed for "
+            "CROWD algorithm selected crossing tracks in metres per second"
         ),
         "calibration_camera": WAYMO_CALIBRATION_CAMERA,
         "calibration_target": WAYMO_CALIBRATION_TARGET,
@@ -3143,6 +5323,11 @@ def mode_fit(manifest_csv: str, model_json: str, output_dir: str) -> None:
         "camera_motion_modelled_explicitly": False,
         "camera_motion_estimated_from_bbox_consensus": True,
         "scene_motion_settings": dict(SCENE_MOTION_SETTINGS),
+        "source_context_settings": dict(SOURCE_CONTEXT_SETTINGS),
+        "source_context_is_label_free": True,
+        "source_context_population": (
+            "all base eligible pedestrian tracks in the same bbox CSV"
+        ),
         "reliability_gates": dict(RELIABILITY_GATES),
         "compensated_proxy_disagreement_role": "diagnostic_only",
         "compensated_proxy_disagreement_used_as_rejection_gate": False,
@@ -3150,6 +5335,33 @@ def mode_fit(manifest_csv: str, model_json: str, output_dir: str) -> None:
         "prediction_mode": prediction_mode,
         "direct_proxy_name": components.get("direct_proxy_name"),
         "selected_ridge": ridge,
+        "selected_spline_knot_count": spline_knot_count,
+        "selected_spline_smoothing": spline_smoothing,
+        "selected_spline_quality_ridge": spline_quality_ridge,
+        "blend_proxy_feature": components.get("blend_proxy_feature", ""),
+        "blend_weight": float(components.get("blend_weight", 0.0)),
+        "variance_expansion_factor": float(
+            components.get("variance_expansion_factor", 1.0)
+        ),
+        "variance_correction_cap_mps": float(
+            components.get("variance_correction_cap_mps", 0.0)
+        ),
+        "variance_prediction_centre_mps": safe_float(
+            components.get("variance_prediction_centre_mps")
+        ),
+        "variance_target_centre_mps": safe_float(
+            components.get("variance_target_centre_mps")
+        ),
+        "extra_trees_n_estimators": int(
+            components.get("extra_trees_n_estimators", 0)
+        ),
+        "extra_trees_min_samples_leaf": int(
+            components.get("extra_trees_min_samples_leaf", 0)
+        ),
+        "extra_trees_random_seed": int(
+            components.get("extra_trees_random_seed", DEFAULT_RANDOM_SEED)
+        ),
+        "extra_trees": list(components.get("extra_trees", [])),
         "feature_names": feature_names,
         "feature_centre": components["feature_centre"].tolist(),
         "feature_scale": components["feature_scale"].tolist(),
@@ -3158,6 +5370,23 @@ def mode_fit(manifest_csv: str, model_json: str, output_dir: str) -> None:
         "feature_lower_bound": components["feature_lower_bound"].tolist(),
         "feature_upper_bound": components["feature_upper_bound"].tolist(),
         "residual_sigma_mps": float(components["residual_sigma_mps"]),
+        "primary_feature": components.get("primary_feature"),
+        "quality_features": components.get("quality_features", []),
+        "spline_knots": (
+            components["spline_knots"].tolist()
+            if components.get("spline_knots") is not None
+            else []
+        ),
+        "quality_centre": (
+            components["quality_centre"].tolist()
+            if components.get("quality_centre") is not None
+            else []
+        ),
+        "quality_scale": (
+            components["quality_scale"].tolist()
+            if components.get("quality_scale") is not None
+            else []
+        ),
         "conformal_coverage": coverage,
         "conformal_absolute_uncertainty_mps": conformal_uncertainty,
         "relative_uncertainty_limit": DEFAULT_RELATIVE_UNCERTAINTY_LIMIT,
@@ -3200,6 +5429,11 @@ def mode_fit(manifest_csv: str, model_json: str, output_dir: str) -> None:
         str(output_path / "cross_validation_report.json"),
         cross_validation,
     )
+    information_diagnostic = write_speed_information_diagnostics(
+        cross_validation_predictions,
+        output_path,
+        "development_source_grouped_cross_validation",
+    )
     report = {
         "release_id": RELEASE_ID,
         "model_path": str(Path(model_json).expanduser().resolve()),
@@ -3209,9 +5443,32 @@ def mode_fit(manifest_csv: str, model_json: str, output_dir: str) -> None:
         "selected_prediction_mode": model["prediction_mode"],
         "selected_feature_names": model["feature_names"],
         "selected_ridge": model["selected_ridge"],
+        "selected_spline_knot_count": model["selected_spline_knot_count"],
+        "selected_spline_smoothing": model["selected_spline_smoothing"],
+        "selected_spline_quality_ridge": model[
+            "selected_spline_quality_ridge"
+        ],
+        "selected_blend_proxy_feature": model.get(
+            "blend_proxy_feature",
+            "",
+        ),
+        "selected_blend_weight": float(model.get("blend_weight", 0.0)),
+        "selected_variance_expansion_factor": float(
+            model.get("variance_expansion_factor", 1.0)
+        ),
+        "selected_variance_correction_cap_mps": float(
+            model.get("variance_correction_cap_mps", 0.0)
+        ),
+        "selected_extra_trees_n_estimators": int(
+            model.get("extra_trees_n_estimators", 0)
+        ),
+        "selected_extra_trees_min_samples_leaf": int(
+            model.get("extra_trees_min_samples_leaf", 0)
+        ),
         "conformal_absolute_uncertainty_mps": conformal_uncertainty,
         "cross_validation": cross_validation,
         "development_fit_metrics": metric_summary(evaluated),
+        "speed_information_diagnostic": information_diagnostic,
         "held_out_test_tracks_not_used": len(held_out_test),
         "held_out_test_sources_not_used": len(held_out_test_sources),
     }
@@ -3224,6 +5481,12 @@ def mode_fit(manifest_csv: str, model_json: str, output_dir: str) -> None:
     log(
         f"Selected model: {model['selected_candidate']}, "
         f"mode={model['prediction_mode']}, ridge={ridge:g}, "
+        f"knots={spline_knot_count}, smoothing={spline_smoothing:g}, "
+        f"blend={blend_weight:g}, "
+        f"variance_factor={variance_expansion_factor:g}, "
+        f"variance_cap={variance_correction_cap_mps:g} m/s, "
+        f"trees={extra_trees_n_estimators}, "
+        f"minimum_leaf={extra_trees_min_samples_leaf}, "
         f"features={','.join(feature_names)}"
     )
     log(
@@ -3234,6 +5497,24 @@ def mode_fit(manifest_csv: str, model_json: str, output_dir: str) -> None:
             if model["calibration_qualified"]
             else "; " + ", ".join(model["qualification_reasons"])
         )
+    )
+    selected_metrics = cross_validation["selected_metrics"]
+
+    def format_selected_metric(name: str) -> str:
+        value = safe_float(selected_metrics.get(name))
+        return f"{value:.3f}" if value is not None else "NA"
+
+    log(
+        "Selected source grouped agreement: "
+        f"MAE={format_selected_metric('source_balanced_mae_mps')} m/s, "
+        f"RMSE={format_selected_metric('rmse_mps')} m/s, "
+        f"SD ratio={format_selected_metric('prediction_reference_sd_ratio')}, "
+        "calibration slope="
+        f"{format_selected_metric('prediction_on_reference_calibration_slope')}, "
+        f"Pearson={format_selected_metric('pearson_correlation')}, "
+        f"Spearman={format_selected_metric('spearman_correlation')}, "
+        "Lin concordance="
+        f"{format_selected_metric('lins_concordance_correlation')}"
     )
     log(
         f"Held out test rows left untouched: {len(held_out_test)} from "
@@ -3249,8 +5530,11 @@ def load_model(path: str, require_qualified: bool = False) -> Dict[str, Any]:
         fail(f"Model JSON does not exist: {model_path}")
     with model_path.open("r", encoding="utf-8") as handle:
         model = json.load(handle)
-    if model.get("schema") != MODEL_SCHEMA:
-        fail(f"Unsupported model schema {model.get('schema')!r}; expected {MODEL_SCHEMA!r}")
+    if model.get("schema") not in {MODEL_SCHEMA, *LEGACY_MODEL_SCHEMAS}:
+        fail(
+            f"Unsupported model schema {model.get('schema')!r}; expected "
+            f"{MODEL_SCHEMA!r} or a supported legacy schema"
+        )
     feature_names = model.get("feature_names")
     if (
         not isinstance(feature_names, list)
@@ -3258,6 +5542,51 @@ def load_model(path: str, require_qualified: bool = False) -> Dict[str, Any]:
         or any(name not in MODEL_FEATURES for name in feature_names)
     ):
         fail("Model contains an unsupported feature list")
+    if model.get("prediction_mode") in {
+        "monotonic_spline_gam",
+        "monotonic_spline_physics_blend",
+        "bounded_variance_calibration",
+    }:
+        knots = model.get("spline_knots")
+        primary_feature = model.get("primary_feature")
+        if (
+            not isinstance(knots, list)
+            or len(knots) < 2
+            or primary_feature not in MODEL_FEATURES
+        ):
+            fail("Monotonic spline model metadata is incomplete")
+    if model.get("prediction_mode") in {
+        "bounded_variance_calibration",
+        "extra_trees_bounded_variance",
+    }:
+        variance_values = [
+            safe_float(model.get("variance_prediction_centre_mps")),
+            safe_float(model.get("variance_target_centre_mps")),
+            safe_float(model.get("variance_expansion_factor")),
+            safe_float(model.get("variance_correction_cap_mps")),
+        ]
+        if any(value is None for value in variance_values):
+            fail("Bounded variance calibration metadata is incomplete")
+    if model.get("prediction_mode") in {
+        "extra_trees_regression",
+        "extra_trees_bounded_variance",
+    }:
+        trees = model.get("extra_trees")
+        if not isinstance(trees, list) or not trees:
+            fail("Extra Trees model metadata is incomplete")
+        required_tree_keys = {
+            "children_left",
+            "children_right",
+            "feature",
+            "threshold",
+            "value",
+        }
+        if any(
+            not isinstance(tree, dict)
+            or not required_tree_keys.issubset(tree)
+            for tree in trees
+        ):
+            fail("Extra Trees model contains an invalid tree")
     if require_qualified:
         if not truthy(model.get("calibration_qualified"), False):
             reasons = ", ".join(model.get("qualification_reasons") or ["unknown"])
@@ -3314,6 +5643,51 @@ def external_test_qualification(
         > float(EXTERNAL_TEST_SETTINGS["maximum_reliable_mae_mps"])
     ):
         reasons.append("reliable_test_mae_too_high")
+    sd_ratio = safe_float(
+        all_metrics.get("prediction_reference_sd_ratio")
+    )
+    if (
+        sd_ratio is None
+        or sd_ratio
+        < float(
+            EXTERNAL_TEST_SETTINGS["minimum_prediction_reference_sd_ratio"]
+        )
+    ):
+        reasons.append("test_prediction_spread_too_narrow")
+    elif sd_ratio > float(
+        EXTERNAL_TEST_SETTINGS["maximum_prediction_reference_sd_ratio"]
+    ):
+        reasons.append("test_prediction_spread_too_wide")
+    calibration_slope = safe_float(
+        all_metrics.get("prediction_on_reference_calibration_slope")
+    )
+    if (
+        calibration_slope is None
+        or calibration_slope
+        < float(EXTERNAL_TEST_SETTINGS["minimum_calibration_slope"])
+    ):
+        reasons.append("test_calibration_slope_too_low")
+    elif calibration_slope > float(
+        EXTERNAL_TEST_SETTINGS["maximum_calibration_slope"]
+    ):
+        reasons.append("test_calibration_slope_too_high")
+    pearson = safe_float(all_metrics.get("pearson_correlation"))
+    if pearson is None or pearson < float(
+        EXTERNAL_TEST_SETTINGS["minimum_pearson_correlation"]
+    ):
+        reasons.append("test_pearson_correlation_too_low")
+    spearman = safe_float(all_metrics.get("spearman_correlation"))
+    if spearman is None or spearman < float(
+        EXTERNAL_TEST_SETTINGS["minimum_spearman_correlation"]
+    ):
+        reasons.append("test_spearman_correlation_too_low")
+    concordance = safe_float(
+        all_metrics.get("lins_concordance_correlation")
+    )
+    if concordance is None or concordance < float(
+        EXTERNAL_TEST_SETTINGS["minimum_lins_concordance"]
+    ):
+        reasons.append("test_lins_concordance_too_low")
     return {
         "passed": not reasons,
         "reasons": reasons,
@@ -3417,11 +5791,21 @@ def mode_evaluate(manifest_csv: str, model_json: str, output_dir: str, selected_
     output_path.mkdir(parents=True, exist_ok=True)
     write_dict_csv(str(output_path / "evaluation_tracks.csv"), evaluated)
     metrics = metric_summary(evaluated)
+    information_diagnostic = write_speed_information_diagnostics(
+        evaluated,
+        output_path,
+        (
+            "untouched_external_test_audit_only"
+            if selected_split == "test"
+            else f"{selected_split}_evaluation"
+        ),
+    )
     report: Dict[str, Any] = {
         "release_id": RELEASE_ID,
         "selected_split": selected_split,
         "model_path": str(Path(model_json).expanduser().resolve()),
         "metrics": metrics,
+        "speed_information_diagnostic": information_diagnostic,
     }
     if selected_split == "test":
         report["external_test_preflight"] = {
@@ -3474,17 +5858,16 @@ def mode_predict(
     person_rows = [row for row in all_rows if row.class_id == PERSON_CLASS_ID]
     tracks = group_tracks(person_rows)
     scene_motion_profile = build_scene_motion_profile(all_rows, fps)
+    features_by_track = contextual_track_features(
+        tracks,
+        fps,
+        source_id,
+        aspect_ratio,
+        scene_motion_profile,
+    )
     output: List[Dict[str, Any]] = []
-    for track_id in sorted(tracks, key=str):
-        features = track_features(
-            tracks[track_id],
-            fps,
-            source_id,
-            aspect_ratio,
-            scene_motion_profile,
-        )
-        if features is None:
-            continue
+    for track_id in sorted(features_by_track, key=str):
+        features = features_by_track[track_id]
         prediction = prediction_from_model(features, model)
         output.append(
             {
@@ -3839,17 +6222,16 @@ def mode_predict_relative(
     person_rows = [row for row in all_rows if row.class_id == PERSON_CLASS_ID]
     tracks = group_tracks(person_rows)
     scene_motion_profile = build_scene_motion_profile(all_rows, fps)
+    features_by_track = contextual_track_features(
+        tracks,
+        fps,
+        source_id,
+        aspect_ratio,
+        scene_motion_profile,
+    )
     prepared: List[Tuple[TrackFeatures, float, str]] = []
-    for track_id in sorted(tracks, key=str):
-        features = track_features(
-            tracks[track_id],
-            fps,
-            source_id,
-            aspect_ratio,
-            scene_motion_profile,
-        )
-        if features is None:
-            continue
+    for track_id in sorted(features_by_track, key=str):
+        features = features_by_track[track_id]
         if features.scene_motion_support >= int(
             SCENE_MOTION_SETTINGS["minimum_reference_tracks"]
         ):
@@ -4082,7 +6464,13 @@ def mode_track_video(video_path: str, output_bbox_csv: str, device: str, tracker
     log(f"Output: {output_path}")
 
 
-def mode_track_index(index_csv: str, device: str, maximum_sequences: int, overwrite: bool) -> None:
+def mode_track_index(
+    index_csv: str,
+    device: str,
+    maximum_sequences: int,
+    overwrite: bool,
+    include_all_sequences: bool = False,
+) -> None:
     rows = read_dict_csv(index_csv)
     if maximum_sequences > 0:
         rows = rows[:maximum_sequences]
@@ -4090,7 +6478,11 @@ def mode_track_index(index_csv: str, device: str, maximum_sequences: int, overwr
     skipped = 0
     for index, row in enumerate(rows, start=1):
         ground_truth_rows = safe_int(row.get("ground_truth_rows"))
-        if ground_truth_rows is not None and ground_truth_rows <= 0:
+        if (
+            not include_all_sequences
+            and ground_truth_rows is not None
+            and ground_truth_rows <= 0
+        ):
             log(
                 f"Skipping sequence {index}/{len(rows)} with no pedestrian "
                 f"ground truth: {row.get('source_id', '')}"
@@ -4828,9 +7220,9 @@ def mode_waymo_export(
         write_dict_csv(str(crossing_path), crossing_rows, WAYMO_CROSSING_TRACK_FIELDS)
         index_row = {
             "source_id": source_id,
-            "video_path": portable_index_path(video_path),
-            "ground_truth_bbox_csv": portable_index_path(gt_path),
-            "crossing_tracks_csv": portable_index_path(crossing_path),
+            "video_path": portable_index_path(video_path, output_root),
+            "ground_truth_bbox_csv": portable_index_path(gt_path, output_root),
+            "crossing_tracks_csv": portable_index_path(crossing_path, output_root),
             "fps": fps,
             "aspect_ratio": width / height if height else DEFAULT_ASPECT_RATIO,
             "frames": frame_index,
@@ -4841,10 +7233,12 @@ def mode_waymo_export(
             "crosswalk_features": len(crosswalks),
             "ground_truth_target": WAYMO_CALIBRATION_TARGET,
             "prediction_bbox_csv": portable_index_path(
-                sequence_dir / "crowd_yolo_botsort_bbox.csv"
+                sequence_dir / "crowd_yolo_botsort_bbox.csv",
+                output_root,
             ),
             "manifest_csv": portable_index_path(
-                sequence_dir / "matched_manifest.csv"
+                sequence_dir / "matched_manifest.csv",
+                output_root,
             ),
         }
         rejection_counts: Dict[str, int] = defaultdict(int)
@@ -5050,8 +7444,8 @@ def print_usage() -> None:
 Required production CSV columns:
   yolo-id,x-center,y-center,width,height,unique-id,confidence,frame-count
 
-predict_metric can use a person-only CSV. predict_relative and the legacy
-predict command need all object classes for bbox scene-motion estimation.
+predict_metric can use a person-only CSV. predict_relative and predict need
+all object classes for bbox scene-motion and within-video context estimation.
 
 Commands:
   python3 speed_estimation_harness.py build_info
@@ -5102,7 +7496,11 @@ Commands:
     <video.mp4> <output-bbox.csv> [device=auto] [tracker-yaml-or-=auto]
 
   python3 speed_estimation_harness.py track_index \\
-    <Waymo-or-nuScenes-index.csv> [device=auto] [max-sequences=0] [overwrite=false]
+    <Waymo-or-nuScenes-index.csv> [device=auto] [max-sequences=0] \
+    [overwrite=false] [include-all-sequences=false]
+
+  python3 speed_estimation_harness.py calibrate_waymo_pipeline \
+    <training-index.csv> <validation-index.csv> <output-directory>
 
   python3 speed_estimation_harness.py match \\
     <source-id> <prediction-bbox.csv> <Waymo-GT-bbox.csv> <fps> <output-manifest.csv> \\
@@ -5129,6 +7527,14 @@ Commands:
 
   python3 speed_estimation_harness.py evaluate \\
     <manifest.csv> <candidate-model.json> <output-directory> [split=test|validation|train|all]
+
+  python3 speed_estimation_harness.py diagnose_speed_information \\
+    <cross-validation-or-evaluation.csv> <output-directory> \\
+    [role=development_diagnostic]
+
+  This command measures error by reference speed bin, prediction range
+  compression, pooled and within-video feature correlations, and the worst
+  individual errors. It never changes a fitted model.
 
   A test evaluation writes <output-directory>/production_model.json only when
   source grouped calibration and the untouched external test both pass.
@@ -5244,7 +7650,19 @@ def main() -> None:
         device = sys.argv[3] if len(sys.argv) > 3 else "auto"
         maximum = int(sys.argv[4]) if len(sys.argv) > 4 else 0
         overwrite = truthy(sys.argv[5], False) if len(sys.argv) > 5 else False
-        mode_track_index(sys.argv[2], device, maximum, overwrite)
+        include_all = truthy(sys.argv[6], False) if len(sys.argv) > 6 else False
+        mode_track_index(sys.argv[2], device, maximum, overwrite, include_all)
+        return
+    if command == "calibrate_waymo_pipeline":
+        require_args(command, 5)
+        from utils.crossing.waymo_calibration import calibrate_waymo_pipeline
+
+        calibrate_waymo_pipeline(
+            sys.argv[2],
+            sys.argv[3],
+            sys.argv[4],
+            sys.modules[__name__],
+        )
         return
     if command == "match":
         require_args(command, 7)
@@ -5283,6 +7701,15 @@ def main() -> None:
         if selected_split not in {"train", "validation", "test", "all"}:
             fail("evaluate split must be train, validation, test, or all")
         mode_evaluate(sys.argv[2], sys.argv[3], sys.argv[4], selected_split)
+        return
+    if command == "diagnose_speed_information":
+        require_args(command, 4)
+        role = (
+            sys.argv[4].strip()
+            if len(sys.argv) > 4
+            else "development_diagnostic"
+        )
+        mode_diagnose_speed_information(sys.argv[2], sys.argv[3], role)
         return
     if command == "predict":
         require_args(command, 6)

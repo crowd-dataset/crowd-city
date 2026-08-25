@@ -7,11 +7,29 @@ from typing import Tuple, List, Any, Optional
 metadata = MetaData()
 helper = Youtube_Helper()
 
+CROSSING_PARAMETER_DEFAULTS = {
+    "tol": 0.00,
+    "min_track_frames": 10,
+    "min_road_frames": 3,
+    "max_track_gap_frames": 30,
+    "min_crossing_x_range": 0.14,
+    "weak_crossing_x_range": 0.64,
+    "low_x_range": 0.30,
+    "low_x_min_road_frames": 20,
+    "weak_y_jitter_motion": 0.30,
+    "long_weak_road_frames": 90,
+}
+
 
 class Detection:
 
     def __init__(self) -> None:
         pass
+
+    @staticmethod
+    def crossing_parameter_defaults() -> dict:
+        """Return an independent copy of the fixed original CROWD defaults."""
+        return dict(CROSSING_PARAMETER_DEFAULTS)
 
     @staticmethod
     def _first_float(value, default: Optional[float] = None) -> Optional[float]:

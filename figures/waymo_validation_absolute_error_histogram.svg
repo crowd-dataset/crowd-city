@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="600">
+<rect width="100%" height="100%" fill="white"/>
+<text x="410" y="34" text-anchor="middle" font-family="Arial" font-size="21">Waymo validation absolute speed error</text>
+<text x="410" y="56" text-anchor="middle" font-family="Arial" font-size="13">Median absolute error 0.09 m/s</text>
+<line x1="90" y1="520" x2="790" y2="520" stroke="#333"/>
+<line x1="90" y1="75" x2="90" y2="520" stroke="#333"/>
+<text x="440.0" y="580" text-anchor="middle" font-family="Arial" font-size="15">Absolute error (m/s), 0.10 m/s bins</text>
+<text transform="translate(22 297.5) rotate(-90)" text-anchor="middle" font-family="Arial" font-size="15">Pedestrian tracks</text>
+<rect x="91.0" y="75.0" width="75.8" height="445.0" fill="#0072B2"/>
+<text x="128.9" y="70.0" text-anchor="middle" font-family="Arial" font-size="11">13</text>
+<rect x="168.8" y="314.6" width="75.8" height="205.4" fill="#0072B2"/>
+<text x="206.7" y="309.6" text-anchor="middle" font-family="Arial" font-size="11">6</text>
+<rect x="246.6" y="485.8" width="75.8" height="34.2" fill="#0072B2"/>
+<text x="284.4" y="480.8" text-anchor="middle" font-family="Arial" font-size="11">1</text>
+<rect x="324.3" y="417.3" width="75.8" height="102.7" fill="#0072B2"/>
+<text x="362.2" y="412.3" text-anchor="middle" font-family="Arial" font-size="11">3</text>
+<rect x="402.1" y="485.8" width="75.8" height="34.2" fill="#0072B2"/>
+<text x="440.0" y="480.8" text-anchor="middle" font-family="Arial" font-size="11">1</text>
+<rect x="479.9" y="520.0" width="75.8" height="0.0" fill="#0072B2"/>
+<text x="517.8" y="515.0" text-anchor="middle" font-family="Arial" font-size="11">0</text>
+<rect x="557.7" y="520.0" width="75.8" height="0.0" fill="#0072B2"/>
+<text x="595.6" y="515.0" text-anchor="middle" font-family="Arial" font-size="11">0</text>
+<rect x="635.4" y="520.0" width="75.8" height="0.0" fill="#0072B2"/>
+<text x="673.3" y="515.0" text-anchor="middle" font-family="Arial" font-size="11">0</text>
+<rect x="713.2" y="485.8" width="75.8" height="34.2" fill="#0072B2"/>
+<text x="751.1" y="480.8" text-anchor="middle" font-family="Arial" font-size="11">1</text>
+</svg>

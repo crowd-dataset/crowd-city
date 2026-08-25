@@ -82,7 +82,7 @@ file_results: str = "results.pickle"
 video_paths = common.get_configs("videos")
 
 # Common junk files/folders to ignore.
-MISC_FILES: Set[str] = {"DS_Store", "seg", "bbox", "._bbox"}
+MISC_FILES: Set[str] = {"DS_Store", "seg", "bbox"}
 
 
 class Analysis():
@@ -1893,9 +1893,41 @@ def _run_integrated_speed_reporting(
         logger.error(f"Integrated crossing motion reporting failed: {error}")
 
 
+def _prepare_waymo_tuned_parameters() -> Dict[str, object]:
+    """Prepare or load the frozen Waymo model before CROWD CSV analysis."""
+    try:
+        from utils.crossing.metrics import (
+            ensure_waymo_processed,
+            metric_speed_is_qualified,
+            tuned_crossing_parameters,
+        )
+
+        ensure_waymo_processed(
+            raw_dataset_path=common.get_configs("waymo_dataset_path"),
+            repository_root=common.root_dir,
+            output_root=common.output_dir,
+            process_if_missing=bool(common.get_configs("process_waymo_if_missing")),
+            log=lambda message: logger.info(message),
+        )
+        parameters = tuned_crossing_parameters()
+        if parameters:
+            logger.info(
+                "Using the fixed CROWD crossing algorithm with the Waymo calibrated speed model; "
+                f"qualified metric speed={metric_speed_is_qualified()}."
+            )
+        else:
+            logger.info("No frozen Waymo model found; using original CROWD parameters.")
+        return parameters
+    except Exception as error:
+        logger.error(f"Waymo preparation failed; using original CROWD parameters: {error}")
+        return {}
+
+
 # Execute analysis
 if __name__ == "__main__":
     logger.info("Analysis started.")
+
+    waymo_crossing_parameters = _prepare_waymo_tuned_parameters()
 
     if os.path.exists(file_results) and not common.get_configs('always_analyse'):
         # Load the data from the pickle file
@@ -2637,27 +2669,53 @@ if __name__ == "__main__":
                     # Get the number of number and unique id of the object crossing the road
                     # ids give the unique of the person who cross the road after applying the filter, while
                     # all_ids gives every unique_id of the person who crosses the road
-                    ids, all_ids = detection.pedestrian_crossing(
-                        df,
-                        filename_no_ext,
-                        df_mapping,
-                        common.get_configs("boundary_left"),
-                        common.get_configs("boundary_right"),
-                        person_id=0,
-                    )
+                    is_bbox_stream = str(subfolder).strip().lower() == "bbox"
+                    if is_bbox_stream:
+                        crossing_parameters = dict(waymo_crossing_parameters)
+                        boundary_left = float(
+                            crossing_parameters.pop(
+                                "boundary_left",
+                                common.get_configs("boundary_left"),
+                            )
+                        )
+                        boundary_right = float(
+                            crossing_parameters.pop(
+                                "boundary_right",
+                                common.get_configs("boundary_right"),
+                            )
+                        )
+                        ids, all_ids = detection.pedestrian_crossing(
+                            df,
+                            filename_no_ext,
+                            df_mapping,
+                            boundary_left,
+                            boundary_right,
+                            person_id=0,
+                            fps=float(fps),
+                            **crossing_parameters,
+                        )
+                        # Save crossing results only for the calibrated bbox +
+                        # BoT SORT stream.  A later pass over the segmentation
+                        # folder must not overwrite these values with an empty
+                        # result for the same video.
+                        pedestrian_crossing_count[filename_no_ext] = {"ids": ids}
+                        pedestrian_crossing_count_all[filename_no_ext] = {"ids": all_ids}
 
-                    # Saving it in a dictionary in: {video-id_time: count, ids}
-                    pedestrian_crossing_count[filename_no_ext] = {"ids": ids}
-                    pedestrian_crossing_count_all[filename_no_ext] = {"ids": all_ids}
-
-                    # Saves the time to cross in form {name_time: {id(s): time(s)}}
-                    temp_data = metrics.time_to_cross(
-                        df,
-                        pedestrian_crossing_count[filename_no_ext]["ids"],
-                        filename_no_ext,
-                        df_mapping,
-                    )
-                    data[filename_no_ext] = temp_data
+                        # Saves the time to cross in form
+                        # {name_time: {id(s): time(s)}}.
+                        temp_data = metrics.time_to_cross(
+                            df,
+                            ids,
+                            filename_no_ext,
+                            df_mapping,
+                        )
+                        data[filename_no_ext] = temp_data
+                    else:
+                        # Waymo calibration and CROWD deployment both use the
+                        # bbox plus BoT SORT stream. Segmentation rows are kept
+                        # for the legacy object statistics below, but never
+                        # become a second crossing/speed measurement.
+                        ids, all_ids, temp_data = [], [], {}
 
                     # List of all 80 class names in COCO order
                     coco_classes = [
@@ -2728,25 +2786,26 @@ if __name__ == "__main__":
                     )
 
                     # Aggregated values
-                    speed_value = metrics.calculate_speed_of_crossing(
-                        df_mapping,
-                        df,
-                        {filename_no_ext: temp_data},
-                    )
+                    if is_bbox_stream:
+                        speed_value = metrics.calculate_speed_of_crossing(
+                            df_mapping,
+                            df,
+                            {filename_no_ext: temp_data},
+                        )
 
-                    if speed_value is not None:
-                        for outer_key, inner_dict in speed_value.items():
-                            all_speed.setdefault(outer_key, {}).update(inner_dict)
+                        if speed_value is not None:
+                            for outer_key, inner_dict in speed_value.items():
+                                all_speed.setdefault(outer_key, {}).update(inner_dict)
 
-                    time_value = metrics.time_to_start_cross(
-                        df_mapping,
-                        df,
-                        {filename_no_ext: temp_data},
-                    )
+                        time_value = metrics.time_to_start_cross(
+                            df_mapping,
+                            df,
+                            {filename_no_ext: temp_data},
+                        )
 
-                    if time_value is not None:
-                        for outer_key, inner_dict in time_value.items():
-                            all_time.setdefault(outer_key, {}).update(inner_dict)
+                        if time_value is not None:
+                            for outer_key, inner_dict in time_value.items():
+                                all_time.setdefault(outer_key, {}).update(inner_dict)
 
         person_counter = df_mapping.select(pl.col("person").sum()).item()
         bicycle_counter = df_mapping.select(pl.col("bicycle").sum()).item()

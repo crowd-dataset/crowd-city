@@ -1,3 +1,4 @@
+import os
 import pickle
 import statistics
 import common
@@ -27,6 +28,15 @@ logger = CustomLogger(__name__)  # use custom logger
 
 # File to store the locality coordinates
 file_results = 'results.pickle'
+
+
+def crossing_metric_label(mean: bool = False) -> str:
+    metric = (
+        "crossing speed (m/s)"
+        if os.environ.get("CROWD_CROSSING_SPEED_UNIT") == "m/s"
+        else "relative crossing motion index"
+    )
+    return f"Mean {metric}" if mean else metric.capitalize()
 
 
 class Crossings:
@@ -443,7 +453,7 @@ class Crossings:
 
         # Set the x-axis labels (title_text) only for the last row and the first row
         fig.update_xaxes(
-            title=dict(text="Mean relative crossing motion index", font=dict(size=font_size_captions)),
+            title=dict(text=crossing_metric_label(mean=True), font=dict(size=font_size_captions)),
             tickfont=dict(size=font_size_captions),
             ticks='outside',
             ticklen=10,
@@ -453,7 +463,7 @@ class Crossings:
             col=1
         )
         fig.update_xaxes(
-            title=dict(text="Mean relative crossing motion index", font=dict(size=font_size_captions)),
+            title=dict(text=crossing_metric_label(mean=True), font=dict(size=font_size_captions)),
             tickfont=dict(size=font_size_captions),
             ticks='outside',
             ticklen=10,
@@ -522,8 +532,8 @@ class Crossings:
 
         # Define the legend items
         legend_items = [
-            {"name": "Relative crossing motion during daytime", "color": C.BAR_COLOR_1},
-            {"name": "Relative crossing motion during night time", "color": C.BAR_COLOR_2},
+            {"name": f"{crossing_metric_label()} during daytime", "color": C.BAR_COLOR_1},
+            {"name": f"{crossing_metric_label()} during night time", "color": C.BAR_COLOR_2},
             {"name": "Crossing decision time during daytime", "color": C.BAR_COLOR_3},
             {"name": "Crossing decision time during night time", "color": C.BAR_COLOR_4},
         ]
@@ -1048,7 +1058,7 @@ class Crossings:
 
         # Set the x-axis labels (title_text) only for the last row and the first row
         fig.update_xaxes(
-            title=dict(text="Mean relative crossing motion index", font=dict(size=font_size_captions)),
+            title=dict(text=crossing_metric_label(mean=True), font=dict(size=font_size_captions)),
             tickfont=dict(size=font_size_captions),
             ticks='outside',
             ticklen=10,
@@ -1058,7 +1068,7 @@ class Crossings:
             col=1
         )
         fig.update_xaxes(
-            title=dict(text="Mean relative crossing motion index", font=dict(size=font_size_captions)),
+            title=dict(text=crossing_metric_label(mean=True), font=dict(size=font_size_captions)),
             tickfont=dict(size=font_size_captions),
             ticks='outside',
             ticklen=10,
@@ -1127,8 +1137,8 @@ class Crossings:
 
         # Define the legend items
         legend_items = [
-            {"name": "Mean relative crossing motion during day", "color": C.BAR_COLOR_1},
-            {"name": "Mean relative crossing motion during night", "color": C.BAR_COLOR_2},
+            {"name": f"{crossing_metric_label(mean=True)} during day", "color": C.BAR_COLOR_1},
+            {"name": f"{crossing_metric_label(mean=True)} during night", "color": C.BAR_COLOR_2},
             {"name": "Mean time to start crossing during day (in s)", "color": C.BAR_COLOR_3},
             {"name": "Mean time to start crossing during night (in s) ", "color": C.BAR_COLOR_4},
         ]
