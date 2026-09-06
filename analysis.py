@@ -2802,7 +2802,11 @@ if __name__ == "__main__":
 
                     # Polars read + filter
                     df = pl.read_csv(file_path)
-                    df = df.filter(pl.col("confidence") >= min_conf)
+                    df = df.filter(
+                        (pl.col("confidence") >= min_conf)
+                        & pl.col("unique-id").is_not_null()
+                        & (pl.col("unique-id") != -1)
+                    )
 
                     # After reading the file, clean up the filename
                     base_name = tools.clean_csv_filename(file_str)
