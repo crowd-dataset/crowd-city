@@ -103,6 +103,23 @@ class Stacked:
             if not (isinstance(value, float) and math.isnan(value))
         }
 
+        def valid_metric_value(value) -> bool:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return False
+            return math.isfinite(numeric) and numeric > 0.0
+
+        def available_mean(locality: str) -> float:
+            values = [
+                float(final_dict[locality][f"{metric}_{condition}"])
+                for condition in (0, 1)
+                if valid_metric_value(
+                    final_dict[locality].get(f"{metric}_{condition}")
+                )
+            ]
+            return sum(values) / len(values) if values else 0.0
+
         if analysis_level == "locality":
             # Now populate the final_dict with locality-wise speed data
             for locality_condition, _ in tqdm(metric_data.items()):
@@ -148,7 +165,7 @@ class Stacked:
                 cities_ordered = sorted(
                     [
                         locality for locality in final_dict.keys()
-                        if (final_dict[locality].get(f"{metric}_0") or 0) >= 0.005
+                        if valid_metric_value(final_dict[locality].get(f"{metric}_0"))
                     ],
                     key=lambda locality: (final_dict[locality].get("iso") or "")
                 )
@@ -156,7 +173,7 @@ class Stacked:
                 cities_ordered = sorted(
                     [
                         locality for locality in final_dict.keys()
-                        if (final_dict[locality].get(f"{metric}_1") or 0) >= 0.005
+                        if valid_metric_value(final_dict[locality].get(f"{metric}_1"))
                     ],
                     key=lambda locality: (final_dict[locality].get("iso") or "")
                 )
@@ -164,7 +181,7 @@ class Stacked:
                 cities_ordered = sorted(
                     [
                         locality for locality in final_dict.keys()
-                        if (((final_dict[locality].get(f"{metric}_0") or 0) + (final_dict[locality].get(f"{metric}_1") or 0)) / 2) >= 0.005  # noqa:E501
+                        if available_mean(locality) > 0.0
                     ],
                     key=lambda locality: (final_dict[locality].get("iso") or "")
                 )
@@ -174,7 +191,7 @@ class Stacked:
                 cities_ordered = sorted(
                     [
                         locality for locality in final_dict.keys()
-                        if (final_dict[locality].get(f"{metric}_0") or 0) >= 0.005
+                        if valid_metric_value(final_dict[locality].get(f"{metric}_0"))
                     ],
                     key=lambda locality: final_dict[locality].get(f"{metric}_0") or 0,
                     reverse=True
@@ -184,7 +201,7 @@ class Stacked:
                 cities_ordered = sorted(
                     [
                         locality for locality in final_dict.keys()
-                        if (final_dict[locality].get(f"{metric}_1") or 0) >= 0.005
+                        if valid_metric_value(final_dict[locality].get(f"{metric}_1"))
                     ],
                     key=lambda locality: final_dict[locality].get(f"{metric}_1") or 0,
                     reverse=True
@@ -194,14 +211,17 @@ class Stacked:
                 cities_ordered = sorted(
                     [
                         locality for locality in final_dict.keys()
-                        if (((final_dict[locality].get(f"{metric}_0") or 0) + (final_dict[locality].get(f"{metric}_1") or 0)) / 2) >= 0.005  # noqa:E501  # type: ignore
+                        if available_mean(locality) > 0.0
                     ],
-                    key=lambda locality: (
-                        ((final_dict[locality].get(f"{metric}_0") or 0) + (final_dict[locality].get(f"{metric}_1") or 0)) / 2  # noqa:E501  # type: ignore
-                    ), reverse=True
+                    key=available_mean,
+                    reverse=True,
                 )
 
         if len(cities_ordered) == 0:
+            logger.warning(
+                f"Skipping {filename}: no finite positive {metric} values "
+                f"are available for the {data_view} view."
+            )
             return
 
         # Prepare data for day and night stacking
@@ -222,7 +242,18 @@ class Stacked:
         num_cities_per_col = len(cities_ordered) // 2 + len(cities_ordered) % 2  # Split cities into two groups
 
         # Define a base height per row and calculate total figure height
-        TALL_FIG_HEIGHT = num_cities_per_col * C.BASE_HEIGHT_PER_ROW
+        TALL_FIG_HEIGHT = max(
+            500,
+            min(20000, 220 + num_cities_per_col * 70),
+        )
+        FIG_WIDTH = max(
+            1200,
+            min(2400, 1000 + min(len(cities_ordered), 35) * 40),
+        )
+        logger.info(
+            f"Building {filename} for {len(cities_ordered)} cities "
+            f"at {FIG_WIDTH}x{TALL_FIG_HEIGHT} pixels."
+        )
 
         fig = make_subplots(
             rows=num_cities_per_col, cols=2,  # Two columns
@@ -396,13 +427,16 @@ class Stacked:
         ]) if cities_ordered else 0
 
         # Identify the last row for each column where the last locality is plotted
-        last_row_left_column = num_cities_per_col * 2  # The last row in the left column
-        last_row_right_column = (len(cities_ordered) - num_cities_per_col) * 2  # The last row in the right column
+        last_row_left_column = num_cities_per_col
+        last_row_right_column = max(
+            1,
+            len(cities_ordered) - num_cities_per_col,
+        )
         first_row_left_column = 1  # The first row in the left column
         first_row_right_column = 1  # The first row in the right column
 
         # Update the loop for updating x-axes based on max values for speed and time
-        for i in range(1, num_cities_per_col * 2 + 1):  # Loop through all rows in both columns
+        for i in range(1, num_cities_per_col + 1):
             # Update x-axis for the left column
             if i % 2 == 1:  # Odd rows
                 fig.update_xaxes(
@@ -477,7 +511,7 @@ class Stacked:
             paper_bgcolor='white',
             barmode='stack',
             height=TALL_FIG_HEIGHT,
-            width=2480,
+            width=FIG_WIDTH,
             showlegend=False,  # Hide the default legend
             margin=dict(t=150, b=150),
             bargap=0,
@@ -578,8 +612,8 @@ class Stacked:
             font_size = C.FLAG_SIZE  # Font size for visibility
 
             # Initialise variables for dynamic y positioning for both columns
-            current_row_left = 1  # Start from the first row for the left column
-            current_row_right = 1  # Start from the first row for the right column
+            current_row_left = 0
+            current_row_right = 0
             y_position_map_left = {}  # Store y positions for each country (left column)
             y_position_map_right = {}  # Store y positions for each country (right column)
 
@@ -588,18 +622,22 @@ class Stacked:
                 country = final_dict[locality]['iso']
 
                 if country not in y_position_map_left:  # Add the country label once per country
-                    y_position_map_left[country] = 1 - (current_row_left - 1) / ((len(left_column_cities)-1.12) * 2)
+                    y_position_map_left[country] = 1 - (
+                        (current_row_left + 0.5) / max(len(left_column_cities), 1)
+                    )
 
-                current_row_left += 2  # Increment the row for each locality (speed and time take two rows)
+                current_row_left += 1
 
             # Calculate the y positions dynamically for the right column
             for locality in right_column_cities:
                 country = final_dict[locality]['iso']
 
                 if country not in y_position_map_right:  # Add the country label once per country
-                    y_position_map_right[country] = 1 - (current_row_right - 1) / ((len(right_column_cities)-1.12) * 2)
+                    y_position_map_right[country] = 1 - (
+                        (current_row_right + 0.5) / max(len(right_column_cities), 1)
+                    )
 
-                current_row_right += 2  # Increment the row for each locality (speed and time take two rows)
+                current_row_right += 1
 
             # Add annotations for country names dynamically for the left column
             for country, y_position in y_position_map_left.items():
@@ -653,7 +691,7 @@ class Stacked:
         fig.update_layout(margin=dict(l=80, r=80, t=x_axis_title_height, b=10))
         plots_io_class.save_plotly_figure(fig=fig,
                                           filename=filename,
-                                          width=2400,
+                                          width=FIG_WIDTH,
                                           height=TALL_FIG_HEIGHT,
                                           scale=C.SCALE,
                                           save_eps=False,

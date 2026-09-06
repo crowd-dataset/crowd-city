@@ -81,6 +81,9 @@ file_results: str = "results.pickle"
 
 video_paths = common.get_configs("videos")
 
+# Populated once during Waymo preparation and reused by integrated reporting.
+waymo_processed_roots: list[object] = []
+
 # Common junk files/folders to ignore.
 MISC_FILES: Set[str] = {"DS_Store", "seg", "bbox"}
 
@@ -1768,6 +1771,152 @@ def _environment_truthy(name: str, default: bool = False) -> bool:
     return default
 
 
+def _normalise_city_limit(value: object) -> int:
+    """Return the configured city limit, treating an empty value as unlimited."""
+    if value is None:
+        return 0
+    if isinstance(value, str) and not value.strip():
+        return 0
+    if isinstance(value, bool):
+        raise ValueError("n_cities must be an integer, an empty string, or null")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "n_cities must be an integer, an empty string, or null"
+        ) from error
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        raise ValueError("n_cities must be a finite integer")
+    return int(numeric)
+
+
+def _segment_duration_seconds(start_value: object, end_value: object) -> float:
+    """Sum aligned segment durations from scalar or nested mapping values."""
+    def parse(value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        text = value.strip()
+        if not text or text.lower() in {"nan", "none", "null"}:
+            return []
+        try:
+            return ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            return []
+
+    def total(starts: object, ends: object) -> float:
+        if isinstance(starts, (list, tuple)) and isinstance(ends, (list, tuple)):
+            return sum(
+                (total(start, end) for start, end in zip(starts, ends)),
+                0.0,
+            )
+        try:
+            start = float(starts)
+            end = float(ends)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(start) or not math.isfinite(end) or end < start:
+            return 0.0
+        return end - start
+
+    return float(total(parse(start_value), parse(end_value)))
+
+
+def _select_cities_by_footage(
+    df_mapping_source: "pl.DataFrame",
+    configured_limit: object,
+) -> "pl.DataFrame":
+    """Select the highest or lowest footage cities using total segment duration."""
+    limit = _normalise_city_limit(configured_limit)
+    if limit == 0 or df_mapping_source.height == 0:
+        logger.info("City footage limit is empty or zero; analysing all available cities.")
+        return df_mapping_source
+
+    required = {"locality", "start_time", "end_time"}
+    missing = sorted(required - set(df_mapping_source.columns))
+    if missing:
+        raise ValueError(
+            "Cannot apply n_cities because the mapping is missing: "
+            + ", ".join(missing)
+        )
+
+    identity_columns = [
+        column
+        for column in ("locality", "state", "iso3", "country")
+        if column in df_mapping_source.columns
+    ]
+    city_key = pl.concat_str(
+        [
+            pl.col(column).cast(pl.Utf8, strict=False).fill_null("")
+            for column in identity_columns
+        ],
+        separator="\u241f",
+    )
+    footage_seconds = [
+        float(_segment_duration_seconds(start_value, end_value))
+        for start_value, end_value in df_mapping_source.select(
+            ["start_time", "end_time"]
+        ).iter_rows()
+    ]
+    ranked = (
+        df_mapping_source
+        .with_row_index("__city_row_order")
+        .with_columns([
+            city_key.alias("__city_key"),
+            pl.Series(
+                "__city_footage_seconds",
+                footage_seconds,
+                dtype=pl.Float64,
+            ),
+        ])
+    )
+    all_city_totals = (
+        ranked
+        .group_by("__city_key")
+        .agg([
+            pl.col("__city_footage_seconds").sum().alias("footage_seconds"),
+            pl.col("locality").first().alias("locality"),
+            *(
+                [pl.col("state").first().alias("state")]
+                if "state" in ranked.columns
+                else []
+            ),
+            *(
+                [pl.col("country").first().alias("country")]
+                if "country" in ranked.columns
+                else []
+            ),
+        ])
+        .sort(
+            ["footage_seconds", "__city_key"],
+            descending=[limit > 0, False],
+        )
+    )
+    city_totals = all_city_totals.head(abs(limit))
+    selected_keys = city_totals.get_column("__city_key")
+    selected = (
+        ranked
+        .filter(pl.col("__city_key").is_in(selected_keys))
+        .sort("__city_row_order")
+        .drop(["__city_row_order", "__city_key", "__city_footage_seconds"])
+    )
+    direction = "highest" if limit > 0 else "lowest"
+    logger.info(
+        f"Selected {city_totals.height} cities with the {direction} total segment duration "
+        f"from {all_city_totals.height} available cities."
+    )
+    for row in city_totals.iter_rows(named=True):
+        location = ", ".join(
+            str(row.get(field))
+            for field in ("locality", "state", "country")
+            if row.get(field) not in (None, "")
+        )
+        logger.info(
+            f"Selected city: {location}; footage="
+            f"{float(row['footage_seconds']):.2f} seconds."
+        )
+    return selected
+
+
 def _build_integrated_speed_sources(
     df_mapping_source: "pl.DataFrame",
     crossing_tracks: Dict[str, object],
@@ -1851,23 +2000,11 @@ def _run_integrated_speed_reporting(
         logger.info("Integrated crossing motion report disabled by CROWD_SPEED_REPORT.")
         return
     try:
-        from utils.crossing.metrics import (
-            ensure_waymo_processed,
-            run_integrated_speed_report,
-        )
+        from utils.crossing.metrics import run_integrated_speed_report
 
         output_root = os.environ.get(
             "CROWD_SPEED_REPORT_OUTPUT",
             os.path.join(common.output_dir, "crossing_speed"),
-        )
-        waymo_roots = ensure_waymo_processed(
-            raw_dataset_path=common.get_configs("waymo_dataset_path"),
-            repository_root=common.root_dir,
-            output_root=common.output_dir,
-            process_if_missing=bool(
-                common.get_configs("process_waymo_if_missing")
-            ),
-            log=lambda message: logger.info(message),
         )
         summary = run_integrated_speed_report(
             crowd_sources=_build_integrated_speed_sources(
@@ -1876,7 +2013,7 @@ def _run_integrated_speed_reporting(
             ),
             repository_root=common.root_dir,
             output_root=output_root,
-            waymo_roots=waymo_roots or None,
+            waymo_roots=waymo_processed_roots or None,
             force=_environment_truthy("CROWD_SPEED_REPORT_FORCE", False),
             log=lambda message: logger.info(message),
         )
@@ -1895,6 +2032,7 @@ def _run_integrated_speed_reporting(
 
 def _prepare_waymo_tuned_parameters() -> Dict[str, object]:
     """Prepare or load the frozen Waymo model before CROWD CSV analysis."""
+    global waymo_processed_roots
     try:
         from utils.crossing.metrics import (
             ensure_waymo_processed,
@@ -1902,12 +2040,16 @@ def _prepare_waymo_tuned_parameters() -> Dict[str, object]:
             tuned_crossing_parameters,
         )
 
-        ensure_waymo_processed(
-            raw_dataset_path=common.get_configs("waymo_dataset_path"),
-            repository_root=common.root_dir,
-            output_root=common.output_dir,
-            process_if_missing=bool(common.get_configs("process_waymo_if_missing")),
-            log=lambda message: logger.info(message),
+        waymo_processed_roots = list(
+            ensure_waymo_processed(
+                raw_dataset_path=common.get_configs("waymo_dataset_path"),
+                repository_root=common.root_dir,
+                output_root=common.output_dir,
+                process_if_missing=bool(
+                    common.get_configs("process_waymo_if_missing")
+                ),
+                log=lambda message: logger.info(message),
+            )
         )
         parameters = tuned_crossing_parameters()
         if parameters:
@@ -1919,6 +2061,7 @@ def _prepare_waymo_tuned_parameters() -> Dict[str, object]:
             logger.info("No frozen Waymo model found; using original CROWD parameters.")
         return parameters
     except Exception as error:
+        waymo_processed_roots = []
         logger.error(f"Waymo preparation failed; using original CROWD parameters: {error}")
         return {}
 
@@ -1928,8 +2071,19 @@ if __name__ == "__main__":
     logger.info("Analysis started.")
 
     waymo_crossing_parameters = _prepare_waymo_tuned_parameters()
+    city_limit = _normalise_city_limit(common.get_configs("n_cities"))
+    use_cached_results = (
+        os.path.exists(file_results)
+        and not common.get_configs("always_analyse")
+        and city_limit == 0
+    )
+    if city_limit != 0 and os.path.exists(file_results):
+        logger.info(
+            "n_cities is active; bypassing results.pickle so the selected city set "
+            "is analysed from the source CSV files."
+        )
 
-    if os.path.exists(file_results) and not common.get_configs('always_analyse'):
+    if use_cached_results:
         # Load the data from the pickle file
         with open(file_results, 'rb') as file:
             (data,                                          # 0
@@ -2533,6 +2687,10 @@ if __name__ == "__main__":
         countries_include = common.get_configs("countries_analyse")
         if countries_include:
             df_mapping = df_mapping.filter(pl.col("iso3").is_in(countries_include))
+        df_mapping = _select_cities_by_footage(
+            df_mapping,
+            city_limit,
+        )
         log_rollups(df_mapping)
 
         # Make a dict for all columns
@@ -3712,7 +3870,8 @@ if __name__ == "__main__":
                       save_file=True,
                       data_file=file_results)
 
-    if common.get_configs("analysis_level") == "locality":
+    analysis_level = str(common.get_configs("analysis_level")).strip().lower()
+    if analysis_level in {"city", "locality"}:
 
         # Amount of footage
         bivariate.scatter(df=df,
@@ -4268,7 +4427,7 @@ if __name__ == "__main__":
                           marginal_x=None,  # type: ignore
                           marginal_y=None)  # type: ignore
 
-    if common.get_configs("analysis_level") == "country":
+    if analysis_level == "country":
         df_countries = aggregation.aggregate_by_iso3(df_mapping)
         df_countries_raw = aggregation.aggregate_by_iso3(df_mapping_raw)
 
