@@ -1,33 +1,30 @@
+import math
 import os
 import pickle
 import statistics
-import common
-from tqdm import tqdm
-import pandas as pd
+
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+import common
 from custom_logger import CustomLogger
-from utils.plotting.io import IO
-from utils.core.grouping import Grouping
-from utils.core.metadata import MetaData
-from utils.core.tools import Tools
-from utils.plotting.layout import Layout
-from utils.core.iso import ISO
-from utils.plotting import constants as C
 from utils.core.dataset_stats import Dataset_Stats
+from utils.core.iso import ISO
+from utils.core.metadata import MetaData
+from utils.plotting import constants as C
+from utils.plotting.io import IO
+from utils.plotting.layout import Layout
+
 
 layout_class = Layout()
 metadata_class = MetaData()
 plots_io_class = IO()
-grouping_class = Grouping()
-tools_class = Tools()
 iso_class = ISO()
 dataset_stats = Dataset_Stats()
 
-logger = CustomLogger(__name__)  # use custom logger
+logger = CustomLogger(__name__)
 
-# File to store the locality coordinates
-file_results = 'results.pickle'
+file_results = "results.pickle"
 
 
 def crossing_metric_label(mean: bool = False) -> str:
@@ -40,1775 +37,1202 @@ def crossing_metric_label(mean: bool = False) -> str:
 
 
 class Crossings:
+    """
+    Plotting utilities for CROWD crossing metrics.
+
+    The results.pickle tuple layout used by analysis.py is:
+
+        24  avg_time_locality
+        25  avg_speed_locality
+        27  avg_speed_country
+        28  avg_time_country
+        29  crossings_with_traffic_equipment_locality
+        30  crossings_without_traffic_equipment_locality
+        35  pedestrian_cross_country
+
+    Locality keys use:
+        {locality}_{latitude}_{longitude}_{condition}
+
+    Parsing is always performed from the right so locality names containing
+    underscores remain valid.
+    """
+
     def __init__(self) -> None:
         pass
 
-    def speed_and_time_to_start_cross(self, df_mapping, font_size_captions=40, x_axis_title_height=150, legend_x=0.81,
-                                      legend_y=0.98, legend_spacing=0.02):
-        logger.info("Plotting speed_and_time_to_start_cross")
-        final_dict = {}
-        with open(file_results, 'rb') as file:
-            data_tuple = pickle.load(file)
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
 
-        avg_speed = data_tuple[25]
-        avg_time = data_tuple[24]
+    @staticmethod
+    def _load_results():
+        with open(file_results, "rb") as file:
+            return pickle.load(file)
 
-        # Check if both 'speed' and 'time' are valid dictionaries
-        if avg_speed is None or avg_time is None:
-            raise ValueError("Either 'speed' or 'time' returned None, please check the input data or calculations.")
+    @staticmethod
+    def _parse_locality_condition_key(key: str):
+        """
+        Parse:
+            {locality}_{latitude}_{longitude}_{condition}
 
-        # Remove the ones where there is data missing for a specific country and condition
-        common_keys = avg_speed.keys() & avg_time.keys()
-
-        # Retain only the key-value pairs where the key is present in both dictionaries
-        avg_speed = {key: avg_speed[key] for key in common_keys}
-        avg_time = {key: avg_time[key] for key in common_keys}
-
-        # Now populate the final_dict with locality-wise data
-        for locality_condition, speed in tqdm(avg_speed.items()):
-            locality, lat, long, condition = locality_condition.split('_')
-
-            # Get the country from the previously stored locality_country_map
-            country = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "country")
-            iso_code = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "iso3")
-            if country or iso_code is not None:
-
-                # Initialise the locality's dictionary if not already present
-                if f'{locality}_{lat}_{long}' not in final_dict:
-                    final_dict[f"{locality}_{lat}_{long}"] = {
-                        "speed_0": None, "speed_1": None, "time_0": None, "time_1": None,
-                        "country": country, "iso": iso_code}
-
-                # Populate the corresponding speed and time based on the condition
-                final_dict[f"{locality}_{lat}_{long}"][f"speed_{condition}"] = speed
-                if f'{locality}_{lat}_{long}_{condition}' in avg_time:
-                    final_dict[f"{locality}_{lat}_{long}"][f"time_{condition}"] = avg_time[f'{locality}_{lat}_{long}_{condition}']  # noqa: E501
-
-        # Extract all valid speed_0 and speed_1 values along with their corresponding cities
-        diff_speed_values = [(f'{locality}', abs(data['speed_0'] - data['speed_1']))
-                             for locality, data in final_dict.items()
-                             if data['speed_0'] is not None and data['speed_1'] is not None]
-
-        if diff_speed_values:
-            # Sort the list by the absolute difference and get the top 5 and bottom 5
-            sorted_diff_speed_values = sorted(diff_speed_values, key=lambda x: x[1], reverse=True)
-
-            top_5_max_speed = sorted_diff_speed_values[:5]  # Top 5 maximum differences
-            top_5_min_speed = sorted_diff_speed_values[-5:]  # Top 5 minimum differences (including possible zeroes)
-
-            logger.info("Top 5 cities with max |speed at day - speed at night| differences:")
-            for locality, diff in top_5_max_speed:
-                locality_state = grouping_class.process_locality_string(locality, df_mapping)
-                logger.info(f"{locality_state}: {diff}")
-
-            logger.info("Top 5 cities with min |speed at day - speed at night| differences:")
-            for locality, diff in top_5_min_speed:
-                locality_state = grouping_class.process_locality_string(locality, df_mapping)
-                logger.info(f"{locality_state}: {diff}")
-        else:
-            logger.info("No valid relative crossing motion values found for comparison.")
-
-        # Extract all valid time_0 and time_1 values along with their corresponding cities
-        diff_time_values = [(locality, abs(data['time_0'] - data['time_1']))
-                            for locality, data in final_dict.items()
-                            if data['time_0'] is not None and data['time_1'] is not None]
-
-        if diff_time_values:
-            sorted_diff_time_values = sorted(diff_time_values, key=lambda x: x[1], reverse=True)
-
-            top_5_max = sorted_diff_time_values[:5]  # Top 5 maximum differences
-            top_5_min = sorted_diff_time_values[-5:]  # Top 5 minimum differences (including possible zeroes)
-
-            logger.info("Top 5 cities with max |time_0 - time_1| differences:")
-            for locality, diff in top_5_max:
-                locality_state = grouping_class.process_locality_string(locality, df_mapping)
-                logger.info(f"{locality_state}: {diff}")
-
-            logger.info("Top 5 cities with min |time_0 - time_1| differences:")
-            for locality, diff in top_5_min:
-                locality_state = grouping_class.process_locality_string(locality, df_mapping)
-                logger.info(f"{locality_state}: {diff}")
-        else:
-            logger.info("No valid time_0 and time_1 values found for comparison.")
-
-        # Filtering out entries where entries is None
-        filtered_dict_s_0 = {locality: info for locality, info in final_dict.items() if info["speed_0"] is not None}
-        filtered_dict_s_1 = {locality: info for locality, info in final_dict.items() if info["speed_1"] is not None}
-        filtered_dict_t_0 = {locality: info for locality, info in final_dict.items() if info["time_0"] is not None}
-        filtered_dict_t_1 = {locality: info for locality, info in final_dict.items() if info["time_1"] is not None}
-
-        # Find locality with max and min speed_0 and speed_1
-        if filtered_dict_s_0:
-            max_speed_locality_0 = max(filtered_dict_s_0, key=lambda locality: filtered_dict_s_0[locality]["speed_0"])
-            min_speed_locality_0 = min(filtered_dict_s_0, key=lambda locality: filtered_dict_s_0[locality]["speed_0"])
-            max_speed_value_0 = filtered_dict_s_0[max_speed_locality_0]["speed_0"]
-            min_speed_value_0 = filtered_dict_s_0[min_speed_locality_0]["speed_0"]
-
-            logger.info(
-                "locality with maximum relative crossing motion during daytime: "
-                f"{grouping_class.process_locality_string(max_speed_locality_0, df_mapping)} "
-                f"with index {max_speed_value_0}"
-            )
-            logger.info(
-                "locality with minimum relative crossing motion during daytime: "
-                f"{grouping_class.process_locality_string(min_speed_locality_0, df_mapping)} "
-                f"with index {min_speed_value_0}"
+        rsplit is intentional because locality itself may contain underscores.
+        """
+        parts = str(key).rsplit("_", 3)
+        if len(parts) != 4:
+            raise ValueError(
+                "Invalid locality condition key "
+                f"{key!r}; expected locality_latitude_longitude_condition."
             )
 
-        if filtered_dict_s_1:
-            max_speed_locality_1 = max(filtered_dict_s_1, key=lambda locality: filtered_dict_s_1[locality]["speed_1"])
-            min_speed_locality_1 = min(filtered_dict_s_1, key=lambda locality: filtered_dict_s_1[locality]["speed_1"])
-            max_speed_value_1 = filtered_dict_s_1[max_speed_locality_1]["speed_1"]
-            min_speed_value_1 = filtered_dict_s_1[min_speed_locality_1]["speed_1"]
+        locality, lat, lon, condition = parts
 
-            logger.info(
-                "locality with maximum relative crossing motion at night: "
-                f"{grouping_class.process_locality_string(max_speed_locality_1, df_mapping)} "
-                f"with index {max_speed_value_1}"
-            )
-            logger.info(
-                "locality with minimum relative crossing motion at night: "
-                f"{grouping_class.process_locality_string(min_speed_locality_1, df_mapping)} "
-                f"with index {min_speed_value_1}"
-            )
+        try:
+            lat_float = float(lat)
+            lon_float = float(lon)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid coordinates in locality condition key {key!r}."
+            ) from exc
 
-        # Find locality with max and min time_0 and time_1
-        if filtered_dict_t_0:
-            max_time_locality_0 = max(filtered_dict_t_0, key=lambda locality: filtered_dict_t_0[locality]["time_0"])
-            min_time_locality_0 = min(filtered_dict_t_0, key=lambda locality: filtered_dict_t_0[locality]["time_0"])
-            max_time_value_0 = filtered_dict_t_0[max_time_locality_0]["time_0"]
-            min_time_value_0 = filtered_dict_t_0[min_time_locality_0]["time_0"]
+        return locality, lat, lon, lat_float, lon_float, str(condition)
 
-            logger.info(f"locality with max time at day: {grouping_class.process_locality_string(max_time_locality_0, df_mapping)} with time of {max_time_value_0} s")  # noqa:E501
-            logger.info(f"locality with min time at day: {grouping_class.process_locality_string(min_time_locality_0, df_mapping)} with time of {min_time_value_0} s")  # noqa:E501
-
-        if filtered_dict_t_1:
-            max_time_locality_1 = max(filtered_dict_t_1, key=lambda locality: filtered_dict_t_1[locality]["time_1"])
-            min_time_locality_1 = min(filtered_dict_t_1, key=lambda locality: filtered_dict_t_1[locality]["time_1"])
-            max_time_value_1 = filtered_dict_t_1[max_time_locality_1]["time_1"]
-            min_time_value_1 = filtered_dict_t_1[min_time_locality_1]["time_1"]
-
-            logger.info(f"locality with max time at night: {grouping_class.process_locality_string(max_time_locality_1, df_mapping)} with time of {max_time_value_1} s")  # noqa:E501
-            logger.info(f"locality with min time at night: {grouping_class.process_locality_string(min_time_locality_1, df_mapping)} with time of {min_time_value_1} s")  # noqa:E501
-
-        # Extract valid speed and time values and calculate statistics
-        speed_0_values = [data['speed_0'] for data in final_dict.values() if pd.notna(data['speed_0'])]
-        speed_1_values = [data['speed_1'] for data in final_dict.values() if pd.notna(data['speed_1'])]
-        time_0_values = [data['time_0'] for data in final_dict.values() if pd.notna(data['time_0'])]
-        time_1_values = [data['time_1'] for data in final_dict.values() if pd.notna(data['time_1'])]
-
-        if speed_0_values:
-            mean_speed_0 = statistics.mean(speed_0_values)
-            sd_speed_0 = statistics.stdev(speed_0_values) if len(speed_0_values) > 1 else 0
-            logger.info(f"Mean relative crossing motion during daytime: {mean_speed_0}")
-            logger.info(f"Standard deviation of relative crossing motion during daytime: {sd_speed_0}")
-        else:
-            logger.error("No valid relative crossing motion values found for daytime.")
-
-        if speed_1_values:
-            mean_speed_1 = statistics.mean(speed_1_values)
-            sd_speed_1 = statistics.stdev(speed_1_values) if len(speed_1_values) > 1 else 0
-            logger.info(f"Mean relative crossing motion at night: {mean_speed_1}")
-            logger.info(f"Standard deviation of relative crossing motion at night: {sd_speed_1}")
-        else:
-            logger.error("No valid relative crossing motion values found for night.")
-
-        if time_0_values:
-            mean_time_0 = statistics.mean(time_0_values)
-            sd_time_0 = statistics.stdev(time_0_values) if len(time_0_values) > 1 else 0
-            logger.info(f"Mean of time during day time: {mean_time_0}")
-            logger.info(f"Standard deviation of time during day time: {sd_time_0}")
-        else:
-            logger.error("No valid time during day time values found.")
-
-        if time_1_values:
-            mean_time_1 = statistics.mean(time_1_values)
-            sd_time_1 = statistics.stdev(time_1_values) if len(time_1_values) > 1 else 0
-            logger.info(f"Mean of time during night time: {mean_time_1}")
-            logger.info(f"Standard deviation of time during night time: {sd_time_1}")
-        else:
-            logger.error("No valid time during night time values found.")
-
-        # Extract locality, condition, and count_ from the info dictionary
-        cities, conditions_, counts = [], [], []
-        for key, value in tqdm(avg_time.items()):
-            locality, lat, long, condition = key.split('_')
-            cities.append(f'{locality}_{lat}_{long}')
-            conditions_.append(condition)
-            counts.append(value)
-
-        # Combine keys from speed and time to ensure we include all available cities and conditions
-        all_keys = set(avg_speed.keys()).union(set(avg_time.keys()))
-
-        # Extract unique cities
-        cities = list(set(["_".join(key.split('_')[:2]) for key in all_keys]))
-
-        country_locality_map = {}
-        for locality_state, info in final_dict.items():
-            country = info['iso']
-            if country not in country_locality_map:
-                country_locality_map[country] = []
-            country_locality_map[country].append(locality_state)
-
-        # Flatten the locality list based on country groupings
-        cities_ordered = []
-        for country in sorted(country_locality_map.keys()):  # Sort countries alphabetically
-            cities_in_country = sorted(country_locality_map[country])  # Sort cities within each country alphabetically
-            cities_ordered.extend(cities_in_country)
-
-        # Prepare data for day and night stacking
-        day_avg_speed = [final_dict[locality]['speed_0'] for locality in cities_ordered]
-        night_avg_speed = [final_dict[locality]['speed_1'] for locality in cities_ordered]
-        day_time_dict = [final_dict[locality]['time_0'] for locality in cities_ordered]
-        night_time_dict = [final_dict[locality]['time_1'] for locality in cities_ordered]
-
-        # Ensure that plotting uses cities_ordered
-        assert len(cities_ordered) == len(day_avg_speed) == len(night_avg_speed) == len(
-            day_time_dict) == len(night_time_dict), "Lengths of lists don't match!"
-
-        # Determine how many cities will be in each column
-        num_cities_per_col = len(cities_ordered) // 2 + len(cities_ordered) % 2  # Split cities into two groups
-
-        # Define a base height per row and calculate total figure height
-        TALL_FIG_HEIGHT = num_cities_per_col * C.BASE_HEIGHT_PER_ROW
-
-        fig = make_subplots(
-            rows=num_cities_per_col * 2, cols=2,  # Two columns
-            vertical_spacing=0,  # Reduce the vertical spacing
-            horizontal_spacing=0.01,  # Reduce horizontal spacing between columns
-            row_heights=[2.0] * (num_cities_per_col * 2),
-        )
-
-        # Plot left column (first half of cities)
-        for i, locality in enumerate(cities_ordered[:num_cities_per_col]):
-            locality = grouping_class.process_locality_string(locality, df_mapping)
-
-            # Row for speed (Day and Night)
-            row = 2 * i + 1
-            if day_avg_speed[i] is not None and night_avg_speed[i] is not None:
-                value = (day_avg_speed[i] + night_avg_speed[i])/2
-                fig.add_trace(go.Bar(
-                    x=[day_avg_speed[i]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} speed during day", marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='auto', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=1)
-                fig.add_trace(go.Bar(
-                    x=[night_avg_speed[i]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} speed during night",
-                    marker=dict(color=C.BAR_COLOR_2),
-                    text=[''], textposition='auto', showlegend=False), row=row, col=1)
-
-            elif day_avg_speed[i] is not None:  # Only day data available
-                value = (day_avg_speed[i])/2
-                fig.add_trace(go.Bar(
-                    x=[day_avg_speed[i]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} speed during day", marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='auto', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=1)
-
-            elif night_avg_speed[i] is not None:  # Only night data available
-                value = (night_avg_speed[i])/2
-                fig.add_trace(go.Bar(
-                    x=[night_avg_speed[i]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} speed during night",
-                    marker=dict(color=C.BAR_COLOR_2), text=[''],
-                    textposition='auto', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=1)
-
-            # Row for time (Day and Night)
-            row = 2 * i + 2
-            if day_time_dict[i] is not None and night_time_dict[i] is not None:
-                value = (day_time_dict[i] + night_time_dict[i])/2
-                fig.add_trace(go.Bar(
-                    x=[day_time_dict[i]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} time during day", marker=dict(color=C.BAR_COLOR_3),
-                    text=[''], textposition='auto', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=1)
-                fig.add_trace(go.Bar(
-                    x=[night_time_dict[i]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} time during night", marker=dict(color=C.BAR_COLOR_4), text=[''],
-                    textposition='auto', showlegend=False), row=row, col=1)
-
-            elif day_time_dict[i] is not None:  # Only day time data available
-                value = (day_time_dict[i])/2
-                fig.add_trace(go.Bar(
-                    x=[day_time_dict[i]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} time during day", marker=dict(color=C.BAR_COLOR_3),
-                    text=[''], textposition='auto', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=1)
-
-            elif night_time_dict[i] is not None:  # Only night time data available
-                value = (night_time_dict[i])/2
-                fig.add_trace(go.Bar(
-                    x=[night_time_dict[i]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} time during night", marker=dict(color=C.BAR_COLOR_4),
-                    text=[''], textposition='auto', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=1)
-
-        # Similarly for the right column
-        for i, locality in enumerate(cities_ordered[num_cities_per_col:]):
-            locality = grouping_class.process_locality_string(locality, df_mapping)
-
-            row = 2 * i + 1
-            idx = num_cities_per_col + i
-            if day_avg_speed[idx] is not None and night_avg_speed[idx] is not None:
-                value = (day_avg_speed[idx] + night_avg_speed[idx])/2
-                fig.add_trace(go.Bar(
-                    x=[day_avg_speed[idx]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} speed during day", marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=2)
-                fig.add_trace(go.Bar(
-                    x=[night_avg_speed[idx]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} speed during night", marker=dict(color=C.BAR_COLOR_2),
-                    text=[''], textposition='inside', showlegend=False), row=row, col=2)
-
-            elif day_avg_speed[idx] is not None:
-                value = (day_avg_speed[idx])/2
-                fig.add_trace(go.Bar(
-                    x=[day_avg_speed[idx]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} speed during day", marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=2)
-
-            elif night_avg_speed[idx] is not None:
-                value = (night_avg_speed[idx])/2
-                fig.add_trace(go.Bar(
-                    x=[night_avg_speed[idx]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} speed during night", marker=dict(color=C.BAR_COLOR_2),
-                    text=[''], textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=2)
-
-            row = 2 * i + 2
-            if day_time_dict[idx] is not None and night_time_dict[idx] is not None:
-                value = (day_time_dict[idx] + night_time_dict[idx])/2
-                fig.add_trace(go.Bar(
-                    x=[day_time_dict[idx]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} time during day", marker=dict(color=C.BAR_COLOR_3),
-                    text=[''], textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=2)
-                fig.add_trace(go.Bar(
-                    x=[night_time_dict[idx]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} time during night", marker=dict(color=C.BAR_COLOR_4), text=[''],
-                    textposition='inside', showlegend=False), row=row, col=2)
-
-            elif day_time_dict[idx] is not None:  # Only day time data available
-                value = (day_time_dict[idx])/2
-                fig.add_trace(go.Bar(
-                    x=[day_time_dict[idx]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} time during day", marker=dict(color=C.BAR_COLOR_3),
-                    text=[''], textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=2)
-
-            elif night_time_dict[idx] is not None:  # Only night time data available
-                value = (night_time_dict[idx])/2
-                fig.add_trace(go.Bar(
-                    x=[night_time_dict[idx]], y=[f'{locality} {value:.2f}'], orientation='h',
-                    name=f"{locality} time during night", marker=dict(color=C.BAR_COLOR_4),
-                    text=[''], textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=2)
-
-        # Calculate the maximum value across all data to use as x-axis range
-        max_value_time = max([
-            (day_time_dict[i] if day_time_dict[i] is not None else 0) +
-            (night_time_dict[i] if night_time_dict[i] is not None else 0)
-            for i in range(len(cities_ordered))
-        ]) if cities_ordered else 0
-
-        # Identify the last row for each column where the last locality is plotted
-        last_row_left_column = num_cities_per_col * 2  # The last row in the left column
-        last_row_right_column = (len(cities) - num_cities_per_col) * 2  # The last row in the right column
-        first_row_left_column = 1  # The first row in the left column
-        first_row_right_column = 1  # The first row in the right column
-
-        # Update the loop for updating x-axes based on max values for speed and time
-        for i in range(1, num_cities_per_col * 2 + 1):  # Loop through all rows in both columns
-            # Update x-axis for the left column (top for speed, bottom for time)
-            if i % 2 == 1:  # Odd rows (representing speed)
-                fig.update_xaxes(
-                    range=[0, max_value_time], row=i, col=1,
-                    showticklabels=(i == first_row_left_column),
-                    side='top', showgrid=False
-                )
-            else:  # Even rows (representing time)
-                fig.update_xaxes(
-                    range=[0, max_value_time], row=i, col=1,
-                    showticklabels=(i == last_row_left_column),
-                    side='bottom', showgrid=False
-                )
-
-            # Update x-axis for the right column (top for speed, bottom for time)
-            if i % 2 == 1:  # Odd rows (representing speed)
-                fig.update_xaxes(
-                    range=[0, max_value_time], row=i, col=2,  # Use speed max value for top axis
-                    showticklabels=(i == first_row_right_column),
-                    side='top', showgrid=False
-                )
-            else:  # Even rows (representing time)
-                fig.update_xaxes(
-                    range=[0, max_value_time], row=i, col=2,  # Use time max value for bottom axis
-                    showticklabels=(i == last_row_right_column),
-                    side='bottom', showgrid=False
-                )
-
-        # Set the x-axis labels (title_text) only for the last row and the first row
-        fig.update_xaxes(
-            title=dict(text=crossing_metric_label(mean=True), font=dict(size=font_size_captions)),
-            tickfont=dict(size=font_size_captions),
-            ticks='outside',
-            ticklen=10,
-            tickwidth=2,
-            tickcolor='black',
-            row=1,
-            col=1
-        )
-        fig.update_xaxes(
-            title=dict(text=crossing_metric_label(mean=True), font=dict(size=font_size_captions)),
-            tickfont=dict(size=font_size_captions),
-            ticks='outside',
-            ticklen=10,
-            tickwidth=2,
-            tickcolor='black',
-            row=1,
-            col=2
-        )
-        fig.update_xaxes(
-            title=dict(text="Mean time to start crossing (in s)", font=dict(size=font_size_captions)),
-            tickfont=dict(size=font_size_captions),
-            ticks='outside',
-            ticklen=10,
-            tickwidth=2,
-            tickcolor='black',
-            row=num_cities_per_col * 2,
-            col=1
-        )
-
-        fig.update_xaxes(
-            title=dict(text="Mean time to start crossing (in s)", font=dict(size=font_size_captions)),
-            tickfont=dict(size=font_size_captions),
-            ticks='outside',
-            ticklen=10,
-            tickwidth=2,
-            tickcolor='black',
-            row=num_cities_per_col * 2,
-            col=2
-        )
-
-        # Update both y-axes (for left and right columns) to hide the tick labels
-        fig.update_yaxes(showticklabels=False)
-
-        # Ensure no gridlines are shown on x-axes and y-axes
-        fig.update_xaxes(showgrid=False)
-        fig.update_yaxes(showgrid=False)
-
-        # Update layout to hide the main legend and adjust margins
-        fig.update_layout(
-            plot_bgcolor='white', paper_bgcolor='white', barmode='stack',
-            height=TALL_FIG_HEIGHT*2, width=4960, showlegend=False,  # Hide the default legend
-            margin=dict(t=150, b=150), bargap=0, bargroupgap=0
-        )
-
-        # Set the x-axis range to cover the values you want in x_grid_values
-        x_grid_values = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
-
-        for x in x_grid_values:
-            fig.add_shape(
-                type="line",
-                x0=x, y0=0, x1=x, y1=1,  # Set the position of the gridlines
-                xref='x', yref='paper',  # Ensure gridlines span the whole chart (yref='paper' spans full height)
-                line=dict(color="darkgray", width=1),  # Customize the appearance of the gridlines
-                layer="above"  # Draw the gridlines above the bars
+    @staticmethod
+    def _parse_locality_key(key: str):
+        """
+        Parse:
+            {locality}_{latitude}_{longitude}
+        """
+        parts = str(key).rsplit("_", 2)
+        if len(parts) != 3:
+            raise ValueError(
+                f"Invalid locality key {key!r}; expected locality_latitude_longitude."
             )
 
-        # Manually add gridlines using `shapes` for the right column (x-axis 'x2')
-        for x in x_grid_values:
-            fig.add_shape(
-                type="line",
-                x0=x, y0=0, x1=x, y1=1,  # Set the position of the gridlines
-                xref='x2', yref='paper',  # Apply to right column (x-axis 'x2')
-                line=dict(color="darkgray", width=1),  # Customize the appearance of the gridlines
-                layer="above"  # Draw the gridlines above the bars
-            )
+        locality, lat, lon = parts
 
-        # Define the legend items
-        legend_items = [
-            {"name": f"{crossing_metric_label()} during daytime", "color": C.BAR_COLOR_1},
-            {"name": f"{crossing_metric_label()} during night time", "color": C.BAR_COLOR_2},
-            {"name": "Crossing decision time during daytime", "color": C.BAR_COLOR_3},
-            {"name": "Crossing decision time during night time", "color": C.BAR_COLOR_4},
+        try:
+            lat_float = float(lat)
+            lon_float = float(lon)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid coordinates in locality key {key!r}."
+            ) from exc
+
+        return locality, lat, lon, lat_float, lon_float
+
+    @staticmethod
+    def _parse_country_condition_key(key: str):
+        parts = str(key).rsplit("_", 1)
+        if len(parts) != 2:
+            raise ValueError(
+                f"Invalid country condition key {key!r}; expected country_condition."
+            )
+        return parts[0], parts[1]
+
+    @staticmethod
+    def _as_float(value):
+        if value is None:
+            return None
+
+        try:
+            value_float = float(value)
+        except (TypeError, ValueError):
+            return None
+
+        if not math.isfinite(value_float):
+            return None
+
+        return value_float
+
+    @staticmethod
+    def _safe_average(values):
+        valid = [
+            float(value)
+            for value in values
+            if Crossings._as_float(value) is not None
         ]
 
-        # Add the vertical legends at the top and bottom
-        layout_class.add_vertical_legend_annotations(fig, legend_items, x_position=legend_x, y_start=legend_y,
-                                                     spacing=legend_spacing, font_size=font_size_captions)
+        if not valid:
+            return None
 
-        # Add a box around the first column (left side)
-        fig.add_shape(
-            type="rect", xref="paper", yref="paper",
-            x0=0, y0=1, x1=0.495, y1=0.0,
-            line=dict(color="black", width=2)  # Black border for the box
+        return sum(valid) / len(valid)
+
+    @staticmethod
+    def _is_missing_text(value) -> bool:
+        if value is None:
+            return True
+
+        if isinstance(value, float) and math.isnan(value):
+            return True
+
+        if isinstance(value, str):
+            return value.strip().lower() in {"", "nan", "na", "n/a", "unknown"}
+
+        return False
+
+    @staticmethod
+    def _flag_from_iso3(iso3):
+        if Crossings._is_missing_text(iso3):
+            return ""
+
+        try:
+            iso2 = iso_class.iso3_to_iso2(str(iso3))
+            if not iso2:
+                return ""
+            return iso_class.iso2_to_flag(iso2) or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _locality_metadata(df_mapping, locality: str, lat: float):
+        country = metadata_class.get_value(
+            df_mapping,
+            "locality",
+            locality,
+            "lat",
+            lat,
+            "country",
         )
-
-        # Add a box around the second column (right side)
-        fig.add_shape(
-            type="rect", xref="paper", yref="paper",
-            x0=0.505, y0=1, x1=1, y1=0.0,
-            line=dict(color="black", width=2)  # Black border for the box
+        iso3 = metadata_class.get_value(
+            df_mapping,
+            "locality",
+            locality,
+            "lat",
+            lat,
+            "iso3",
         )
+        state = metadata_class.get_value(
+            df_mapping,
+            "locality",
+            locality,
+            "lat",
+            lat,
+            "state",
+        )
+        return country, iso3, state
 
-        # Create an ordered list of unique countries based on the cities in final_dict
-        country_locality_map = {}
-        for locality, info in final_dict.items():
-            country = info['iso']
-            if country not in country_locality_map:
-                country_locality_map[country] = []
-            country_locality_map[country].append(locality)
-
-        # Split cities into left and right columns
-        left_column_cities = cities_ordered[:num_cities_per_col]
-        right_column_cities = cities_ordered[num_cities_per_col:]
-
-        # Adjust x positioning for the left and right columns
-        x_position_left = 0.0  # Position for the left column
-        x_position_right = 1.0  # Position for the right column
-        font_size = 15  # Font size for visibility
-
-        # Initialise variables for dynamic y positioning for both columns
-        current_row_left = 1  # Start from the first row for the left column
-        current_row_right = 1  # Start from the first row for the right column
-        y_position_map_left = {}  # Store y positions for each country (left column)
-        y_position_map_right = {}  # Store y positions for each country (right column)
-
-        # Calculate the y positions dynamically for the left column
-        for locality in left_column_cities:
-            country = final_dict[locality]['iso']
-
-            if country not in y_position_map_left:  # Add the country label once per country
-                y_position_map_left[country] = 1 - (current_row_left - 1) / ((len(left_column_cities)-0.56) * 2)
-
-            current_row_left += 2  # Increment the row for each locality (speed and time take two rows)
-
-        # Calculate the y positions dynamically for the right column
-        for locality in right_column_cities:
-            country = final_dict[locality]['iso']
-
-            if country not in y_position_map_right:  # Add the country label once per country
-                y_position_map_right[country] = 1 - (current_row_right - 1) / ((len(right_column_cities)-0.56) * 2)
-
-            current_row_right += 2  # Increment the row for each locality (speed and time take two rows)
-
-        # Add annotations for country names dynamically for the left column
-        for country, y_position in y_position_map_left.items():
-            iso2 = iso_class.iso3_to_iso2(country)
-            country = country + iso_class.iso2_to_flag(iso2)
-            fig.add_annotation(
-                x=x_position_left,  # Left column x position
-                y=y_position,  # Calculated y position based on the locality order
-                xref="paper", yref="paper",
-                text=country,  # Country name
-                showarrow=False,
-                font=dict(size=font_size, color="black"),
-                xanchor='right',
-                align='right',
-                bgcolor='rgba(255,255,255,0.8)',  # Background color for visibility
-                # bordercolor="black",  # Border for visibility
+    @staticmethod
+    def _format_locality_label(
+        df_mapping,
+        locality: str,
+        lat: float,
+        iso3=None,
+        state=None,
+    ) -> str:
+        if state is None:
+            state = metadata_class.get_value(
+                df_mapping,
+                "locality",
+                locality,
+                "lat",
+                lat,
+                "state",
             )
 
-        # Add annotations for country names dynamically for the right column
-        for country, y_position in y_position_map_right.items():
-            iso2 = iso_class.iso3_to_iso2(country)
-            country = country + iso_class.iso2_to_flag(iso2)
-            fig.add_annotation(
-                x=x_position_right,  # Right column x position
-                y=y_position,  # Calculated y position based on the locality order
-                xref="paper", yref="paper",
-                text=country,  # Country name
-                showarrow=False,
-                font=dict(size=font_size, color="black"),
-                xanchor='left',
-                align='left',
-                bgcolor='rgba(255,255,255,0.8)',  # Background color for visibility
-                # bordercolor="black",  # Border for visibility
+        if iso3 is None:
+            iso3 = metadata_class.get_value(
+                df_mapping,
+                "locality",
+                locality,
+                "lat",
+                lat,
+                "iso3",
             )
 
-        fig.update_yaxes(
-            tickfont=dict(size=14, color="black"),
-            showticklabels=True,  # Ensure locality names are visible
-            ticklabelposition='inside',  # Move the tick labels inside the bars
+        if Crossings._is_missing_text(state):
+            label = str(locality)
+        else:
+            label = f"{locality}, {state}"
+
+        flag = Crossings._flag_from_iso3(iso3)
+        return f"{flag} {label}".strip()
+
+    @staticmethod
+    def _format_country_label(df_mapping, country: str, iso3=None) -> str:
+        if iso3 is None:
+            iso3 = metadata_class.get_value(
+                df=df_mapping,
+                column_name1="country",
+                column_value1=country,
+                column_name2=None,
+                column_value2=None,
+                target_column="iso3",
+            )
+
+        flag = Crossings._flag_from_iso3(iso3)
+        return f"{flag} {country}".strip()
+
+    @staticmethod
+    def _log_values(name: str, day_values, night_values) -> None:
+        day_values = [
+            float(value)
+            for value in day_values
+            if Crossings._as_float(value) is not None
+        ]
+        night_values = [
+            float(value)
+            for value in night_values
+            if Crossings._as_float(value) is not None
+        ]
+
+        if day_values:
+            logger.info(
+                f"Mean {name} during daytime: {statistics.mean(day_values):.2f}"
+            )
+            logger.info(
+                f"Standard deviation of {name} during daytime: "
+                f"{statistics.stdev(day_values) if len(day_values) > 1 else 0:.2f}"
+            )
+        else:
+            logger.info(f"No valid {name} values found for daytime.")
+
+        if night_values:
+            logger.info(
+                f"Mean {name} during night time: {statistics.mean(night_values):.2f}"
+            )
+            logger.info(
+                f"Standard deviation of {name} during night time: "
+                f"{statistics.stdev(night_values) if len(night_values) > 1 else 0:.2f}"
+            )
+        else:
+            logger.info(f"No valid {name} values found for night time.")
+
+    @staticmethod
+    def _log_day_night_differences(records, metric_prefix: str, label_name: str) -> None:
+        differences = []
+
+        for record_key, record in records.items():
+            day = Crossings._as_float(record.get(f"{metric_prefix}_0"))
+            night = Crossings._as_float(record.get(f"{metric_prefix}_1"))
+
+            if day is None or night is None:
+                continue
+
+            differences.append((record_key, abs(day - night)))
+
+        if not differences:
+            logger.info(
+                f"No valid paired day and night {label_name} values found for comparison."
+            )
+            return
+
+        ordered = sorted(differences, key=lambda item: item[1], reverse=True)
+        top = ordered[:5]
+        bottom = ordered[-5:]
+
+        logger.info(
+            f"Top 5 locations with largest absolute day and night "
+            f"{label_name} differences:"
         )
+        for location, difference in top:
+            logger.info(f"{location}: {difference:.2f}")
 
-        fig.update_xaxes(
-            tickangle=0,  # No rotation or small rotation for the x-axis
+        logger.info(
+            f"Top 5 locations with smallest absolute day and night "
+            f"{label_name} differences:"
         )
+        for location, difference in bottom:
+            logger.info(f"{location}: {difference:.2f}")
 
-        # update font family
-        fig.update_layout(font=dict(family=common.get_configs('font_family')))
+    @staticmethod
+    def _nonzero_max(values, default: float = 1.0) -> float:
+        valid = [
+            float(value)
+            for value in values
+            if Crossings._as_float(value) is not None and float(value) > 0
+        ]
 
-        # Final adjustments and display
-        fig.update_layout(margin=dict(l=80, r=80, t=x_axis_title_height, b=x_axis_title_height))
+        if not valid:
+            return default
 
-        plots_io_class.save_plotly_figure(fig,
-                                          "consolidated",
-                                          height=TALL_FIG_HEIGHT*2,
-                                          width=4960,
-                                          scale=C.SCALE,
-                                          save_final=True,
-                                          save_eps=False,
-                                          save_png=False)
+        return max(valid)
 
-    def speed_and_time_to_start_cross_country(self, df_mapping, font_size_captions=40, x_axis_title_height=150,
-                                              legend_x=0.81, legend_y=0.98, legend_spacing=0.02):
+    # ------------------------------------------------------------------
+    # Locality speed and crossing initiation time
+    # ------------------------------------------------------------------
+
+    def _build_locality_speed_time_records(self, df_mapping, avg_speed, avg_time):
+        records = {}
+
+        if not isinstance(avg_speed, dict) or not isinstance(avg_time, dict):
+            return records
+
+        common_keys = set(avg_speed).intersection(avg_time)
+
+        for key in common_keys:
+            try:
+                locality, lat, lon, lat_float, _, condition = (
+                    self._parse_locality_condition_key(key)
+                )
+            except ValueError as exc:
+                logger.warning(str(exc))
+                continue
+
+            speed = self._as_float(avg_speed.get(key))
+            time_value = self._as_float(avg_time.get(key))
+
+            if speed is None and time_value is None:
+                continue
+
+            country, iso3, state = self._locality_metadata(
+                df_mapping,
+                locality,
+                lat_float,
+            )
+
+            base_key = f"{locality}_{lat}_{lon}"
+
+            if base_key not in records:
+                records[base_key] = {
+                    "locality": locality,
+                    "lat": lat_float,
+                    "lon": float(lon),
+                    "country": country,
+                    "iso3": iso3,
+                    "state": state,
+                    "speed_0": None,
+                    "speed_1": None,
+                    "time_0": None,
+                    "time_1": None,
+                }
+
+            if condition in {"0", "1"}:
+                records[base_key][f"speed_{condition}"] = speed
+                records[base_key][f"time_{condition}"] = time_value
+
+        return records
+
+    def speed_and_time_to_start_cross(
+        self,
+        df_mapping,
+        font_size_captions=40,
+        x_axis_title_height=150,
+        legend_x=0.81,
+        legend_y=0.98,
+        legend_spacing=0.02,
+    ):
         logger.info("Plotting speed_and_time_to_start_cross")
-        final_dict = {}
-        with open(file_results, 'rb') as file:
-            data_tuple = pickle.load(file)
+
+        data_tuple = self._load_results()
+
+        avg_time = data_tuple[24]
+        avg_speed = data_tuple[25]
+
+        records = self._build_locality_speed_time_records(
+            df_mapping,
+            avg_speed,
+            avg_time,
+        )
+
+        if not records:
+            logger.warning(
+                "No locality speed and time records are available for plotting."
+            )
+            return
+
+        self._log_day_night_differences(
+            records,
+            "speed",
+            "crossing motion",
+        )
+        self._log_day_night_differences(
+            records,
+            "time",
+            "crossing initiation time",
+        )
+
+        self._log_values(
+            "relative crossing motion",
+            [record["speed_0"] for record in records.values()],
+            [record["speed_1"] for record in records.values()],
+        )
+        self._log_values(
+            "crossing initiation time",
+            [record["time_0"] for record in records.values()],
+            [record["time_1"] for record in records.values()],
+        )
+
+        ordered_keys = sorted(
+            records,
+            key=lambda key: (
+                str(records[key].get("iso3") or ""),
+                str(records[key].get("locality") or ""),
+                float(records[key].get("lat") or 0),
+            ),
+        )
+
+        self._plot_speed_time_records(
+            df_mapping=df_mapping,
+            records=records,
+            ordered_keys=ordered_keys,
+            locality_mode=True,
+            font_size_captions=font_size_captions,
+            x_axis_title_height=x_axis_title_height,
+            legend_x=legend_x,
+            legend_y=legend_y,
+            legend_spacing=legend_spacing,
+        )
+
+    # ------------------------------------------------------------------
+    # Country speed and crossing initiation time
+    # ------------------------------------------------------------------
+
+    def _build_country_speed_time_records(
+        self,
+        df_mapping,
+        avg_speed,
+        avg_time,
+        no_of_crossing,
+    ):
+        records = {}
+
+        if not isinstance(avg_speed, dict) or not isinstance(avg_time, dict):
+            return records
+
+        no_of_crossing = no_of_crossing if isinstance(no_of_crossing, dict) else {}
+        threshold = float(common.get_configs("min_crossing_detect"))
+
+        common_keys = set(avg_speed).intersection(avg_time)
+
+        for key in common_keys:
+            crossing_count = self._as_float(no_of_crossing.get(key, 0)) or 0.0
+
+            if crossing_count < threshold:
+                continue
+
+            try:
+                country, condition = self._parse_country_condition_key(key)
+            except ValueError as exc:
+                logger.warning(str(exc))
+                continue
+
+            if condition not in {"0", "1"}:
+                continue
+
+            speed = self._as_float(avg_speed.get(key))
+            time_value = self._as_float(avg_time.get(key))
+
+            iso3 = metadata_class.get_value(
+                df=df_mapping,
+                column_name1="country",
+                column_value1=country,
+                column_name2=None,
+                column_value2=None,
+                target_column="iso3",
+            )
+
+            if country not in records:
+                records[country] = {
+                    "country": country,
+                    "iso3": iso3,
+                    "speed_0": None,
+                    "speed_1": None,
+                    "time_0": None,
+                    "time_1": None,
+                }
+
+            records[country][f"speed_{condition}"] = speed
+            records[country][f"time_{condition}"] = time_value
+
+        return records
+
+    def speed_and_time_to_start_cross_country(
+        self,
+        df_mapping,
+        font_size_captions=40,
+        x_axis_title_height=150,
+        legend_x=0.81,
+        legend_y=0.98,
+        legend_spacing=0.02,
+    ):
+        logger.info("Plotting speed_and_time_to_start_cross_country")
+
+        data_tuple = self._load_results()
 
         avg_speed = data_tuple[27]
         avg_time = data_tuple[28]
         no_of_crossing = data_tuple[35]
 
-        # Check if both 'speed' and 'time' are valid dictionaries
-        if avg_speed is None or avg_time is None:
-            raise ValueError("Either 'speed' or 'time' returned None, please check the input data or calculations.")
+        records = self._build_country_speed_time_records(
+            df_mapping,
+            avg_speed,
+            avg_time,
+            no_of_crossing,
+        )
 
-        # Remove the ones where there is data missing for a specific country and condition
-        common_keys = avg_speed.keys() & avg_time.keys()
-
-        # Retain only the key-value pairs where the key is present in both dictionaries
-        avg_speed = {key: avg_speed[key] for key in common_keys}
-        avg_time = {key: avg_time[key] for key in common_keys}
-
-        # Now populate the final_dict with country-wise data
-        for country_condition, speed in tqdm(avg_speed.items()):
-            if no_of_crossing[country_condition] < common.get_configs("min_crossing_detect"):
-                continue
-            country, condition = country_condition.split('_')
-
-            # Get the iso3 from the mapping file
-            iso_code = metadata_class.get_value(df=df_mapping,
-                                                column_name1="country",
-                                                column_value1=country,
-                                                column_name2=None,
-                                                column_value2=None,
-                                                target_column="iso3")
-
-            if country and iso_code is not None:
-                # Initialise the country's dictionary if not already present
-                if f'{country}' not in final_dict:
-                    final_dict[f"{country}"] = {
-                        "speed_0": None, "speed_1": None, "time_0": None, "time_1": None,
-                        "country": country, "iso3": iso_code}
-
-                # Populate the corresponding speed and time based on the condition
-                final_dict[f"{country}"][f"speed_{condition}"] = speed
-                if f'{country}_{condition}' in avg_time:
-                    final_dict[f"{country}"][f"time_{condition}"] = avg_time[f'{country}_{condition}']
-
-        # Extract all valid speed_0 and speed_1 values along with their corresponding countries
-        diff_speed_values = [(f'{country}', abs(data['speed_0'] - data['speed_1']))
-                             for country, data in final_dict.items()
-                             if data['speed_0'] is not None and data['speed_1'] is not None]
-
-        if diff_speed_values:
-            # Sort the list by the absolute difference and get the top 5 and bottom 5
-            sorted_diff_speed_values = sorted(diff_speed_values, key=lambda x: x[1], reverse=True)
-
-            top_5_max_speed = sorted_diff_speed_values[:5]  # Top 5 maximum differences
-            top_5_min_speed = sorted_diff_speed_values[-5:]  # Top 5 minimum differences (including possible zeroes)
-
-            logger.info("Top 5 country with max |speed_0 - speed_1| differences:")
-            for country, diff in top_5_max_speed:
-                logger.info(f"{grouping_class.format_locality_state(country)}: {diff}")
-
-            logger.info("Top 5 cities with min |speed_0 - speed_1| differences:")
-            for country, diff in top_5_min_speed:
-                logger.info(f"{grouping_class.format_locality_state(country)}: {diff}")
-        else:
-            logger.info("No valid relative crossing motion values found for comparison.")
-
-        # Extract all valid time_0 and time_1 values along with their corresponding countries
-        diff_time_values = [(country, abs(data['time_0'] - data['time_1']))
-                            for country, data in final_dict.items()
-                            if data['time_0'] is not None and data['time_1'] is not None]
-
-        if diff_time_values:
-            sorted_diff_time_values = sorted(diff_time_values, key=lambda x: x[1], reverse=True)
-
-            top_5_max = sorted_diff_time_values[:5]  # Top 5 maximum differences
-            top_5_min = sorted_diff_time_values[-5:]  # Top 5 minimum differences (including possible zeroes)
-
-            logger.info("Top 5 cities with max |time_0 - time_1| differences:")
-            for country, diff in top_5_max:
-                logger.info(f"{grouping_class.format_locality_state(country)}: {diff}")
-
-            logger.info("Top 5 cities with min |time_0 - time_1| differences:")
-            for country, diff in top_5_min:
-                logger.info(f"{grouping_class.format_locality_state(country)}: {diff}")
-        else:
-            logger.info("No valid time_0 and time_1 values found for comparison.")
-
-        # Filtering out entries where entries is None
-        filtered_dict_s_0 = {country: info for country, info in final_dict.items() if info["speed_0"] is not None}
-        filtered_dict_s_1 = {country: info for country, info in final_dict.items() if info["speed_1"] is not None}
-        filtered_dict_t_0 = {country: info for country, info in final_dict.items() if info["time_0"] is not None}
-        filtered_dict_t_1 = {country: info for country, info in final_dict.items() if info["time_1"] is not None}
-
-        # Find country with max and min speed_0 and speed_1
-        if filtered_dict_s_0:
-            max_speed_country_0 = max(filtered_dict_s_0, key=lambda country: filtered_dict_s_0[country]["speed_0"])
-            min_speed_country_0 = min(filtered_dict_s_0, key=lambda country: filtered_dict_s_0[country]["speed_0"])
-            max_speed_value_0 = filtered_dict_s_0[max_speed_country_0]["speed_0"]
-            min_speed_value_0 = filtered_dict_s_0[min_speed_country_0]["speed_0"]
-
-            logger.info(
-                "Country with maximum relative crossing motion during daytime: "
-                f"{grouping_class.format_locality_state(max_speed_country_0)} "
-                f"with index {max_speed_value_0}"
+        if not records:
+            logger.warning(
+                "No country speed and time records are available for plotting."
             )
-            logger.info(
-                "Country with minimum relative crossing motion during daytime: "
-                f"{grouping_class.format_locality_state(min_speed_country_0)} "
-                f"with index {min_speed_value_0}"
-            )
+            return
 
-        if filtered_dict_s_1:
-            max_speed_country_1 = max(filtered_dict_s_1, key=lambda country: filtered_dict_s_1[country]["speed_1"])
-            min_speed_country_1 = min(filtered_dict_s_1, key=lambda country: filtered_dict_s_1[country]["speed_1"])
-            max_speed_value_1 = filtered_dict_s_1[max_speed_country_1]["speed_1"]
-            min_speed_value_1 = filtered_dict_s_1[min_speed_country_1]["speed_1"]
+        self._log_day_night_differences(
+            records,
+            "speed",
+            "crossing motion",
+        )
+        self._log_day_night_differences(
+            records,
+            "time",
+            "crossing initiation time",
+        )
 
-            logger.info(
-                "Country with maximum relative crossing motion at night: "
-                f"{grouping_class.format_locality_state(max_speed_country_1)} "
-                f"with index {max_speed_value_1}"
-            )
-            logger.info(
-                "Country with minimum relative crossing motion at night: "
-                f"{grouping_class.format_locality_state(min_speed_country_1)} "
-                f"with index {min_speed_value_1}"
-            )
+        self._log_values(
+            "relative crossing motion",
+            [record["speed_0"] for record in records.values()],
+            [record["speed_1"] for record in records.values()],
+        )
+        self._log_values(
+            "crossing initiation time",
+            [record["time_0"] for record in records.values()],
+            [record["time_1"] for record in records.values()],
+        )
 
-        # Find country with max and min time_0 and time_1
-        if filtered_dict_t_0:
-            max_time_country_0 = max(filtered_dict_t_0, key=lambda country: filtered_dict_t_0[country]["time_0"])
-            min_time_country_0 = min(filtered_dict_t_0, key=lambda country: filtered_dict_t_0[country]["time_0"])
-            max_time_value_0 = filtered_dict_t_0[max_time_country_0]["time_0"]
-            min_time_value_0 = filtered_dict_t_0[min_time_country_0]["time_0"]
+        ordered_keys = sorted(records)
 
-            logger.info(f"Country with max time at day: {grouping_class.format_locality_state(max_time_country_0)} with time of {max_time_value_0} s")  # noqa:E501
-            logger.info(f"Country with min time at day: {grouping_class.format_locality_state(min_time_country_0)} with time of {min_time_value_0} s")  # noqa:E501
+        self._plot_speed_time_records(
+            df_mapping=df_mapping,
+            records=records,
+            ordered_keys=ordered_keys,
+            locality_mode=False,
+            font_size_captions=font_size_captions,
+            x_axis_title_height=x_axis_title_height,
+            legend_x=legend_x,
+            legend_y=legend_y,
+            legend_spacing=legend_spacing,
+        )
 
-        if filtered_dict_t_1:
-            max_time_country_1 = max(filtered_dict_t_1, key=lambda country: filtered_dict_t_1[country]["time_1"])
-            min_time_country_1 = min(filtered_dict_t_1, key=lambda country: filtered_dict_t_1[country]["time_1"])
-            max_time_value_1 = filtered_dict_t_1[max_time_country_1]["time_1"]
-            min_time_value_1 = filtered_dict_t_1[min_time_country_1]["time_1"]
+    # ------------------------------------------------------------------
+    # Shared speed and time figure
+    # ------------------------------------------------------------------
 
-            logger.info(f"Country with max time at night: {grouping_class.format_locality_state(max_time_country_1)} with time of {max_time_value_1} s")  # noqa:E501
-            logger.info(f"Country with min time at night: {grouping_class.format_locality_state(min_time_country_1)} with time of {min_time_value_1} s")  # noqa:E501
+    def _plot_speed_time_records(
+        self,
+        df_mapping,
+        records,
+        ordered_keys,
+        locality_mode,
+        font_size_captions,
+        x_axis_title_height,
+        legend_x,
+        legend_y,
+        legend_spacing,
+    ):
+        count = len(ordered_keys)
 
-        # Extract valid speed and time values and calculate statistics
-        speed_0_values = [data['speed_0'] for data in final_dict.values() if pd.notna(data['speed_0'])]
-        speed_1_values = [data['speed_1'] for data in final_dict.values() if pd.notna(data['speed_1'])]
-        time_0_values = [data['time_0'] for data in final_dict.values() if pd.notna(data['time_0'])]
-        time_1_values = [data['time_1'] for data in final_dict.values() if pd.notna(data['time_1'])]
+        if count == 0:
+            return
 
-        if speed_0_values:
-            mean_speed_0 = statistics.mean(speed_0_values)
-            sd_speed_0 = statistics.stdev(speed_0_values) if len(speed_0_values) > 1 else 0
-            logger.info(f"Mean relative crossing motion during daytime: {mean_speed_0}")
-            logger.info(f"Standard deviation of relative crossing motion during daytime: {sd_speed_0}")
-        else:
-            logger.error("No valid relative crossing motion values found for daytime.")
-
-        if speed_1_values:
-            mean_speed_1 = statistics.mean(speed_1_values)
-            sd_speed_1 = statistics.stdev(speed_1_values) if len(speed_1_values) > 1 else 0
-            logger.info(f"Mean relative crossing motion at night: {mean_speed_1}")
-            logger.info(f"Standard deviation of relative crossing motion at night: {sd_speed_1}")
-        else:
-            logger.error("No valid relative crossing motion values found for night.")
-
-        if time_0_values:
-            mean_time_0 = statistics.mean(time_0_values)
-            sd_time_0 = statistics.stdev(time_0_values) if len(time_0_values) > 1 else 0
-            logger.info(f"Mean of time during day time: {mean_time_0}")
-            logger.info(f"Standard deviation of time during day time: {sd_time_0}")
-        else:
-            logger.error("No valid time during day time values found.")
-
-        if time_1_values:
-            mean_time_1 = statistics.mean(time_1_values)
-            sd_time_1 = statistics.stdev(time_1_values) if len(time_1_values) > 1 else 0
-            logger.info(f"Mean of time during night time: {mean_time_1}")
-            logger.info(f"Standard deviation of time during night time: {sd_time_1}")
-        else:
-            logger.error("No valid time during night time values found.")
-
-        # Extract country, condition, and count_ from the info dictionary
-        countries, conditions_, counts = [], [], []
-        for key, value in tqdm(avg_time.items()):
-            country, condition = key.split('_')
-            countries.append(f'{country}')
-            conditions_.append(condition)
-            counts.append(value)
-
-        # Sort the list of tuples by country name
-        countries_ordered = sorted(final_dict, key=lambda x: x[0])
-
-        # Extract the desired values from the sorted list
-        day_avg_speed = [final_dict[country]['speed_0'] for country in countries_ordered]
-        night_avg_speed = [final_dict[country]['speed_1'] for country in countries_ordered]
-        day_time_dict = [final_dict[country]['time_0'] for country in countries_ordered]
-        night_time_dict = [final_dict[country]['time_1'] for country in countries_ordered]
-
-        # Ensure that plotting uses cities_ordered
-        assert len(countries_ordered) == len(day_avg_speed) == len(night_avg_speed) == len(
-            day_time_dict) == len(night_time_dict), "Lengths of lists don't match!"
-
-        # Determine how many cities will be in each column
-        num_cities_per_col = len(countries_ordered) // 2 + len(countries_ordered) % 2  # Split cities into two groups
-        # Define a base height per row and calculate total figure height
-        TALL_FIG_HEIGHT = num_cities_per_col * C.BASE_HEIGHT_PER_ROW
+        per_column = (count + 1) // 2
+        rows = max(2, per_column * 2)
 
         fig = make_subplots(
-            rows=num_cities_per_col * 2, cols=2,  # Two columns
-            vertical_spacing=0,  # Reduce the vertical spacing
-            horizontal_spacing=0.01,  # Reduce horizontal spacing between columns
-            row_heights=[2.0] * (num_cities_per_col * 2),
+            rows=rows,
+            cols=2,
+            vertical_spacing=0,
+            horizontal_spacing=0.01,
+            row_heights=[1.0] * rows,
         )
 
-        # Plot left column (first half of cities)
-        for i, country in enumerate(countries_ordered[:num_cities_per_col]):
-            iso_code = metadata_class.get_value(df_mapping, "country", country, None, None, "iso3")
-            # build up textual label for left column
-            iso2 = iso_class.iso3_to_iso2(iso_code)
-            # country = Analysis.iso2_to_flag(iso2) + " " + iso_code + " " + country
-            country = iso_class.iso2_to_flag(iso2) + " " + country
-            # Row for speed (Day and Night)
-            row = 2 * i + 1
-            if day_avg_speed[i] is not None and night_avg_speed[i] is not None:
-                value = (day_avg_speed[i] + night_avg_speed[i])/2
-                fig.add_trace(go.Bar(
-                    x=[day_avg_speed[i]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} speed during day", marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='auto', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=1)
-                fig.add_trace(go.Bar(
-                    x=[night_avg_speed[i]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} speed during night",
-                    marker=dict(color=C.BAR_COLOR_2),
-                    text=[''], textposition='auto', showlegend=False), row=row, col=1)
+        speed_totals = []
+        time_totals = []
 
-            elif day_avg_speed[i] is not None:  # Only day data available
-                value = (day_avg_speed[i])/2
-                fig.add_trace(go.Bar(
-                    x=[day_avg_speed[i]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} speed during day", marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='auto', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=1)
-
-            elif night_avg_speed[i] is not None:  # Only night data available
-                value = (night_avg_speed[i])/2
-                fig.add_trace(go.Bar(
-                    x=[night_avg_speed[i]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} speed during night",
-                    marker=dict(color=C.BAR_COLOR_2), text=[''],
-                    textposition='auto', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=1)
-
-            # Row for time (Day and Night)
-            row = 2 * i + 2
-            if day_time_dict[i] is not None and night_time_dict[i] is not None:
-                value = (day_time_dict[i] + night_time_dict[i])/2
-                fig.add_trace(go.Bar(
-                    x=[day_time_dict[i]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} time during day", marker=dict(color=C.BAR_COLOR_3),
-                    text=[''], textposition='auto', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=1)
-                fig.add_trace(go.Bar(
-                    x=[night_time_dict[i]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} time during night", marker=dict(color=C.BAR_COLOR_4), text=[''],
-                    textposition='auto', showlegend=False), row=row, col=1)
-
-            elif day_time_dict[i] is not None:  # Only day time data available
-                value = (day_time_dict[i])/2
-                fig.add_trace(go.Bar(
-                    x=[day_time_dict[i]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} time during day", marker=dict(color=C.BAR_COLOR_3),
-                    text=[''], textposition='auto', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=1)
-
-            elif night_time_dict[i] is not None:  # Only night time data available
-                value = (night_time_dict[i])/2
-                fig.add_trace(go.Bar(
-                    x=[night_time_dict[i]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} time during night", marker=dict(color=C.BAR_COLOR_4),
-                    text=[''], textposition='auto', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=1)
-
-        # Similarly for the right column
-        for i, country in enumerate(countries_ordered[num_cities_per_col:]):
-            iso_code = metadata_class.get_value(df_mapping, "country", country, None, None, "iso3")
-            row = 2 * i + 1
-            idx = num_cities_per_col + i
-            # build up textual label for left column
-            iso2 = iso_class.iso3_to_iso2(iso_code)
-            # country = Analysis.iso2_to_flag(iso2) + " " + iso_code + " " + country
-            country = iso_class.iso2_to_flag(iso2) + " " + country
-            if day_avg_speed[idx] is not None and night_avg_speed[idx] is not None:
-                value = (day_avg_speed[idx] + night_avg_speed[idx])/2
-                fig.add_trace(go.Bar(
-                    x=[day_avg_speed[idx]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} speed during day", marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=2)
-                fig.add_trace(go.Bar(
-                    x=[night_avg_speed[idx]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} speed during night", marker=dict(color=C.BAR_COLOR_2),
-                    text=[''], textposition='inside', showlegend=False), row=row, col=2)
-
-            elif day_avg_speed[idx] is not None:
-                value = (day_avg_speed[idx])/2
-                fig.add_trace(go.Bar(
-                    x=[day_avg_speed[idx]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} speed during day", marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=2)
-
-            elif night_avg_speed[idx] is not None:
-                value = (night_avg_speed[idx])/2
-                fig.add_trace(go.Bar(
-                    x=[night_avg_speed[idx]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} speed during night", marker=dict(color=C.BAR_COLOR_2),
-                    text=[''], textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=2)
-
-            row = 2 * i + 2
-            if day_time_dict[idx] is not None and night_time_dict[idx] is not None:
-                value = (day_time_dict[idx] + night_time_dict[idx])/2
-                fig.add_trace(go.Bar(
-                    x=[day_time_dict[idx]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} time during day", marker=dict(color=C.BAR_COLOR_3),
-                    text=[''], textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=2)
-                fig.add_trace(go.Bar(
-                    x=[night_time_dict[idx]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} time during night", marker=dict(color=C.BAR_COLOR_4), text=[''],
-                    textposition='inside', showlegend=False), row=row, col=2)
-
-            elif day_time_dict[idx] is not None:  # Only day time data available
-                value = (day_time_dict[idx])/2
-                fig.add_trace(go.Bar(
-                    x=[day_time_dict[idx]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} time during day", marker=dict(color=C.BAR_COLOR_3),
-                    text=[''], textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=2)
-
-            elif night_time_dict[idx] is not None:  # Only night time data available
-                value = (night_time_dict[idx])/2
-                fig.add_trace(go.Bar(
-                    x=[night_time_dict[idx]], y=[f'{country} {value:.2f}'], orientation='h',
-                    name=f"{country} time during night", marker=dict(color=C.BAR_COLOR_4),
-                    text=[''], textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=28, color='white')), row=row, col=2)
-
-        # Calculate the maximum value across all data to use as x-axis range
-        max_value_time = max([
-            (day_time_dict[i] if day_time_dict[i] is not None else 0) +
-            (night_time_dict[i] if night_time_dict[i] is not None else 0)
-            for i in range(len(countries_ordered))
-        ]) if countries_ordered else 0
-
-        # Identify the last row for each column where the last locality is plotted
-        last_row_left_column = num_cities_per_col * 2  # The last row in the left column
-        last_row_right_column = (len(countries) - num_cities_per_col) * 2  # The last row in the right column
-        first_row_left_column = 1  # The first row in the left column
-        first_row_right_column = 1  # The first row in the right column
-
-        # Update the loop for updating x-axes based on max values for speed and time
-        for i in range(1, num_cities_per_col * 2 + 1):  # Loop through all rows in both columns
-            # Update x-axis for the left column (top for speed, bottom for time)
-            if i % 2 == 1:  # Odd rows (representing speed)
-                fig.update_xaxes(
-                    range=[0, max_value_time], row=i, col=1,
-                    showticklabels=(i == first_row_left_column),
-                    side='top', showgrid=False
-                )
-            else:  # Even rows (representing time)
-                fig.update_xaxes(
-                    range=[0, max_value_time], row=i, col=1,
-                    showticklabels=(i == last_row_left_column),
-                    side='bottom', showgrid=False
-                )
-
-            # Update x-axis for the right column (top for speed, bottom for time)
-            if i % 2 == 1:  # Odd rows (representing speed)
-                fig.update_xaxes(
-                    range=[0, max_value_time], row=i, col=2,  # Use speed max value for top axis
-                    showticklabels=(i == first_row_right_column),
-                    side='top', showgrid=False
-                )
-            else:  # Even rows (representing time)
-                fig.update_xaxes(
-                    range=[0, max_value_time], row=i, col=2,  # Use time max value for bottom axis
-                    showticklabels=(i == last_row_right_column),
-                    side='bottom', showgrid=False
-                )
-
-        # Set the x-axis labels (title_text) only for the last row and the first row
-        fig.update_xaxes(
-            title=dict(text=crossing_metric_label(mean=True), font=dict(size=font_size_captions)),
-            tickfont=dict(size=font_size_captions),
-            ticks='outside',
-            ticklen=10,
-            tickwidth=2,
-            tickcolor='black',
-            row=1,
-            col=1
-        )
-        fig.update_xaxes(
-            title=dict(text=crossing_metric_label(mean=True), font=dict(size=font_size_captions)),
-            tickfont=dict(size=font_size_captions),
-            ticks='outside',
-            ticklen=10,
-            tickwidth=2,
-            tickcolor='black',
-            row=1,
-            col=2
-        )
-        fig.update_xaxes(
-            title=dict(text="Mean time to start crossing (in s)", font=dict(size=font_size_captions)),
-            tickfont=dict(size=font_size_captions),
-            ticks='outside',
-            ticklen=10,
-            tickwidth=2,
-            tickcolor='black',
-            row=num_cities_per_col * 2,
-            col=1,
-        )
-        fig.update_xaxes(
-            title=dict(text="Mean time to start crossing (in s)", font=dict(size=font_size_captions)),
-            tickfont=dict(size=font_size_captions),
-            ticks='outside',
-            ticklen=10,
-            tickwidth=2,
-            tickcolor='black',
-            row=num_cities_per_col * 2,
-            col=2
-        )
-
-        # Update both y-axes (for left and right columns) to hide the tick labels
-        fig.update_yaxes(showticklabels=False)
-
-        # Ensure no gridlines are shown on x-axes and y-axes
-        fig.update_xaxes(showgrid=False)
-        fig.update_yaxes(showgrid=False)
-
-        # Update layout to hide the main legend and adjust margins
-        fig.update_layout(
-            plot_bgcolor='white', paper_bgcolor='white', barmode='stack',
-            height=TALL_FIG_HEIGHT*2, width=4960, showlegend=False,  # Hide the default legend
-            margin=dict(t=150, b=150), bargap=0, bargroupgap=0
-        )
-
-        # Set the x-axis range to cover the values you want in x_grid_values
-        # TODO: move away from hardcoded xtick values
-        x_grid_values = [2, 4, 6, 8, 10, 12, 14, 16, 18]
-
-        for x in x_grid_values:
-            fig.add_shape(
-                type="line",
-                x0=x, y0=0, x1=x, y1=1,  # Set the position of the gridlines
-                xref='x', yref='paper',  # Ensure gridlines span the whole chart (yref='paper' spans full height)
-                line=dict(color="darkgray", width=1),  # Customize the appearance of the gridlines
-                layer="above"  # Draw the gridlines above the bars
+        for record in records.values():
+            speed_totals.append(
+                (self._as_float(record.get("speed_0")) or 0)
+                + (self._as_float(record.get("speed_1")) or 0)
+            )
+            time_totals.append(
+                (self._as_float(record.get("time_0")) or 0)
+                + (self._as_float(record.get("time_1")) or 0)
             )
 
-        # Manually add gridlines using `shapes` for the right column (x-axis 'x2')
-        for x in x_grid_values:
-            fig.add_shape(
-                type="line",
-                x0=x, y0=0, x1=x, y1=1,  # Set the position of the gridlines
-                xref='x2', yref='paper',  # Apply to right column (x-axis 'x2')
-                line=dict(color="darkgray", width=1),  # Customize the appearance of the gridlines
-                layer="above"  # Draw the gridlines above the bars
+        speed_max = self._nonzero_max(speed_totals) * 1.05
+        time_max = self._nonzero_max(time_totals) * 1.05
+
+        for absolute_index, record_key in enumerate(ordered_keys):
+            record = records[record_key]
+
+            if absolute_index < per_column:
+                column = 1
+                local_index = absolute_index
+                column_count = min(per_column, count)
+            else:
+                column = 2
+                local_index = absolute_index - per_column
+                column_count = count - per_column
+
+            speed_row = local_index * 2 + 1
+            time_row = local_index * 2 + 2
+
+            if locality_mode:
+                label = self._format_locality_label(
+                    df_mapping,
+                    record["locality"],
+                    record["lat"],
+                    iso3=record.get("iso3"),
+                    state=record.get("state"),
+                )
+            else:
+                label = self._format_country_label(
+                    df_mapping,
+                    record["country"],
+                    iso3=record.get("iso3"),
+                )
+
+            speed_day = self._as_float(record.get("speed_0"))
+            speed_night = self._as_float(record.get("speed_1"))
+            time_day = self._as_float(record.get("time_0"))
+            time_night = self._as_float(record.get("time_1"))
+
+            speed_average = self._safe_average([speed_day, speed_night])
+            time_average = self._safe_average([time_day, time_night])
+
+            speed_label = (
+                f"{label} {speed_average:.2f}"
+                if speed_average is not None
+                else label
+            )
+            time_label = (
+                f"{label} {time_average:.2f}"
+                if time_average is not None
+                else label
             )
 
-        # Define the legend items
-        legend_items = [
-            {"name": f"{crossing_metric_label(mean=True)} during day", "color": C.BAR_COLOR_1},
-            {"name": f"{crossing_metric_label(mean=True)} during night", "color": C.BAR_COLOR_2},
-            {"name": "Mean time to start crossing during day (in s)", "color": C.BAR_COLOR_3},
-            {"name": "Mean time to start crossing during night (in s) ", "color": C.BAR_COLOR_4},
-        ]
+            if speed_day is not None:
+                fig.add_trace(
+                    go.Bar(
+                        x=[speed_day],
+                        y=[speed_label],
+                        orientation="h",
+                        name=f"{label} crossing motion during day",
+                        marker=dict(color=C.BAR_COLOR_1),
+                        showlegend=False,
+                        text=[""],
+                    ),
+                    row=speed_row,
+                    col=column,
+                )
 
-        # Add the vertical legends at the top and bottom
-        layout_class.add_vertical_legend_annotations(fig, legend_items, x_position=legend_x, y_start=legend_y,
-                                                     spacing=legend_spacing, font_size=font_size_captions)
+            if speed_night is not None:
+                fig.add_trace(
+                    go.Bar(
+                        x=[speed_night],
+                        y=[speed_label],
+                        orientation="h",
+                        name=f"{label} crossing motion during night",
+                        marker=dict(color=C.BAR_COLOR_2),
+                        showlegend=False,
+                        text=[""],
+                    ),
+                    row=speed_row,
+                    col=column,
+                )
 
-        # Add a box around the first column (left side)
-        fig.add_shape(
-            type="rect", xref="paper", yref="paper",
-            x0=0, y0=1, x1=0.495, y1=0.0,
-            line=dict(color="black", width=2)  # Black border for the box
-        )
+            if time_day is not None:
+                fig.add_trace(
+                    go.Bar(
+                        x=[time_day],
+                        y=[time_label],
+                        orientation="h",
+                        name=f"{label} crossing initiation during day",
+                        marker=dict(color=C.BAR_COLOR_3),
+                        showlegend=False,
+                        text=[""],
+                    ),
+                    row=time_row,
+                    col=column,
+                )
 
-        # Add a box around the second column (right side)
-        fig.add_shape(
-            type="rect", xref="paper", yref="paper",
-            x0=0.505, y0=1, x1=1, y1=0.0,
-            line=dict(color="black", width=2)  # Black border for the box
-        )
+            if time_night is not None:
+                fig.add_trace(
+                    go.Bar(
+                        x=[time_night],
+                        y=[time_label],
+                        orientation="h",
+                        name=f"{label} crossing initiation during night",
+                        marker=dict(color=C.BAR_COLOR_4),
+                        showlegend=False,
+                        text=[""],
+                    ),
+                    row=time_row,
+                    col=column,
+                )
+
+            fig.update_xaxes(
+                range=[0, speed_max],
+                side="top",
+                showticklabels=(local_index == 0),
+                showgrid=True,
+                row=speed_row,
+                col=column,
+            )
+
+            fig.update_xaxes(
+                range=[0, time_max],
+                side="bottom",
+                showticklabels=(local_index == column_count - 1),
+                showgrid=True,
+                row=time_row,
+                col=column,
+            )
+
+        for column in (1, 2):
+            fig.update_xaxes(
+                title=dict(
+                    text=crossing_metric_label(mean=True),
+                    font=dict(size=font_size_captions),
+                ),
+                tickfont=dict(size=font_size_captions),
+                ticks="outside",
+                ticklen=10,
+                tickwidth=2,
+                tickcolor="black",
+                row=1,
+                col=column,
+            )
+
+        left_bottom_row = min(per_column, count) * 2
+        if left_bottom_row >= 1:
+            fig.update_xaxes(
+                title=dict(
+                    text="Mean time to start crossing (in s)",
+                    font=dict(size=font_size_captions),
+                ),
+                tickfont=dict(size=font_size_captions),
+                ticks="outside",
+                ticklen=10,
+                tickwidth=2,
+                tickcolor="black",
+                row=left_bottom_row,
+                col=1,
+            )
+
+        right_count = max(0, count - per_column)
+        if right_count > 0:
+            fig.update_xaxes(
+                title=dict(
+                    text="Mean time to start crossing (in s)",
+                    font=dict(size=font_size_captions),
+                ),
+                tickfont=dict(size=font_size_captions),
+                ticks="outside",
+                ticklen=10,
+                tickwidth=2,
+                tickcolor="black",
+                row=right_count * 2,
+                col=2,
+            )
 
         fig.update_yaxes(
+            showticklabels=True,
+            ticklabelposition="inside",
             tickfont=dict(size=14, color="black"),
-            showticklabels=True,  # Ensure locality names are visible
-            ticklabelposition='inside',  # Move the tick labels inside the bars
-        )
-        fig.update_xaxes(
-            tickangle=0,  # No rotation or small rotation for the x-axis
+            showgrid=False,
         )
 
-        # update font family
-        fig.update_layout(font=dict(family=common.get_configs('font_family')))
-
-        # Final adjustments and display
-        fig.update_layout(margin=dict(l=10, r=10, t=x_axis_title_height, b=x_axis_title_height))
-        plots_io_class.save_plotly_figure(fig, "consolidated", height=TALL_FIG_HEIGHT*2, width=4960, scale=C.SCALE,
-                                          save_final=True, save_eps=False)
-
-    def plot_crossing_without_traffic_light(self, df_mapping, font_size_captions=40, x_axis_title_height=150,
-                                            legend_x=0.92, legend_y=0.015, legend_spacing=0.02):
-        final_dict = {}
-        with open(file_results, 'rb') as file:
-            data_tuple = pickle.load(file)
-
-        without_trf_light = data_tuple[28]
-        # Now populate the final_dict with locality-wise speed data
-        for locality_condition, count in without_trf_light.items():
-            locality, lat, long, condition = locality_condition.split('_')
-
-            # Get the country from the previously stored locality_country_map
-            country = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "country")
-            iso_code = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "iso3")
-            if country or iso_code is not None:
-                # Initialise the locality's dictionary if not already present
-                if f"{locality}_{lat}_{long}" not in final_dict:
-                    final_dict[f"{locality}_{lat}_{long}"] = {"without_trf_light_0": None, "without_trf_light_1": None,
-                                                              "country": country, "iso": iso_code}
-
-                # normalise by total time and total number of detected persons
-                total_time = metadata_class.get_value(df_mapping, "locality", locality, "lat",
-                                                      float(lat), "total_time")
-                person = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "person")
-                count = count / total_time / person
-
-                # Populate the corresponding speed based on the condition
-                final_dict[f"{locality}_{lat}_{long}"][f"without_trf_light_{condition}"] = count
-
-        # Multiply each of the numeric speed values by 10^6
-        for locality_key, data in final_dict.items():
-            for key, value in data.items():
-                # Only modify keys that represent speed values
-                if key.startswith("without_trf_light") and value is not None:
-                    data[key] = round(value * 10**6, 2)
-
-        cities_ordered = sorted(
-            final_dict.keys(),
-            key=lambda locality: dataset_stats.safe_average([
-                final_dict[locality]["without_trf_light_0"],
-                final_dict[locality]["without_trf_light_1"]
-            ]),
-            reverse=True
+        fig.update_layout(
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            barmode="stack",
+            height=max(
+                C.BASE_HEIGHT_PER_ROW * per_column * 2,
+                C.BASE_HEIGHT_PER_ROW * 2,
+            ),
+            width=4960,
+            showlegend=False,
+            margin=dict(
+                l=80,
+                r=80,
+                t=x_axis_title_height,
+                b=x_axis_title_height,
+            ),
+            bargap=0,
+            bargroupgap=0,
+            font=dict(family=common.get_configs("font_family")),
         )
 
-        # Extract unique cities
-        cities = list(set([key.split('_')[0] for key in final_dict.keys()]))
+        legend_items = [
+            {
+                "name": f"{crossing_metric_label()} during daytime",
+                "color": C.BAR_COLOR_1,
+            },
+            {
+                "name": f"{crossing_metric_label()} during night time",
+                "color": C.BAR_COLOR_2,
+            },
+            {
+                "name": "Crossing initiation time during daytime",
+                "color": C.BAR_COLOR_3,
+            },
+            {
+                "name": "Crossing initiation time during night time",
+                "color": C.BAR_COLOR_4,
+            },
+        ]
 
-        # Prepare data for day and night stacking
-        day_crossing = [final_dict[locality]['without_trf_light_0'] for locality in cities_ordered]
-        night_crossing = [final_dict[locality]['without_trf_light_1'] for locality in cities_ordered]
+        layout_class.add_vertical_legend_annotations(
+            fig,
+            legend_items,
+            x_position=legend_x,
+            y_start=legend_y,
+            spacing=legend_spacing,
+            font_size=font_size_captions,
+        )
 
-        # Determine how many cities will be in each column
-        num_cities_per_col = len(cities_ordered) // 2 + len(cities_ordered) % 2  # Split cities into two groups
-        # Define a base height per row and calculate total figure height
-        TALL_FIG_HEIGHT = num_cities_per_col * C.BASE_HEIGHT_PER_ROW
+        plots_io_class.save_plotly_figure(
+            fig,
+            "consolidated",
+            height=max(
+                C.BASE_HEIGHT_PER_ROW * per_column * 2,
+                C.BASE_HEIGHT_PER_ROW * 2,
+            ),
+            width=4960,
+            scale=C.SCALE,
+            save_final=True,
+            save_eps=False,
+            save_png=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Traffic equipment figures
+    # ------------------------------------------------------------------
+
+    def _build_traffic_equipment_records(
+        self,
+        df_mapping,
+        source,
+        value_prefix,
+    ):
+        records = {}
+
+        if not isinstance(source, dict):
+            return records
+
+        for locality_condition, raw_count in source.items():
+            try:
+                locality, lat, lon, lat_float, _, condition = (
+                    self._parse_locality_condition_key(locality_condition)
+                )
+            except ValueError as exc:
+                logger.warning(str(exc))
+                continue
+
+            if condition not in {"0", "1"}:
+                continue
+
+            count = self._as_float(raw_count)
+            if count is None:
+                continue
+
+            country, iso3, state = self._locality_metadata(
+                df_mapping,
+                locality,
+                lat_float,
+            )
+
+            total_time = self._as_float(
+                metadata_class.get_value(
+                    df_mapping,
+                    "locality",
+                    locality,
+                    "lat",
+                    lat_float,
+                    "total_time",
+                )
+            )
+            person = self._as_float(
+                metadata_class.get_value(
+                    df_mapping,
+                    "locality",
+                    locality,
+                    "lat",
+                    lat_float,
+                    "person",
+                )
+            )
+
+            if total_time is None or total_time <= 0:
+                logger.warning(
+                    f"Skipping {locality_condition}: invalid total_time={total_time}."
+                )
+                continue
+
+            if person is None or person <= 0:
+                logger.warning(
+                    f"Skipping {locality_condition}: invalid person count={person}."
+                )
+                continue
+
+            normalised = count / total_time / person
+            normalised = round(normalised * 10**6, 2)
+
+            base_key = f"{locality}_{lat}_{lon}"
+
+            if base_key not in records:
+                records[base_key] = {
+                    "locality": locality,
+                    "lat": lat_float,
+                    "lon": float(lon),
+                    "country": country,
+                    "iso3": iso3,
+                    "state": state,
+                    f"{value_prefix}_0": None,
+                    f"{value_prefix}_1": None,
+                }
+
+            records[base_key][f"{value_prefix}_{condition}"] = normalised
+
+        return records
+
+    def _plot_traffic_equipment(
+        self,
+        df_mapping,
+        source,
+        value_prefix,
+        axis_title,
+        output_file,
+        font_size_captions,
+        x_axis_title_height,
+        legend_x,
+        legend_y,
+        legend_spacing,
+    ):
+        records = self._build_traffic_equipment_records(
+            df_mapping,
+            source,
+            value_prefix,
+        )
+
+        if not records:
+            logger.warning(
+                f"No data available for {axis_title.lower()}."
+            )
+            return
+
+        ordered_keys = sorted(
+            records,
+            key=lambda key: (
+                self._safe_average(
+                    [
+                        records[key].get(f"{value_prefix}_0"),
+                        records[key].get(f"{value_prefix}_1"),
+                    ]
+                )
+                or 0
+            ),
+            reverse=True,
+        )
+
+        count = len(ordered_keys)
+        per_column = (count + 1) // 2
+        rows = max(1, per_column)
 
         fig = make_subplots(
-            rows=num_cities_per_col, cols=2,  # Two columns
-            vertical_spacing=0.0005,  # Reduce the vertical spacing
-            horizontal_spacing=0.01,  # Reduce horizontal spacing between columns
-            row_heights=[1.0] * (num_cities_per_col),
+            rows=rows,
+            cols=2,
+            vertical_spacing=0.0005,
+            horizontal_spacing=0.01,
+            row_heights=[1.0] * rows,
         )
 
-        # Plot left column (first half of cities)
-        for i, locality in enumerate(cities_ordered[:num_cities_per_col]):
-            locality_new, lat, long = locality.split('_')
-            iso_code = metadata_class.get_value(df_mapping, "locality", locality_new, "lat", float(lat), "iso3")
-            locality = grouping_class.process_locality_string(locality, df_mapping)
+        totals = []
 
-            locality = iso_class.iso2_to_flag(iso_class.iso3_to_iso2(iso_code)) + " " + locality   # type: ignore
+        for record in records.values():
+            totals.append(
+                (self._as_float(record.get(f"{value_prefix}_0")) or 0)
+                + (self._as_float(record.get(f"{value_prefix}_1")) or 0)
+            )
 
-            row = i + 1
-            if day_crossing[i] is not None and night_crossing[i] is not None:
-                value = round((day_crossing[i] + night_crossing[i])/2, 2)
-                fig.add_trace(go.Bar(
-                    x=[day_crossing[i]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing without traffic light in day",
-                    marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=14, color='white')), row=row, col=1)
-                fig.add_trace(go.Bar(
-                    x=[night_crossing[i]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing without traffic light in night",
-                    marker=dict(color=C.BAR_COLOR_2),
-                    text=[''], textposition='inside', showlegend=False), row=row, col=1)
+        x_max = self._nonzero_max(totals) * 1.05
 
-            elif day_crossing[i] is not None:  # Only day data available
-                value = (day_crossing[i])
-                fig.add_trace(go.Bar(
-                    x=[day_crossing[i]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing without traffic light in day",
-                    marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=14, color='white')), row=row, col=1)
+        for absolute_index, record_key in enumerate(ordered_keys):
+            record = records[record_key]
 
-            elif night_crossing[i] is not None:  # Only night data available
-                value = (night_crossing[i])
-                fig.add_trace(go.Bar(
-                    x=[night_crossing[i]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing without traffic light in night",
-                    marker=dict(color=C.BAR_COLOR_2),
-                    textposition='inside', insidetextanchor='start', showlegend=False,
-                    text=[''], textfont=dict(size=14, color='white')), row=row, col=1)
+            if absolute_index < per_column:
+                column = 1
+                row = absolute_index + 1
+            else:
+                column = 2
+                row = absolute_index - per_column + 1
 
-        for i, locality in enumerate(cities_ordered[num_cities_per_col:]):
-            locality_new, lat, long = locality.split('_')
-            iso_code = metadata_class.get_value(df_mapping, "locality", locality_new, "lat", float(lat), "iso3")
-            locality = grouping_class.process_locality_string(locality, df_mapping)
+            day_value = self._as_float(record.get(f"{value_prefix}_0"))
+            night_value = self._as_float(record.get(f"{value_prefix}_1"))
 
-            locality = iso_class.iso2_to_flag(iso_class.iso3_to_iso2(iso_code)) + " " + locality   # type: ignore
+            average = self._safe_average([day_value, night_value])
 
-            row = i + 1
-            idx = num_cities_per_col + i
-            if day_crossing[idx] is not None and night_crossing[idx] is not None:
-                value = round((day_crossing[idx] + night_crossing[idx])/2, 2)
-                fig.add_trace(go.Bar(
-                    x=[day_crossing[idx]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing without traffic light in day",
-                    marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=14, color='white')), row=row, col=2)
-                fig.add_trace(go.Bar(
-                    x=[night_crossing[idx]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing without traffic light in night",
-                    marker=dict(color=C.BAR_COLOR_2),
-                    text=[''], textposition='inside', showlegend=False), row=row, col=2)
+            label = self._format_locality_label(
+                df_mapping,
+                record["locality"],
+                record["lat"],
+                iso3=record.get("iso3"),
+                state=record.get("state"),
+            )
 
-            elif day_crossing[idx] is not None:
-                value = (day_crossing[idx])
-                fig.add_trace(go.Bar(
-                    x=[day_crossing[idx]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing without traffic light in day",
-                    marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=14, color='white')), row=row, col=2)
+            if average is not None:
+                label = f"{label} {average:.2f}"
 
-            elif night_crossing[idx] is not None:
-                value = (night_crossing[idx])
-                fig.add_trace(go.Bar(
-                    x=[night_crossing[idx]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing without traffic light in night",
-                    marker=dict(color=C.BAR_COLOR_2),
-                    textposition='inside', insidetextanchor='start', showlegend=False,
-                    text=[''], textfont=dict(size=14, color='white')), row=row, col=2)
-
-        # Calculate the maximum value across all data to use as x-axis range
-        max_value_speed = max([
-            (day_crossing[i] if day_crossing[i] is not None else 0) +
-            (night_crossing[i] if night_crossing[i] is not None else 0)
-            for i in range(len(cities))
-        ]) if cities else 0
-
-        # Identify the last row for each column where the last locality is plotted
-        last_row_left_column = num_cities_per_col * 2  # The last row in the left column
-        last_row_right_column = (len(cities) - num_cities_per_col) * 2  # The last row in the right column
-        first_row_left_column = 1  # The first row in the left column
-        first_row_right_column = 1  # The first row in the right column
-
-        # Update the loop for updating x-axes based on max values for speed and time
-        for i in range(1, num_cities_per_col * 2 + 1):  # Loop through all rows in both columns
-            # Update x-axis for the left column (top for speed, bottom for time)
-            if i % 2 == 1:  # Odd rows (representing speed)
-                fig.update_xaxes(
-                    range=[0, max_value_speed], row=i, col=1,
-                    showticklabels=(i == first_row_left_column),
-                    side='top', showgrid=True
-                )
-            else:  # Even rows (representing time)
-                fig.update_xaxes(
-                    range=[0, max_value_speed], row=i, col=1,
-                    showticklabels=(i == last_row_left_column),
-                    side='bottom', showgrid=True
+            if day_value is not None:
+                fig.add_trace(
+                    go.Bar(
+                        x=[day_value],
+                        y=[label],
+                        orientation="h",
+                        name=f"{label} during day",
+                        marker=dict(color=C.BAR_COLOR_1),
+                        text=[""],
+                        showlegend=False,
+                    ),
+                    row=row,
+                    col=column,
                 )
 
-            # Update x-axis for the right column (top for speed, bottom for time)
-            if i % 2 == 1:  # Odd rows (representing speed)
-                fig.update_xaxes(
-                    range=[0, max_value_speed], row=i, col=2,  # Use speed max value for top axis
-                    showticklabels=(i == first_row_right_column),
-                    side='top', showgrid=True
+            if night_value is not None:
+                fig.add_trace(
+                    go.Bar(
+                        x=[night_value],
+                        y=[label],
+                        orientation="h",
+                        name=f"{label} during night",
+                        marker=dict(color=C.BAR_COLOR_2),
+                        text=[""],
+                        showlegend=False,
+                    ),
+                    row=row,
+                    col=column,
                 )
-            else:  # Even rows (representing time)
-                fig.update_xaxes(
-                    range=[0, max_value_speed], row=i, col=2,  # Use time max value for bottom axis
-                    showticklabels=(i == last_row_right_column),
-                    side='bottom', showgrid=True
-                )
 
-        # Set the x-axis labels (title_text) only for the last row and the first row
-        fig.update_xaxes(title=dict(text="Road crossings without traffic signals (normalised)",
-                         font=dict(size=font_size_captions)), tickfont=dict(size=font_size_captions), ticks='outside',
-                         ticklen=10, tickwidth=2, tickcolor='black', row=1, col=1)
+            fig.update_xaxes(
+                range=[0, x_max],
+                showgrid=True,
+                showticklabels=(row == 1),
+                side="top",
+                row=row,
+                col=column,
+            )
 
-        fig.update_xaxes(title=dict(text="Road crossings without traffic signals (normalised)",
-                         font=dict(size=font_size_captions)), tickfont=dict(size=font_size_captions), ticks='outside',
-                         ticklen=10, tickwidth=2, tickcolor='black', row=1, col=2)
+        for column in (1, 2):
+            fig.update_xaxes(
+                title=dict(
+                    text=axis_title,
+                    font=dict(size=font_size_captions),
+                ),
+                tickfont=dict(size=font_size_captions),
+                ticks="outside",
+                ticklen=10,
+                tickwidth=2,
+                tickcolor="black",
+                row=1,
+                col=column,
+            )
 
-        # Update both y-axes (for left and right columns) to hide the tick labels
-        fig.update_yaxes(showticklabels=False)
+        fig.update_yaxes(
+            showticklabels=True,
+            ticklabelposition="inside",
+            tickfont=dict(size=12, color="black"),
+            showgrid=False,
+        )
 
-        # Ensure no gridlines are shown on x-axes and y-axes
-        fig.update_xaxes(showgrid=True)
-        fig.update_yaxes(showgrid=False)
-
-        # Update layout to hide the main legend and adjust margins
         fig.update_layout(
-            plot_bgcolor='white', paper_bgcolor='white', barmode='stack',
-            height=TALL_FIG_HEIGHT, width=2480, showlegend=False,  # Hide the default legend
-            margin=dict(t=150, b=150), bargap=0, bargroupgap=0
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            barmode="stack",
+            height=max(C.BASE_HEIGHT_PER_ROW * rows, C.BASE_HEIGHT_PER_ROW),
+            width=2480,
+            showlegend=False,
+            margin=dict(
+                l=80,
+                r=100,
+                t=x_axis_title_height,
+                b=180,
+            ),
+            bargap=0,
+            bargroupgap=0,
+            font=dict(family=common.get_configs("font_family")),
         )
 
-        # Manually add gridlines using `shapes`
-        x_grid_values = [200, 400, 600, 800, 1000, 1200, 1400, 1600]  # Define the gridline positions on the x-axis
-
-        for x in x_grid_values:
-            fig.add_shape(
-                type="line",
-                x0=x, y0=0, x1=x, y1=1,  # Set the position of the gridlines
-                xref='x', yref='paper',  # Ensure gridlines span the whole chart (yref='paper' spans full height)
-                line=dict(color="darkgray", width=1),  # Customize the appearance of the gridlines
-                layer="above"  # Draw the gridlines above the bars
-            )
-
-        # Manually add gridlines using `shapes` for the right column (x-axis 'x2')
-        for x in x_grid_values:
-            fig.add_shape(
-                type="line",
-                x0=x, y0=0, x1=x, y1=1,  # Set the position of the gridlines
-                xref='x2', yref='paper',  # Apply to right column (x-axis 'x2')
-                line=dict(color="darkgray", width=1),  # Customize the appearance of the gridlines
-                layer="above"  # Draw the gridlines above the bars
-            )
-
-        # Define the legend items
         legend_items = [
             {"name": "Day", "color": C.BAR_COLOR_1},
             {"name": "Night", "color": C.BAR_COLOR_2},
         ]
 
-        # Add the vertical legends at the top and bottom
-        layout_class.add_vertical_legend_annotations(fig, legend_items, x_position=legend_x, y_start=legend_y,
-                                                     spacing=legend_spacing, font_size=font_size_captions)
-
-        # Add a box around the first column (left side)
-        fig.add_shape(
-            type="rect", xref="paper", yref="paper",
-            x0=0, y0=1, x1=0.495, y1=0.0,
-            line=dict(color="black", width=2)  # Black border for the box
+        layout_class.add_vertical_legend_annotations(
+            fig,
+            legend_items,
+            x_position=legend_x,
+            y_start=legend_y,
+            spacing=legend_spacing,
+            font_size=font_size_captions,
         )
 
-        # Add a box around the second column (right side)
-        fig.add_shape(
-            type="rect", xref="paper", yref="paper",
-            x0=0.505, y0=1, x1=1, y1=0.0,
-            line=dict(color="black", width=2)  # Black border for the box
+        plots_io_class.save_plotly_figure(
+            fig,
+            output_file,
+            width=2480,
+            height=max(C.BASE_HEIGHT_PER_ROW * rows, C.BASE_HEIGHT_PER_ROW),
+            scale=C.SCALE,
+            save_eps=False,
+            save_final=True,
         )
 
-        # Create an ordered list of unique countries based on the cities in final_dict
-        country_locality_map = {}
-        for locality, info in final_dict.items():
-            country = info['iso']
-            if country not in country_locality_map:
-                country_locality_map[country] = []
-            country_locality_map[country].append(locality)
+    def plot_crossing_without_traffic_light(
+        self,
+        df_mapping,
+        font_size_captions=40,
+        x_axis_title_height=150,
+        legend_x=0.92,
+        legend_y=0.015,
+        legend_spacing=0.02,
+    ):
+        """
+        Plot locality crossing events without traffic equipment.
 
-        # Split cities into left and right columns
-        left_column_cities = cities_ordered[:num_cities_per_col]
-        right_column_cities = cities_ordered[num_cities_per_col:]
+        Correct results.pickle index:
+            30 = crossings_without_traffic_equipment_locality
+        """
+        data_tuple = self._load_results()
+        without_trf_light = data_tuple[30]
 
-        # Initialise variables for dynamic y positioning for both columns
-        current_row_left = 1  # Start from the first row for the left column
-        current_row_right = 1  # Start from the first row for the right column
-        y_position_map_left = {}  # Store y positions for each country (left column)
-        y_position_map_right = {}  # Store y positions for each country (right column)
-
-        # Calculate the y positions dynamically for the left column
-        for locality in left_column_cities:
-            country = final_dict[locality]['iso']
-
-            if country not in y_position_map_left:  # Add the country label once per country
-                y_position_map_left[country] = 1 - (current_row_left - 1) / (len(left_column_cities) * 2)
-
-            current_row_left += 2  # Increment the row for each locality (speed and time take two rows)
-
-        # Calculate the y positions dynamically for the right column
-        for locality in right_column_cities:
-            country = final_dict[locality]['iso']
-
-            if country not in y_position_map_right:  # Add the country label once per country
-                y_position_map_right[country] = 1 - (current_row_right - 1) / (len(right_column_cities) * 2)
-
-            current_row_right += 2  # Increment the row for each locality (speed and time take two rows)
-
-        fig.update_yaxes(
-            tickfont=dict(size=12, color="black"),
-            showticklabels=True,  # Ensure locality names are visible
-            ticklabelposition='inside',  # Move the tick labels inside the bars
-        )
-        fig.update_xaxes(
-            tickangle=0,  # No rotation or small rotation for the x-axis
+        self._plot_traffic_equipment(
+            df_mapping=df_mapping,
+            source=without_trf_light,
+            value_prefix="without_trf_light",
+            axis_title="Road crossings without traffic signals (normalised)",
+            output_file="crossings_without_traffic_equipment_avg",
+            font_size_captions=font_size_captions,
+            x_axis_title_height=x_axis_title_height,
+            legend_x=legend_x,
+            legend_y=legend_y,
+            legend_spacing=legend_spacing,
         )
 
-        # update font family
-        fig.update_layout(font=dict(family=common.get_configs('font_family')))
+    def plot_crossing_with_traffic_light(
+        self,
+        df_mapping,
+        font_size_captions=40,
+        x_axis_title_height=150,
+        legend_x=0.92,
+        legend_y=0.015,
+        legend_spacing=0.02,
+    ):
+        """
+        Plot locality crossing events with traffic equipment.
 
-        # Final adjustments and display
-        fig.update_layout(margin=dict(l=80, r=100, t=x_axis_title_height, b=180))
-        plots_io_class.save_plotly_figure(fig,
-                                          "crossings_without_traffic_equipment_avg",
-                                          width=2480,
-                                          height=TALL_FIG_HEIGHT,
-                                          scale=C.SCALE,
-                                          save_eps=False,
-                                          save_final=True)
+        Correct results.pickle index:
+            29 = crossings_with_traffic_equipment_locality
+        """
+        data_tuple = self._load_results()
+        with_trf_light = data_tuple[29]
 
-    def plot_crossing_with_traffic_light(self, df_mapping, font_size_captions=40, x_axis_title_height=150,
-                                         legend_x=0.92, legend_y=0.015, legend_spacing=0.02):
-        final_dict = {}
-        with open(file_results, 'rb') as file:
-            data_tuple = pickle.load(file)
-
-        with_trf_light = data_tuple[27]
-        # Now populate the final_dict with locality-wise speed data
-        for locality_condition, count in with_trf_light.items():
-            locality, lat, long, condition = locality_condition.split('_')
-
-            # Get the country from the previously stored locality_country_map
-            country = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "country")
-            iso_code = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "iso3")
-            if country or iso_code is not None:
-                # Initialise the locality's dictionary if not already present
-                if f"{locality}_{lat}_{long}" not in final_dict:
-                    final_dict[f"{locality}_{lat}_{long}"] = {"with_trf_light_0": None, "with_trf_light_1": None,
-                                                              "country": country, "iso": iso_code}
-
-                # normalise by total time and total number of detected persons
-                total_time = metadata_class.get_value(df_mapping, "locality", locality,
-                                                      "lat", float(lat), "total_time")
-                person = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "person")
-                count = count / total_time / person
-
-                # Populate the corresponding speed based on the condition
-                final_dict[f"{locality}_{lat}_{long}"][f"with_trf_light_{condition}"] = count
-
-        # Multiply each of the numeric speed values by 10^6
-        for locality_key, data in final_dict.items():
-            for key, value in data.items():
-                # Only modify keys that represent speed values
-                if key.startswith("with_trf_light") and value is not None:
-                    data[key] = round(value * 10**6, 2)
-
-        cities_ordered = sorted(
-            final_dict.keys(),
-            key=lambda locality: dataset_stats.safe_average([
-                final_dict[locality]["with_trf_light_0"],
-                final_dict[locality]["with_trf_light_1"]
-            ]),
-            reverse=True
+        self._plot_traffic_equipment(
+            df_mapping=df_mapping,
+            source=with_trf_light,
+            value_prefix="with_trf_light",
+            axis_title="Road crossings with traffic signals (normalised)",
+            output_file="crossings_with_traffic_equipment_avg",
+            font_size_captions=font_size_captions,
+            x_axis_title_height=x_axis_title_height,
+            legend_x=legend_x,
+            legend_y=legend_y,
+            legend_spacing=legend_spacing,
         )
-
-        # Extract unique cities
-        cities = list(set([key.split('_')[0] for key in final_dict.keys()]))
-
-        # Prepare data for day and night stacking
-        day_crossing = [final_dict[locality]['with_trf_light_0'] for locality in cities_ordered]
-        night_crossing = [final_dict[locality]['with_trf_light_1'] for locality in cities_ordered]
-
-        # # Ensure that plotting uses cities_ordered
-        # assert len(cities_ordered) == len(day_crossing) == len(night_crossing), "Lengths of lists don't match!"
-
-        # Determine how many cities will be in each column
-        num_cities_per_col = len(cities_ordered) // 2 + len(cities_ordered) % 2  # Split cities into two groups
-        # Define a base height per row and calculate total figure height
-        TALL_FIG_HEIGHT = num_cities_per_col * C.BASE_HEIGHT_PER_ROW
-
-        fig = make_subplots(
-            rows=num_cities_per_col, cols=2,  # Two columns
-            vertical_spacing=0.0005,  # Reduce the vertical spacing
-            horizontal_spacing=0.01,  # Reduce horizontal spacing between columns
-            row_heights=[1.0] * (num_cities_per_col),
-        )
-
-        # Plot left column (first half of cities)
-        for i, locality in enumerate(cities_ordered[:num_cities_per_col]):
-            locality_new, lat, long = locality.split('_')
-            iso_code = metadata_class.get_value(df_mapping, "locality", locality_new, "lat", float(lat), "iso3")
-            locality = grouping_class.process_locality_string(locality, df_mapping)
-
-            locality = iso_class.iso2_to_flag(iso_class.iso3_to_iso2(iso_code)) + " " + locality   # type: ignore
-
-            row = i + 1
-            if day_crossing[i] is not None and night_crossing[i] is not None:
-                value = round((day_crossing[i] + night_crossing[i])/2, 2)
-                fig.add_trace(go.Bar(
-                    x=[day_crossing[i]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing with traffic light in day",
-                    marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='auto', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=14, color='white')), row=row, col=1)
-                fig.add_trace(go.Bar(
-                    x=[night_crossing[i]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing with traffic light in night",
-                    marker=dict(color=C.BAR_COLOR_2),
-                    text=[''], textposition='auto', showlegend=False), row=row, col=1)
-
-            elif day_crossing[i] is not None:  # Only day data available
-                value = (day_crossing[i])
-                fig.add_trace(go.Bar(
-                    x=[day_crossing[i]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing with traffic light in day",
-                    marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='auto', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=14, color='white')), row=row, col=1)
-
-            elif night_crossing[i] is not None:  # Only night data available
-                value = (night_crossing[i])
-                fig.add_trace(go.Bar(
-                    x=[night_crossing[i]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing with traffic light in night",
-                    marker=dict(color=C.BAR_COLOR_2),
-                    textposition='auto', insidetextanchor='start', showlegend=False,
-                    text=[''], textfont=dict(size=14, color='white')), row=row, col=1)
-
-        for i, locality in enumerate(cities_ordered[num_cities_per_col:]):
-            locality_new, lat, long = locality.split('_')
-            iso_code = metadata_class.get_value(df_mapping, "locality", locality_new, "lat", float(lat), "iso3")
-            locality = grouping_class.process_locality_string(locality, df_mapping)
-
-            locality = iso_class.iso2_to_flag(iso_class.iso3_to_iso2(iso_code)) + " " + locality   # type: ignore
-
-            row = i + 1
-            idx = num_cities_per_col + i
-            if day_crossing[idx] is not None and night_crossing[idx] is not None:
-                value = round((day_crossing[idx] + night_crossing[idx])/2, 2)
-                fig.add_trace(go.Bar(
-                    x=[day_crossing[idx]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing with traffic light in day",
-                    marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=14, color='white')), row=row, col=2)
-                fig.add_trace(go.Bar(
-                    x=[night_crossing[idx]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing with traffic light in night",
-                    marker=dict(color=C.BAR_COLOR_2),
-                    text=[''], textposition='inside', showlegend=False), row=row, col=2)
-
-            elif day_crossing[idx] is not None:
-                value = (day_crossing[idx])
-                fig.add_trace(go.Bar(
-                    x=[day_crossing[idx]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing with traffic light in day",
-                    marker=dict(color=C.BAR_COLOR_1), text=[''],
-                    textposition='inside', insidetextanchor='start', showlegend=False,
-                    textfont=dict(size=14, color='white')), row=row, col=2)
-
-            elif night_crossing[idx] is not None:
-                value = (night_crossing[idx])
-                fig.add_trace(go.Bar(
-                    x=[night_crossing[idx]], y=[f'{locality} {value}'], orientation='h',
-                    name=f"{locality} crossing with traffic light in night",
-                    marker=dict(color=C.BAR_COLOR_2),
-                    textposition='inside', insidetextanchor='start', showlegend=False,
-                    text=[''], textfont=dict(size=14, color='white')), row=row, col=2)
-
-        # Calculate the maximum value across all data to use as x-axis range
-        max_value_speed = max([
-            (day_crossing[i] if day_crossing[i] is not None else 0) +
-            (night_crossing[i] if night_crossing[i] is not None else 0)
-            for i in range(len(cities))
-        ]) if cities else 0
-
-        # Identify the last row for each column where the last locality is plotted
-        last_row_left_column = num_cities_per_col * 2  # The last row in the left column
-        last_row_right_column = (len(cities) - num_cities_per_col) * 2  # The last row in the right column
-        first_row_left_column = 1  # The first row in the left column
-        first_row_right_column = 1  # The first row in the right column
-
-        # Update the loop for updating x-axes based on max values for speed and time
-        for i in range(1, num_cities_per_col * 2 + 1):  # Loop through all rows in both columns
-            # Update x-axis for the left column (top for speed, bottom for time)
-            if i % 2 == 1:  # Odd rows (representing speed)
-                fig.update_xaxes(
-                    range=[0, max_value_speed], row=i, col=1,
-                    showticklabels=(i == first_row_left_column),
-                    side='top', showgrid=True
-                )
-            else:  # Even rows (representing time)
-                fig.update_xaxes(
-                    range=[0, max_value_speed], row=i, col=1,
-                    showticklabels=(i == last_row_left_column),
-                    side='bottom', showgrid=True
-                )
-
-            # Update x-axis for the right column (top for speed, bottom for time)
-            if i % 2 == 1:  # Odd rows (representing speed)
-                fig.update_xaxes(
-                    range=[0, max_value_speed], row=i, col=2,  # Use speed max value for top axis
-                    showticklabels=(i == first_row_right_column),
-                    side='top', showgrid=True
-                )
-            else:  # Even rows (representing time)
-                fig.update_xaxes(
-                    range=[0, max_value_speed], row=i, col=2,  # Use time max value for bottom axis
-                    showticklabels=(i == last_row_right_column),
-                    side='bottom', showgrid=True
-                )
-
-        # Set the x-axis labels (title_text) only for the last row and the first row
-        fig.update_xaxes(title=dict(text="Road crossings with traffic signals (normalised)",
-                         font=dict(size=font_size_captions)), tickfont=dict(size=font_size_captions), ticks='outside',
-                         ticklen=10, tickwidth=2, tickcolor='black', row=1, col=1)
-
-        fig.update_xaxes(title=dict(text="Road crossings with traffic signals (normalised)",
-                         font=dict(size=font_size_captions)), tickfont=dict(size=font_size_captions), ticks='outside',
-                         ticklen=10, tickwidth=2, tickcolor='black', row=1, col=2)
-
-        # Update both y-axes (for left and right columns) to hide the tick labels
-        fig.update_yaxes(showticklabels=False)
-
-        # Ensure no gridlines are shown on x-axes and y-axes
-        fig.update_xaxes(showgrid=True)
-        fig.update_yaxes(showgrid=False)
-
-        # Update layout to hide the main legend and adjust margins
-        fig.update_layout(
-            plot_bgcolor='white', paper_bgcolor='white', barmode='stack',
-            height=TALL_FIG_HEIGHT, width=2480, showlegend=False,  # Hide the default legend
-            margin=dict(t=150, b=150), bargap=0, bargroupgap=0
-        )
-
-        # Manually add gridlines using `shapes`
-        x_grid_values = [50, 100, 150, 200, 250]  # Define the gridline positions on the x-axis
-
-        for x in x_grid_values:
-            fig.add_shape(
-                type="line",
-                x0=x, y0=0, x1=x, y1=1,  # Set the position of the gridlines
-                xref='x', yref='paper',  # Ensure gridlines span the whole chart (yref='paper' spans full height)
-                line=dict(color="darkgray", width=1),  # Customize the appearance of the gridlines
-                layer="above"  # Draw the gridlines above the bars
-            )
-
-        # Manually add gridlines using `shapes` for the right column (x-axis 'x2')
-        for x in x_grid_values:
-            fig.add_shape(
-                type="line",
-                x0=x, y0=0, x1=x, y1=1,  # Set the position of the gridlines
-                xref='x2', yref='paper',  # Apply to right column (x-axis 'x2')
-                line=dict(color="darkgray", width=1),  # Customize the appearance of the gridlines
-                layer="above"  # Draw the gridlines above the bars
-            )
-
-        # Define the legend items
-        legend_items = [
-            {"name": "Day", "color": C.BAR_COLOR_1},
-            {"name": "Night", "color": C.BAR_COLOR_2},
-        ]
-
-        # Add the vertical legends at the top and bottom
-        layout_class.add_vertical_legend_annotations(fig, legend_items, x_position=legend_x, y_start=legend_y,
-                                                     spacing=legend_spacing, font_size=font_size_captions)
-
-        # Add a box around the first column (left side)
-        fig.add_shape(
-            type="rect", xref="paper", yref="paper",
-            x0=0, y0=1, x1=0.495, y1=0.0,
-            line=dict(color="black", width=2)  # Black border for the box
-        )
-
-        # Add a box around the second column (right side)
-        fig.add_shape(
-            type="rect", xref="paper", yref="paper",
-            x0=0.505, y0=1, x1=1, y1=0.0,
-            line=dict(color="black", width=2)  # Black border for the box
-        )
-
-        # Create an ordered list of unique countries based on the cities in final_dict
-        country_locality_map = {}
-        for locality, info in final_dict.items():
-            country = info['iso']
-            if country not in country_locality_map:
-                country_locality_map[country] = []
-            country_locality_map[country].append(locality)
-
-        # Split cities into left and right columns
-        left_column_cities = cities_ordered[:num_cities_per_col]
-        right_column_cities = cities_ordered[num_cities_per_col:]
-
-        # Initialise variables for dynamic y positioning for both columns
-        current_row_left = 1  # Start from the first row for the left column
-        current_row_right = 1  # Start from the first row for the right column
-        y_position_map_left = {}  # Store y positions for each country (left column)
-        y_position_map_right = {}  # Store y positions for each country (right column)
-
-        # Calculate the y positions dynamically for the left column
-        for locality in left_column_cities:
-            country = final_dict[locality]['iso']
-
-            if country not in y_position_map_left:  # Add the country label once per country
-                y_position_map_left[country] = 1 - (current_row_left - 1) / (len(left_column_cities) * 2)
-
-            current_row_left += 2  # Increment the row for each locality (speed and time take two rows)
-
-        # Calculate the y positions dynamically for the right column
-        for locality in right_column_cities:
-            country = final_dict[locality]['iso']
-
-            if country not in y_position_map_right:  # Add the country label once per country
-                y_position_map_right[country] = 1 - (current_row_right - 1) / (len(right_column_cities) * 2)
-
-            current_row_right += 2  # Increment the row for each locality (speed and time take two rows)
-
-        fig.update_yaxes(
-            tickfont=dict(size=12, color="black"),
-            showticklabels=True,  # Ensure locality names are visible
-            ticklabelposition='inside',  # Move the tick labels inside the bars
-        )
-        fig.update_xaxes(
-            tickangle=0,  # No rotation or small rotation for the x-axis
-        )
-
-        # update font family
-        fig.update_layout(font=dict(family=common.get_configs('font_family')))
-
-        # Final adjustments and display
-        fig.update_layout(margin=dict(l=80, r=100, t=x_axis_title_height, b=180))
-        plots_io_class.save_plotly_figure(fig,
-                                          "crossings_with_traffic_equipment_avg",
-                                          width=2480,
-                                          height=TALL_FIG_HEIGHT,
-                                          scale=C.SCALE,
-                                          save_eps=False,
-                                          save_final=True)

@@ -59,17 +59,17 @@ class Mapping_Enrich:
             night_col = f"{col_prefix}_night_{label}"
             avg_col = f"{col_prefix}_day_night_{label}_avg"
 
-            # Ensure columns exist
+            # Ensure canonical output columns exist.
             for col in [day_col, night_col, avg_col]:
                 if col not in out.columns:
-                    out = out.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
+                    out = out.with_columns(
+                        pl.lit(None).cast(pl.Float64).alias(col)
+                    )
 
-            # Build an "updates" table from avg_dict
             updates_rows = []
 
-            iterator = avg_dict.items()
             iterator = tqdm(
-                iterator,
+                avg_dict.items(),
                 desc=f"{label.capitalize()} {cfg['value_type'].capitalize()}s",
                 total=len(avg_dict),
             )
@@ -85,8 +85,14 @@ class Mapping_Enrich:
                     except Exception:
                         continue
 
-                    # state lookup, same semantics as pandas version
-                    state = metadata_class.get_value(out, "locality", locality, "lat", lat, "state")
+                    state = metadata_class.get_value(
+                        out,
+                        "locality",
+                        locality,
+                        "lat",
+                        lat,
+                        "state",
+                    )
 
                     updates_rows.append({
                         "locality": locality,
@@ -101,13 +107,17 @@ class Mapping_Enrich:
 
                 updates = pl.DataFrame(updates_rows)
 
-                # Decide whether it goes to day or night column
                 updates = updates.with_columns([
-                    pl.when(pl.col("_tod") == 0).then(pl.col("_val")).otherwise(None).alias("_day"),
-                    pl.when(pl.col("_tod") == 1).then(pl.col("_val")).otherwise(None).alias("_night"),
+                    pl.when(pl.col("_tod") == 0)
+                    .then(pl.col("_val"))
+                    .otherwise(None)
+                    .alias("_day"),
+                    pl.when(pl.col("_tod") == 1)
+                    .then(pl.col("_val"))
+                    .otherwise(None)
+                    .alias("_night"),
                 ])
 
-                # Aggregate in case multiple entries per locality/lat/state (take last non-null)
                 updates = (
                     updates
                     .group_by(["locality", "lat", "_state_lookup"])
@@ -117,45 +127,72 @@ class Mapping_Enrich:
                     ])
                 )
 
-                # Join onto mapping. Replicate pandas mask logic:
-                # (state matches) OR (both missing)
-                #
-                # In mapping you may have null/NA; we treat:
-                # - mapping_state_str is a string; null stays null
-                # - update_state_str is a string; None stays null
-                out = out.with_columns([
-                    pl.col("state").cast(pl.Utf8, strict=False).alias("_state_str"),
-                ])
-                updates = updates.with_columns([
-                    pl.col("_state_lookup").cast(pl.Utf8, strict=False).alias("_state_str_upd"),
-                ])
+                # Match locality rows primarily by locality + latitude and
+                # then enforce the original state matching semantics.
+                out = out.with_columns(
+                    pl.col("state")
+                    .cast(pl.Utf8, strict=False)
+                    .alias("_state_str")
+                )
+                updates = updates.with_columns(
+                    pl.col("_state_lookup")
+                    .cast(pl.Utf8, strict=False)
+                    .alias("_state_str_upd")
+                )
 
-                # Join by locality+lat first (as the strong keys), then conditionally apply based on state match.
+                # The canonical day/night columns already exist in `out`, so
+                # the joined update values must use a suffix. The old code
+                # left those values in *_right columns and then accidentally
+                # read the original columns again. Use an explicit suffix and
+                # merge the joined values back into the canonical columns.
                 out = out.join(
-                    updates.select(["locality", "lat", "_state_str_upd", day_col, night_col]),
+                    updates.select([
+                        "locality",
+                        "lat",
+                        "_state_str_upd",
+                        day_col,
+                        night_col,
+                    ]),
                     on=["locality", "lat"],
                     how="left",
+                    suffix="_upd",
                 )
 
-                # Apply state-match semantics to day/night updates (otherwise keep existing)
                 state_match = (
                     (pl.col("_state_str") == pl.col("_state_str_upd"))
-                    | (pl.col("_state_str").is_null() & pl.col("_state_str_upd").is_null())
+                    | (
+                        pl.col("_state_str").is_null()
+                        & pl.col("_state_str_upd").is_null()
+                    )
                 )
 
+                day_update_col = f"{day_col}_upd"
+                night_update_col = f"{night_col}_upd"
+
                 out = out.with_columns([
-                    pl.when(state_match & pl.col(day_col).is_not_null())
-                      .then(pl.col(day_col))
-                      .otherwise(pl.col(day_col).fill_null(pl.col(day_col)))
-                      .alias(day_col),
-                    pl.when(state_match & pl.col(night_col).is_not_null())
-                      .then(pl.col(night_col))
-                      .otherwise(pl.col(night_col).fill_null(pl.col(night_col)))
-                      .alias(night_col),
+                    pl.when(
+                        state_match
+                        & pl.col(day_update_col).is_not_null()
+                    )
+                    .then(pl.col(day_update_col))
+                    .otherwise(pl.col(day_col))
+                    .alias(day_col),
+
+                    pl.when(
+                        state_match
+                        & pl.col(night_update_col).is_not_null()
+                    )
+                    .then(pl.col(night_update_col))
+                    .otherwise(pl.col(night_col))
+                    .alias(night_col),
                 ])
 
-                # Cleanup the joined helper column
-                out = out.drop(["_state_str", "_state_str_upd"])
+                out = out.drop([
+                    "_state_str",
+                    "_state_str_upd",
+                    day_update_col,
+                    night_update_col,
+                ])
 
             else:
                 # country keys: "{country}_{condition}"
@@ -181,41 +218,71 @@ class Mapping_Enrich:
                     continue
 
                 updates = pl.DataFrame(updates_rows).with_columns([
-                    pl.when(pl.col("_tod") == 0).then(pl.col("_val")).otherwise(None).alias(day_col),
-                    pl.when(pl.col("_tod") == 1).then(pl.col("_val")).otherwise(None).alias(night_col),
+                    pl.when(pl.col("_tod") == 0)
+                    .then(pl.col("_val"))
+                    .otherwise(None)
+                    .alias(day_col),
+                    pl.when(pl.col("_tod") == 1)
+                    .then(pl.col("_val"))
+                    .otherwise(None)
+                    .alias(night_col),
                 ])
 
                 updates = (
                     updates
                     .group_by(["country"])
                     .agg([
-                        pl.col(day_col).drop_nulls().last().alias(day_col),
-                        pl.col(night_col).drop_nulls().last().alias(night_col),
+                        pl.col(day_col)
+                        .drop_nulls()
+                        .last()
+                        .alias(day_col),
+                        pl.col(night_col)
+                        .drop_nulls()
+                        .last()
+                        .alias(night_col),
                     ])
                 )
 
-                out = out.join(updates, on="country", how="left", suffix="_upd")
+                out = out.join(
+                    updates,
+                    on="country",
+                    how="left",
+                    suffix="_upd",
+                )
 
-                # Merge joined values into existing columns (prefer new non-null)
                 out = out.with_columns([
-                    pl.coalesce([pl.col(f"{day_col}_upd"), pl.col(day_col)]).alias(day_col),
-                    pl.coalesce([pl.col(f"{night_col}_upd"), pl.col(night_col)]).alias(night_col),
-                ]).drop([f"{day_col}_upd", f"{night_col}_upd"])
+                    pl.coalesce([
+                        pl.col(f"{day_col}_upd"),
+                        pl.col(day_col),
+                    ]).alias(day_col),
+                    pl.coalesce([
+                        pl.col(f"{night_col}_upd"),
+                        pl.col(night_col),
+                    ]).alias(night_col),
+                ]).drop([
+                    f"{day_col}_upd",
+                    f"{night_col}_upd",
+                ])
 
-            # Compute avg_col with same semantics as numpy.where chain:
-            # if day>0 and night>0 => mean
-            # else if day>0 => day
-            # else if night>0 => night
-            # else null
+            # Compute combined day/night average:
+            # both > 0 -> mean
+            # only day > 0 -> day
+            # only night > 0 -> night
+            # otherwise -> null
             out = out.with_columns(
-                pl.when((pl.col(day_col) > 0) & (pl.col(night_col) > 0))
-                  .then((pl.col(day_col) + pl.col(night_col)) / 2)
-                  .when(pl.col(day_col) > 0)
-                  .then(pl.col(day_col))
-                  .when(pl.col(night_col) > 0)
-                  .then(pl.col(night_col))
-                  .otherwise(None)
-                  .alias(avg_col)
+                pl.when(
+                    (pl.col(day_col) > 0)
+                    & (pl.col(night_col) > 0)
+                )
+                .then(
+                    (pl.col(day_col) + pl.col(night_col)) / 2
+                )
+                .when(pl.col(day_col) > 0)
+                .then(pl.col(day_col))
+                .when(pl.col(night_col) > 0)
+                .then(pl.col(night_col))
+                .otherwise(None)
+                .alias(avg_col)
             )
 
         return out

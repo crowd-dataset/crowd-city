@@ -4039,393 +4039,351 @@ if __name__ == "__main__":
                                        traffic_sign_locality, all_speed, all_time, avg_time_locality,
                                        avg_speed_locality)
 
-        # Speed of crossing vs time to start crossing
-        df = (df_mapping.filter(
-                (pl.col("speed_crossing") != 0) &
-                (pl.col("time_crossing") != 0)
-            ).with_columns(
-                pl.col("state").fill_null("NA").alias("state")))
+        # ---------------------------------------------------------------------
+        # Locality-level bivariate plots
+        #
+        # The mapping enrichment pipeline now creates explicit locality-level
+        # columns such as:
+        #   speed_crossing_day_locality
+        #   speed_crossing_night_locality
+        #   speed_crossing_day_night_locality_avg
+        #   time_crossing_day_locality
+        #   time_crossing_night_locality
+        #   time_crossing_day_night_locality_avg
+        #
+        # This block intentionally stays Polars-native. Older versions of this
+        # section used legacy column names and Pandas-style DataFrame operations.
+        # ---------------------------------------------------------------------
 
-        bivariate.scatter(df=df,
-                          x="speed_crossing",
-                          y="time_crossing",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Relative crossing motion index',
-                          yaxis_title='Crossing initiation time (in s)',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.01,
-                          legend_y=1.0,
-                          label_distance_factor=3.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+        LOCALITY_SPEED = "speed_crossing_day_night_locality_avg"
+        LOCALITY_TIME = "time_crossing_day_night_locality_avg"
+        LOCALITY_SPEED_DAY = "speed_crossing_day_locality"
+        LOCALITY_SPEED_NIGHT = "speed_crossing_night_locality"
+        LOCALITY_TIME_DAY = "time_crossing_day_locality"
+        LOCALITY_TIME_NIGHT = "time_crossing_night_locality"
 
-        # Speed of crossing during daytime vs time to start crossing during daytime
-        df = df_mapping[df_mapping["speed_crossing_day"] != 0].copy()
-        df = df[df["time_crossing_day"] != 0]
-        df['state'] = df['state'].fillna('NA')
+        def _locality_scatter(
+            x: str,
+            y: str,
+            *,
+            xaxis_title: str,
+            yaxis_title: str,
+            legend_x: float = 0.87,
+            legend_y: float = 1.0,
+            label_distance_factor: float = 3.0,
+            source_df: Optional[pl.DataFrame] = None,
+        ) -> None:
+            # Create a locality scatter plot using current Polars columns.
+            base = df_mapping if source_df is None else source_df
 
-        bivariate.scatter(df=df,
-                          x="speed_crossing_day",
-                          y="time_crossing_day",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Relative crossing motion index during daytime',
-                          yaxis_title='Crossing initiation time during daytime (in s)',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.01,
-                          legend_y=1.0,
-                          label_distance_factor=3.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+            required = [x, y]
+            missing = [column for column in required if column not in base.columns]
+            if missing:
+                logger.warning(
+                    "Skipping locality scatter x={} y={}; missing columns: {}.",
+                    x,
+                    y,
+                    missing,
+                )
+                return
 
-        # Speed of crossing during night time vs time to start crossing during night time
-        df = df_mapping[df_mapping["speed_crossing_night"] != 0].copy()
-        df = df[df["time_crossing_night"] != 0]
-        df['state'] = df['state'].fillna('NA')
-        bivariate.scatter(df=df,
-                          x="speed_crossing_night",
-                          y="time_crossing_night",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Relative crossing motion index during night time',
-                          yaxis_title='Crossing initiation time during night time (in s)',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.87,
-                          legend_y=1.0,
-                          label_distance_factor=0.8,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+            # Cast only the plotted values so numeric strings and nullable
+            # numeric columns are handled consistently.
+            plot_df = base.with_columns(
+                [
+                    pl.col(x).cast(pl.Float64, strict=False).alias(x),
+                    pl.col(y).cast(pl.Float64, strict=False).alias(y),
+                ]
+            )
 
-        # Time to start crossing vs population of locality
-        df = df_mapping[df_mapping["time_crossing"] != 0].copy()
-        df = df[(df["population_locality"].notna()) & (df["population_locality"] != 0)]
-        df['state'] = df['state'].fillna('NA')
-        bivariate.scatter(df=df,
-                          x="time_crossing",
-                          y="population_locality",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Crossing initiation time (in s)',
-                          yaxis_title='Population of locality',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.87,
-                          legend_y=1.0,
-                          label_distance_factor=2.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+            plot_df = plot_df.filter(
+                pl.col(x).is_not_null()
+                & pl.col(y).is_not_null()
+                & pl.col(x).is_finite()
+                & pl.col(y).is_finite()
+                & (pl.col(x) != 0)
+                & (pl.col(y) != 0)
+            )
 
-        # Speed of crossing vs population of locality
-        df = df_mapping[df_mapping["speed_crossing"] != 0].copy()
-        df = df[(df["population_locality"].notna()) & (df["population_locality"] != 0)]
-        df['state'] = df['state'].fillna('NA')
-        bivariate.scatter(df=df,
-                          x="speed_crossing",
-                          y="population_locality",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Mean relative crossing motion index',
-                          yaxis_title='Population of locality',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.87,
-                          legend_y=1.0,
-                          label_distance_factor=3.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+            if "state" in plot_df.columns:
+                plot_df = plot_df.with_columns(
+                    pl.col("state").fill_null("NA").alias("state")
+                )
 
-        # Time to start crossing vs population of locality
-        df = df_mapping[df_mapping["time_crossing"] != 0].copy()
-        df = df[(df["traffic_mortality"].notna()) & (df["traffic_mortality"] != 0)]
-        df['state'] = df['state'].fillna('NA')
-        bivariate.scatter(df=df,
-                          x="time_crossing",
-                          y="traffic_mortality",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Crossing initiation time (in s)',
-                          yaxis_title='National traffic mortality rate (per 100,000 of population)',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.87,
-                          legend_y=1.0,
-                          label_distance_factor=3.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+            bivariate.scatter(
+                df=plot_df,
+                x=x,
+                y=y,
+                color="continent",
+                text="locality",
+                xaxis_title=xaxis_title,
+                yaxis_title=yaxis_title,
+                pretty_text=False,
+                marker_size=10,
+                save_file=True,
+                hover_data=hover_data,
+                hover_name="locality",
+                legend_title="",
+                legend_x=legend_x,
+                legend_y=legend_y,
+                label_distance_factor=label_distance_factor,
+                marginal_x=None,  # type: ignore
+                marginal_y=None,  # type: ignore
+            )
 
-        # Speed of crossing vs population of locality
-        df = df_mapping[df_mapping["speed_crossing"] != 0].copy()
-        df = df[(df["traffic_mortality"].notna()) & (df["traffic_mortality"] != 0)]
-        df['state'] = df['state'].fillna('NA')
-        bivariate.scatter(df=df,
-                          x="speed_crossing",
-                          y="traffic_mortality",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Mean relative crossing motion index',
-                          yaxis_title='National traffic mortality rate (per 100,000 of population)',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.87,
-                          legend_y=1.0,
-                          label_distance_factor=2.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+        # Mean crossing motion vs crossing initiation time
+        _locality_scatter(
+            LOCALITY_SPEED,
+            LOCALITY_TIME,
+            xaxis_title="Relative crossing motion index",
+            yaxis_title="Crossing initiation time (in s)",
+            legend_x=0.01,
+            legend_y=1.0,
+            label_distance_factor=3.0,
+        )
 
-        # Time to start crossing vs population of locality
-        df = df_mapping[df_mapping["time_crossing"] != 0].copy()
-        df = df[(df["literacy_rate"].notna()) & (df["literacy_rate"] != 0)]
-        df['state'] = df['state'].fillna('NA')
-        bivariate.scatter(df=df,
-                          x="time_crossing",
-                          y="literacy_rate",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Crossing initiation time (in s)',
-                          yaxis_title='Literacy rate',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.87,
-                          legend_y=0.01,
-                          label_distance_factor=3.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+        # Daytime crossing motion vs daytime crossing initiation time
+        _locality_scatter(
+            LOCALITY_SPEED_DAY,
+            LOCALITY_TIME_DAY,
+            xaxis_title="Relative crossing motion index during daytime",
+            yaxis_title="Crossing initiation time during daytime (in s)",
+            legend_x=0.01,
+            legend_y=1.0,
+            label_distance_factor=3.0,
+        )
 
-        # Speed of crossing vs population of locality
-        df = df_mapping[df_mapping["speed_crossing"] != 0].copy()
-        df = df[(df["literacy_rate"].notna()) & (df["literacy_rate"] != 0)]
-        df['state'] = df['state'].fillna('NA')
-        bivariate.scatter(df=df,
-                          x="speed_crossing",
-                          y="literacy_rate",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Mean relative crossing motion index',
-                          yaxis_title='Literacy rate',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.87,
-                          legend_y=0.01,
-                          label_distance_factor=3.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+        # Night-time crossing motion vs night-time crossing initiation time
+        _locality_scatter(
+            LOCALITY_SPEED_NIGHT,
+            LOCALITY_TIME_NIGHT,
+            xaxis_title="Relative crossing motion index during night time",
+            yaxis_title="Crossing initiation time during night time (in s)",
+            legend_x=0.87,
+            legend_y=1.0,
+            label_distance_factor=0.8,
+        )
 
-        # Time to start crossing vs population of locality
-        df = df_mapping[df_mapping["time_crossing"] != 0].copy()
-        df = df[(df["gini"].notna()) & (df["gini"] != 0)]
-        df['state'] = df['state'].fillna('NA')
-        bivariate.scatter(df=df,
-                          x="time_crossing",
-                          y="gini",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Crossing initiation time (in s)',
-                          yaxis_title='Gini coefficient',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.87,
-                          legend_y=1.0,
-                          label_distance_factor=3.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+        # Crossing initiation time vs locality population
+        _locality_scatter(
+            LOCALITY_TIME,
+            "population_locality",
+            xaxis_title="Crossing initiation time (in s)",
+            yaxis_title="Population of locality",
+            label_distance_factor=2.0,
+        )
 
-        # Speed of crossing vs population of locality
-        df = df_mapping[df_mapping["speed_crossing"] != 0].copy()
-        df = df[(df["gini"].notna()) & (df["gini"] != 0)]
-        df['state'] = df['state'].fillna('NA')
-        bivariate.scatter(df=df,
-                          x="speed_crossing",
-                          y="gini",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Mean relative crossing motion index',
-                          yaxis_title='Gini coefficient',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.87,
-                          legend_y=1.0,
-                          label_distance_factor=2.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+        # Crossing motion vs locality population
+        _locality_scatter(
+            LOCALITY_SPEED,
+            "population_locality",
+            xaxis_title="Mean relative crossing motion index",
+            yaxis_title="Population of locality",
+            label_distance_factor=3.0,
+        )
 
-        # Time to start crossing vs population of locality
-        df = df_mapping[df_mapping["time_crossing"] != 0].copy()
-        df = df[(df["traffic_index"].notna()) & (df["traffic_index"] != 0)]
-        df['state'] = df['state'].fillna('NA')
-        bivariate.scatter(df=df,
-                          x="time_crossing",
-                          y="traffic_index",
-                          color="continent",
-                          text="locality",
-                          # size="gmp",
-                          xaxis_title='Crossing initiation time (in s)',
-                          yaxis_title='Traffic index',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.87,
-                          legend_y=1.0,
-                          label_distance_factor=2.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+        # Crossing initiation time vs national traffic mortality
+        _locality_scatter(
+            LOCALITY_TIME,
+            "traffic_mortality",
+            xaxis_title="Crossing initiation time (in s)",
+            yaxis_title="National traffic mortality rate (per 100,000 of population)",
+            label_distance_factor=3.0,
+        )
 
-        # Speed of crossing vs population of locality
-        df = df_mapping[df_mapping["speed_crossing"] != 0].copy()
-        df = df[df["traffic_index"] != 0]
-        df['state'] = df['state'].fillna('NA')
-        bivariate.scatter(df=df,
-                          x="speed_crossing",
-                          y="traffic_index",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Mean relative crossing motion index',
-                          yaxis_title='Traffic index',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.87,
-                          legend_y=1.0,
-                          label_distance_factor=2.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+        # Crossing motion vs national traffic mortality
+        _locality_scatter(
+            LOCALITY_SPEED,
+            "traffic_mortality",
+            xaxis_title="Mean relative crossing motion index",
+            yaxis_title="National traffic mortality rate (per 100,000 of population)",
+            label_distance_factor=2.0,
+        )
 
-        # Speed of crossing vs detected mobile phones
-        df = df_mapping[df_mapping["time_crossing"] != 0].copy()
-        df['state'] = df['state'].fillna('NA')
-        df['cellphone_normalised'] = df['cellphone'] / df['total_time']
-        bivariate.scatter(df=df,
-                          x="time_crossing",
-                          y="cellphone_normalised",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Crossing initiation time (in s)',
-                          yaxis_title='Mobile phones detected (normalised over time)',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.87,
-                          legend_y=1.0,
-                          label_distance_factor=3.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+        # Crossing initiation time vs literacy rate
+        _locality_scatter(
+            LOCALITY_TIME,
+            "literacy_rate",
+            xaxis_title="Crossing initiation time (in s)",
+            yaxis_title="Literacy rate",
+            legend_x=0.87,
+            legend_y=0.01,
+            label_distance_factor=3.0,
+        )
 
-        # Speed of crossing vs detected mobile phones
-        df = df_mapping[df_mapping["speed_crossing"] != 0].copy()
-        df['state'] = df['state'].fillna('NA')
-        df['cellphone_normalised'] = df['cellphone'] / df['total_time']
-        bivariate.scatter(df=df,
-                          x="speed_crossing",
-                          y="cellphone_normalised",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Mean relative crossing motion index',
-                          yaxis_title='Mobile phones detected (normalised over time)',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.87,
-                          legend_y=1.0,
-                          label_distance_factor=3.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+        # Crossing motion vs literacy rate
+        _locality_scatter(
+            LOCALITY_SPEED,
+            "literacy_rate",
+            xaxis_title="Mean relative crossing motion index",
+            yaxis_title="Literacy rate",
+            legend_x=0.87,
+            legend_y=0.01,
+            label_distance_factor=3.0,
+        )
 
-        # Jaywalking
-        crossing.plot_crossing_without_traffic_light(df_mapping,
-                                                     x_axis_title_height=60,
-                                                     font_size_captions=common.get_configs("font_size"),
-                                                     legend_x=0.97,
-                                                     legend_y=1.0,
-                                                     legend_spacing=0.004)
-        crossing.plot_crossing_with_traffic_light(df_mapping,
-                                                  x_axis_title_height=60,
-                                                  font_size_captions=common.get_configs("font_size"),
-                                                  legend_x=0.97,
-                                                  legend_y=1.0,
-                                                  legend_spacing=0.004)
+        # Crossing initiation time vs Gini coefficient
+        _locality_scatter(
+            LOCALITY_TIME,
+            "gini",
+            xaxis_title="Crossing initiation time (in s)",
+            yaxis_title="Gini coefficient",
+            label_distance_factor=3.0,
+        )
 
-        # Crossing with and without traffic lights
-        df = df_mapping.copy()
-        df['state'] = df['state'].fillna('NA')
-        df['with_trf_light_norm'] = (df['with_trf_light_day'] + df['with_trf_light_night']) / df['total_time'] / df['population_locality']  # noqa: E501
-        df['without_trf_light_norm'] = (df['without_trf_light_day'] + df['without_trf_light_night']) / df['total_time'] / df['population_locality']  # noqa: E501
-        bivariate.scatter(df=df,
-                          x="with_trf_light_norm",
-                          y="without_trf_light_norm",
-                          color="continent",
-                          text="locality",
-                          xaxis_title='Crossing events with traffic lights (normalised)',
-                          yaxis_title='Crossing events without traffic lights (normalised)',
-                          pretty_text=False,
-                          marker_size=10,
-                          save_file=True,
-                          hover_data=hover_data,
-                          hover_name="locality",
-                          legend_title="",
-                          legend_x=0.87,
-                          legend_y=1.0,
-                          label_distance_factor=3.0,
-                          marginal_x=None,  # type: ignore
-                          marginal_y=None)  # type: ignore
+        # Crossing motion vs Gini coefficient
+        _locality_scatter(
+            LOCALITY_SPEED,
+            "gini",
+            xaxis_title="Mean relative crossing motion index",
+            yaxis_title="Gini coefficient",
+            label_distance_factor=2.0,
+        )
+
+        # Crossing initiation time vs traffic index
+        _locality_scatter(
+            LOCALITY_TIME,
+            "traffic_index",
+            xaxis_title="Crossing initiation time (in s)",
+            yaxis_title="Traffic index",
+            label_distance_factor=2.0,
+        )
+
+        # Crossing motion vs traffic index
+        _locality_scatter(
+            LOCALITY_SPEED,
+            "traffic_index",
+            xaxis_title="Mean relative crossing motion index",
+            yaxis_title="Traffic index",
+            label_distance_factor=2.0,
+        )
+
+        # Mobile-phone detections normalised by footage time
+        if {"cellphone", "total_time"} <= set(df_mapping.columns):
+            cellphone_df = df_mapping.with_columns(
+                pl.when(
+                    pl.col("total_time").cast(pl.Float64, strict=False) > 0
+                )
+                .then(
+                    pl.col("cellphone").cast(pl.Float64, strict=False)
+                    / pl.col("total_time").cast(pl.Float64, strict=False)
+                )
+                .otherwise(None)
+                .alias("cellphone_normalised")
+            )
+
+            _locality_scatter(
+                LOCALITY_TIME,
+                "cellphone_normalised",
+                xaxis_title="Crossing initiation time (in s)",
+                yaxis_title="Mobile phones detected (normalised over time)",
+                label_distance_factor=3.0,
+                source_df=cellphone_df,
+            )
+
+            _locality_scatter(
+                LOCALITY_SPEED,
+                "cellphone_normalised",
+                xaxis_title="Mean relative crossing motion index",
+                yaxis_title="Mobile phones detected (normalised over time)",
+                label_distance_factor=3.0,
+                source_df=cellphone_df,
+            )
+        else:
+            logger.warning(
+                "Skipping cellphone-normalised locality plots because "
+                "'cellphone' or 'total_time' is missing."
+            )
+
+        # Jaywalking / traffic-light plots
+        crossing.plot_crossing_without_traffic_light(
+            df_mapping,
+            x_axis_title_height=60,
+            font_size_captions=common.get_configs("font_size"),
+            legend_x=0.97,
+            legend_y=1.0,
+            legend_spacing=0.004,
+        )
+        crossing.plot_crossing_with_traffic_light(
+            df_mapping,
+            x_axis_title_height=60,
+            font_size_captions=common.get_configs("font_size"),
+            legend_x=0.97,
+            legend_y=1.0,
+            legend_spacing=0.004,
+        )
+
+        # Crossing events with and without traffic lights, normalised by
+        # footage time and locality population.
+        traffic_light_columns = {
+            "with_trf_light_day_locality",
+            "with_trf_light_night_locality",
+            "without_trf_light_day_locality",
+            "without_trf_light_night_locality",
+            "total_time",
+            "population_locality",
+        }
+
+        missing_traffic_light_columns = sorted(
+            traffic_light_columns - set(df_mapping.columns)
+        )
+
+        if not missing_traffic_light_columns:
+            total_time_expr = pl.col("total_time").cast(
+                pl.Float64, strict=False
+            )
+            population_expr = pl.col("population_locality").cast(
+                pl.Float64, strict=False
+            )
+            denominator = total_time_expr * population_expr
+
+            traffic_light_df = df_mapping.with_columns(
+                [
+                    pl.when(denominator > 0)
+                    .then(
+                        (
+                            pl.col("with_trf_light_day_locality")
+                            .cast(pl.Float64, strict=False)
+                            .fill_null(0)
+                            + pl.col("with_trf_light_night_locality")
+                            .cast(pl.Float64, strict=False)
+                            .fill_null(0)
+                        )
+                        / denominator
+                    )
+                    .otherwise(None)
+                    .alias("with_trf_light_norm"),
+                    pl.when(denominator > 0)
+                    .then(
+                        (
+                            pl.col("without_trf_light_day_locality")
+                            .cast(pl.Float64, strict=False)
+                            .fill_null(0)
+                            + pl.col("without_trf_light_night_locality")
+                            .cast(pl.Float64, strict=False)
+                            .fill_null(0)
+                        )
+                        / denominator
+                    )
+                    .otherwise(None)
+                    .alias("without_trf_light_norm"),
+                ]
+            )
+
+            _locality_scatter(
+                "with_trf_light_norm",
+                "without_trf_light_norm",
+                xaxis_title="Crossing events with traffic lights (normalised)",
+                yaxis_title="Crossing events without traffic lights (normalised)",
+                label_distance_factor=3.0,
+                source_df=traffic_light_df,
+            )
+        else:
+            logger.warning(
+                "Skipping locality traffic-light normalisation plot; "
+                "missing columns: {}.",
+                missing_traffic_light_columns,
+            )
 
     if analysis_level == "country":
         df_countries = aggregation.aggregate_by_iso3(df_mapping)
