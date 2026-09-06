@@ -9,9 +9,12 @@ those metrics via Grouping.locality_country_wrapper() using the mapping datafram
 Key design points
 -----------------
 - Uses a class-level cache so multiple downstream calls do not re-scan the filesystem or re-read CSVs.
-- Indexes CSV files once per compute run (fast lookup by filename/prefix).
-- Computes *rates per minute* for most object classes (unique object IDs per minute).
-- Computes a specialized "cellphones per person" normalized measure.
+- Captures small per-file aggregate counts when analysis.py reads each detection CSV for the first time.
+- Reuses those aggregates later so the normal analysis path does not read the same CSV files twice.
+- Falls back to reading a CSV when it was not observed during the main analysis pass.
+- Indexes CSV files once per compute run for fast lookup by filename/prefix.
+- Computes rates per minute for most object classes.
+- Computes a specialised cellphones-per-person normalised measure.
 
 Compatibility / linting
 -----------------------
@@ -52,6 +55,7 @@ YOLO_CELLPHONE = 67
 # ------------------------------------------------------------------------------
 UniqueValue = Union[str, Tuple[str, ...]]
 UniqueValues = Set[UniqueValue]
+FileMetricCounts = Dict[str, int]
 
 # ------------------------------------------------------------------------------
 # Shared helpers (external dependencies)
@@ -78,10 +82,165 @@ class MetricsCache:
     _all_metrics_cache is a dictionary mapping metric name -> wrapped output from Grouping.locality_country_wrapper().
     Example keys:
       "cellphones", "traffic_signs", "vehicles", "bicycles", "cars", "motorcycles", "buses", "trucks", "persons"
+
+    _file_metrics_cache stores only compact aggregate counts per CSV filename. It does not retain
+    the full detection DataFrame, so using the single-pass path has a small memory footprint.
     """
 
     # Class-level cache: avoids recomputation across calls within the same process.
     _all_metrics_cache: ClassVar[Dict[str, Any]] = {}
+
+    # Compact per-file metrics captured during the first pl.read_csv() call in analysis.py.
+    _file_metrics_cache: ClassVar[Dict[str, FileMetricCounts]] = {}
+
+    # Keep the original Polars reader so the fallback path can bypass the observer.
+    _original_read_csv: ClassVar[Any] = pl.read_csv
+    _read_observer_installed: ClassVar[bool] = False
+    _capture_min_confidence: ClassVar[Optional[float]] = None
+    _capture_roots: ClassVar[Tuple[str, ...]] = ()
+
+    def __init__(self) -> None:
+        self._install_read_observer()
+
+    # --------------------------------------------------------------------------
+    # Single-pass CSV observation
+    # --------------------------------------------------------------------------
+    @classmethod
+    def _install_read_observer(cls) -> None:
+        """Observe detection CSV reads and cache only the aggregate counts needed later.
+
+        analysis.py imports Polars as a module and calls ``pl.read_csv``. Polars modules are shared
+        within the Python process, so installing this light wrapper once lets MetricsCache see the
+        already-loaded detection DataFrame during the main analysis pass. The returned DataFrame is
+        unchanged.
+        """
+        if cls._read_observer_installed:
+            return
+
+        try:
+            cls._capture_min_confidence = float(common.get_configs("min_confidence"))
+        except Exception:
+            cls._capture_min_confidence = None
+
+        try:
+            data_folders = common.get_configs("data") or []
+            subfolders = common.get_configs("sub_domain") or []
+            cls._capture_roots = tuple(
+                os.path.realpath(os.path.join(os.fspath(folder), os.fspath(subfolder)))
+                for folder in data_folders
+                for subfolder in subfolders
+            )
+        except Exception:
+            cls._capture_roots = ()
+
+        original_read_csv = cls._original_read_csv
+
+        def observed_read_csv(source, *args, **kwargs):
+            dataframe = original_read_csv(source, *args, **kwargs)
+            try:
+                cls._record_loaded_dataframe(source, dataframe)
+            except Exception as exc:
+                # Metrics observation must never make an otherwise valid CSV read fail.
+                _LOGGER.debug("Could not capture metrics from %s: %s", source, exc)
+            return dataframe
+
+        pl.read_csv = observed_read_csv
+        cls._read_observer_installed = True
+
+    @classmethod
+    def _record_loaded_dataframe(cls, source: Any, dataframe: pl.DataFrame) -> None:
+        """Cache aggregate detection counts for a CSV that has already been read.
+
+        Non-detection CSV files, such as mapping.csv, are ignored automatically because they do not
+        contain the required YOLO columns.
+        """
+        try:
+            source_path = os.fspath(source)
+        except TypeError:
+            return
+
+        if not isinstance(source_path, str) or not source_path.lower().endswith(".csv"):
+            return
+
+        source_realpath = os.path.realpath(source_path)
+        if cls._capture_roots:
+            inside_data_root = False
+            for root in cls._capture_roots:
+                try:
+                    if os.path.commonpath([source_realpath, root]) == root:
+                        inside_data_root = True
+                        break
+                except ValueError:
+                    continue
+            if not inside_data_root:
+                return
+
+        required_cols = {"confidence", "yolo-id", "unique-id"}
+        if not required_cols.issubset(set(dataframe.columns)):
+            return
+
+        min_conf = cls._capture_min_confidence
+        if min_conf is None:
+            try:
+                min_conf = float(common.get_configs("min_confidence"))
+            except Exception:
+                return
+            cls._capture_min_confidence = min_conf
+
+        filtered = dataframe.filter(
+            pl.col("confidence").cast(pl.Float64, strict=False) >= float(min_conf)
+        )
+        cls._file_metrics_cache[os.path.basename(source_path)] = cls._metric_counts_from_dataframe(filtered)
+
+    @staticmethod
+    def _empty_metric_counts() -> FileMetricCounts:
+        """Return zero counts for all metrics expected by the aggregation path."""
+        return {
+            "persons": 0,
+            "cellphones": 0,
+            "traffic_signs": 0,
+            "vehicles": 0,
+            "bicycles": 0,
+            "cars": 0,
+            "motorcycles": 0,
+            "buses": 0,
+            "trucks": 0,
+        }
+
+    @classmethod
+    def _metric_counts_from_dataframe(cls, df: pl.DataFrame) -> FileMetricCounts:
+        """Compute all required unique-object counts in one Polars aggregation.
+
+        The aggregate definitions intentionally match the previous implementation. In particular,
+        traffic-sign and vehicle counts use ``n_unique`` across the combined class sets rather than
+        summing per-class counts, so tracker-ID overlap retains the existing behaviour.
+        """
+        required = {"yolo-id", "unique-id"}
+        if df.height == 0 or not required.issubset(set(df.columns)):
+            return cls._empty_metric_counts()
+
+        working = df.with_columns(
+            pl.col("yolo-id").cast(pl.Int64, strict=False).alias("_metric_yolo_id")
+        )
+        uid = pl.col("unique-id")
+        yolo = pl.col("_metric_yolo_id")
+
+        result = working.select([
+            uid.filter(yolo == YOLO_PERSON).n_unique().alias("persons"),
+            uid.filter(yolo == YOLO_CELLPHONE).n_unique().alias("cellphones"),
+            uid.filter(yolo.is_in(list(YOLO_TRAFFIC_SIGN_IDS))).n_unique().alias("traffic_signs"),
+            uid.filter(yolo.is_in([YOLO_CAR, YOLO_MOTORCYCLE, YOLO_BUS, YOLO_TRUCK])).n_unique().alias("vehicles"),
+            uid.filter(yolo == YOLO_BICYCLE).n_unique().alias("bicycles"),
+            uid.filter(yolo == YOLO_CAR).n_unique().alias("cars"),
+            uid.filter(yolo == YOLO_MOTORCYCLE).n_unique().alias("motorcycles"),
+            uid.filter(yolo == YOLO_BUS).n_unique().alias("buses"),
+            uid.filter(yolo == YOLO_TRUCK).n_unique().alias("trucks"),
+        ])
+
+        return {
+            name: int(result.item(0, name) or 0)
+            for name in cls._empty_metric_counts()
+        }
 
     # --------------------------------------------------------------------------
     # CSV indexing and parsing helpers
@@ -94,7 +253,7 @@ class MetricsCache:
         The mapping file may store values like:
           [abc]
           "[abc,def]"
-          ["abc","def"]
+          ["a","b"]
           []
         We treat any token matching [A-Za-z0-9_-]+ as an ID component.
         """
@@ -140,13 +299,7 @@ class MetricsCache:
 
     @staticmethod
     def _count_unique_objects(df: pl.DataFrame, yolo_ids: Iterable[int]) -> int:
-        """
-        Count unique 'unique-id' values where 'yolo-id' is in yolo_ids.
-
-        Notes:
-        - Casts columns defensively to handle string-typed CSV columns.
-        - Returns 0 if required columns are missing or result is empty.
-        """
+        """Count unique object IDs for compatibility with callers outside the fast path."""
         required = {"yolo-id", "unique-id"}
         if not required.issubset(set(df.columns)):
             return 0
@@ -155,7 +308,6 @@ class MetricsCache:
         if filtered.height == 0:
             return 0
 
-        # Polars scalar extraction: select -> item()
         return int(filtered.select(pl.col("unique-id").n_unique()).item())
 
     # --------------------------------------------------------------------------
@@ -166,16 +318,8 @@ class MetricsCache:
         """
         Compute and cache all metrics for the provided mapping DataFrame.
 
-        Expected df_mapping columns (minimum):
-          - videos
-          - start_time
-          - time_of_day
-
-        In addition, MetaData.find_values_with_video_id() must be able to locate:
-          - start timestamp (seconds)
-          - end timestamp (seconds)
-          - fps (frames per second)
-        from the mapping for a given key: "{vid}_{start_time}_{fps}"
+        The normal path reuses aggregate counts captured when analysis.py first loaded each detection
+        CSV. A disk read is performed only for files that were not observed during that first pass.
         """
         # 1) Build an index of available detection CSVs
         data_folders = common.get_configs("data")
@@ -194,6 +338,8 @@ class MetricsCache:
         persons_metric: Dict[str, float] = {}
 
         min_conf = float(common.get_configs("min_confidence"))
+        reused_files = 0
+        fallback_reads = 0
 
         # 3) Iterate mapping rows (Polars)
         mapping_iter = df_mapping.select(["videos", "start_time", "time_of_day"]).iter_rows(named=True)
@@ -205,27 +351,27 @@ class MetricsCache:
 
             video_ids = cls._parse_videos_cell(videos_cell)
 
-            # start_time/time_of_day appear to be stored as python-literal strings (lists of lists).
             try:
                 start_times = ast.literal_eval(start_time_cell) if isinstance(start_time_cell, str) else None
                 time_of_day = ast.literal_eval(time_of_day_cell) if isinstance(time_of_day_cell, str) else None
             except Exception:
-                # Malformed cells should not crash the run; skip this row.
                 continue
 
             if not (isinstance(start_times, list) and isinstance(time_of_day, list)):
                 continue
 
-            # Each mapping row may reference multiple vids; each vid has multiple segments.
             for vid, start_times_list, time_of_day_list in zip(video_ids, start_times, time_of_day):
                 if not isinstance(start_times_list, list) or not isinstance(time_of_day_list, list):
                     continue
 
                 for start_time, _tod in zip(start_times_list, time_of_day_list):
-                    # Identify a CSV by prefix {vid}_{start_time}_ then parse fps from the filename.
                     prefix = "%s_%s_" % (vid, start_time)
 
-                    matches = [fname for fname in csv_files.keys() if fname.startswith(prefix) and fname.endswith(".csv")]  # noqa: E501
+                    matches = [
+                        fname
+                        for fname in csv_files.keys()
+                        if fname.startswith(prefix) and fname.endswith(".csv")
+                    ]
                     if not matches:
                         _LOGGER.warning("[WARNING] File not found for prefix: %s", prefix)
                         continue
@@ -253,13 +399,10 @@ class MetricsCache:
                     if meta is None:
                         continue
 
-                    # NOTE: These indices come from your existing MetaData contract.
-                    # If you can change MetaData to return a dict/namedtuple, that will be safer.
                     start_sec = meta[1]
                     end_sec = meta[2]
                     fps_from_meta = meta[17]
 
-                    # Prefer the FPS from metadata if present/valid.
                     try:
                         fps_final = int(fps_from_meta)
                     except Exception:
@@ -275,43 +418,41 @@ class MetricsCache:
 
                     video_key = "%s_%s_%s" % (vid, start_time, fps_final)
 
-                    # 5) Read detection CSV and filter by confidence
-                    try:
-                        df = pl.read_csv(file_path)
-                    except Exception as exc:
-                        _LOGGER.warning("[WARNING] Failed reading %s: %s", file_path, exc)
-                        continue
+                    # 5) Reuse aggregate counts captured during analysis.py's first CSV pass.
+                    counts = cls._file_metrics_cache.get(filename)
+                    if counts is not None:
+                        reused_files += 1
+                    else:
+                        # Preserve previous behaviour for files that were skipped or otherwise not
+                        # observed in the main pass.
+                        try:
+                            df = cls._original_read_csv(file_path)
+                        except Exception as exc:
+                            _LOGGER.warning("[WARNING] Failed reading %s: %s", file_path, exc)
+                            continue
 
-                    required_cols = {"confidence", "yolo-id", "unique-id"}
-                    if not required_cols.issubset(set(df.columns)):
-                        continue
+                        required_cols = {"confidence", "yolo-id", "unique-id"}
+                        if not required_cols.issubset(set(df.columns)):
+                            continue
 
-                    df = df.filter(pl.col("confidence").cast(pl.Float64, strict=False) >= min_conf)
-                    if df.height == 0:
-                        # Nothing above threshold; still record zeros for rate metrics.
-                        traffic_signs_metric[video_key] = 0.0
-                        vehicles_metric[video_key] = 0.0
-                        bicycles_metric[video_key] = 0.0
-                        cars_metric[video_key] = 0.0
-                        motorcycles_metric[video_key] = 0.0
-                        buses_metric[video_key] = 0.0
-                        trucks_metric[video_key] = 0.0
-                        persons_metric[video_key] = 0.0
-                        continue
+                        df = df.filter(
+                            pl.col("confidence").cast(pl.Float64, strict=False) >= min_conf
+                        )
+                        counts = cls._metric_counts_from_dataframe(df)
+                        cls._file_metrics_cache[filename] = counts
+                        fallback_reads += 1
 
-                    # 6) Compute unique counts
-                    persons = cls._count_unique_objects(df, [YOLO_PERSON])
-                    cellphones = cls._count_unique_objects(df, [YOLO_CELLPHONE])
+                    persons = counts["persons"]
+                    cellphones = counts["cellphones"]
+                    traffic_signs = counts["traffic_signs"]
+                    vehicles = counts["vehicles"]
+                    bicycles = counts["bicycles"]
+                    cars = counts["cars"]
+                    motorcycles = counts["motorcycles"]
+                    buses = counts["buses"]
+                    trucks = counts["trucks"]
 
-                    traffic_signs = cls._count_unique_objects(df, YOLO_TRAFFIC_SIGN_IDS)
-                    vehicles = cls._count_unique_objects(df, [YOLO_CAR, YOLO_MOTORCYCLE, YOLO_BUS, YOLO_TRUCK])
-                    bicycles = cls._count_unique_objects(df, [YOLO_BICYCLE])
-                    cars = cls._count_unique_objects(df, [YOLO_CAR])
-                    motorcycles = cls._count_unique_objects(df, [YOLO_MOTORCYCLE])
-                    buses = cls._count_unique_objects(df, [YOLO_BUS])
-                    trucks = cls._count_unique_objects(df, [YOLO_TRUCK])
-
-                    # 7) Convert to per-minute rates (unique objects per minute)
+                    # 6) Convert to per-minute rates (unique objects per minute)
                     per_min = 60.0 / duration
 
                     traffic_signs_metric[video_key] = float(traffic_signs) * per_min
@@ -323,13 +464,19 @@ class MetricsCache:
                     trucks_metric[video_key] = float(trucks) * per_min
                     persons_metric[video_key] = float(persons) * per_min
 
-                    # 8) Cellphones metric: per-person normalized measure
-                    # Your original formula:
-                    #   avg_cellphone = ((cellphones * 60) / duration / persons) * 1000
+                    # 7) Cellphones metric: per-person normalised measure.
                     if persons > 0 and cellphones > 0:
-                        cellphone_metric[video_key] = ((float(cellphones) * 60.0) / duration / float(persons)) * 1000.0
+                        cellphone_metric[video_key] = (
+                            (float(cellphones) * 60.0) / duration / float(persons)
+                        ) * 1000.0
 
-        # 9) Wrap metrics with grouping layer and store into the class cache
+        _LOGGER.info(
+            "MetricsCache reused first-pass aggregates for %s CSV files; fallback disk reads: %s.",
+            reused_files,
+            fallback_reads,
+        )
+
+        # 8) Wrap metrics with grouping layer and store into the class cache
         metric_layers: List[Tuple[str, Dict[str, float]]] = [
             ("cellphones", cellphone_metric),
             ("traffic_signs", traffic_signs_metric),
@@ -358,6 +505,12 @@ class MetricsCache:
         """Compute metrics if cache is empty."""
         if not cls._all_metrics_cache:
             cls._compute_all_metrics(df_mapping)
+
+    @classmethod
+    def clear_cache(cls) -> None:
+        """Clear wrapped metrics and captured per-file aggregates."""
+        cls._all_metrics_cache.clear()
+        cls._file_metrics_cache.clear()
 
     # --------------------------------------------------------------------------
     # Public API: metric getters
@@ -434,19 +587,21 @@ class MetricsCache:
         """
         cols = list(value) if isinstance(value, (list, tuple)) else [value]
 
-        key_exprs = [pl.col(c).cast(pl.Utf8).fill_null(null_placeholder).alias(c) for c in cols]  # type: ignore
+        key_exprs = [
+            pl.col(c).cast(pl.Utf8).fill_null(null_placeholder).alias(c)
+            for c in cols
+        ]
         keys_only = df.select(key_exprs)
 
-        # Build as UniqueValues explicitly so Pylance does not infer set[Any] unions.
         unique_values: UniqueValues = set()
 
         if len(cols) == 1:
-            series = keys_only.get_column(cols[0])  # type: ignore
-            for v in series.unique().to_list():
-                unique_values.add(str(v))
+            series = keys_only.get_column(cols[0])
+            for value_item in series.unique().to_list():
+                unique_values.add(str(value_item))
         else:
             for row in keys_only.unique().rows():
-                unique_values.add(tuple(str(v) for v in row))
+                unique_values.add(tuple(str(value_item) for value_item in row))
 
         dup_report: Optional[pl.DataFrame] = None
         if return_duplicates:

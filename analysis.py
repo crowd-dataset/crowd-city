@@ -2838,13 +2838,13 @@ if __name__ == "__main__":
                             crossing_parameters.pop(
                                 "boundary_left",
                                 common.get_configs("boundary_left"),
-                            )
+                            )  # pyright: ignore[reportArgumentType]
                         )
                         boundary_right = float(
                             crossing_parameters.pop(
                                 "boundary_right",
                                 common.get_configs("boundary_right"),
-                            )
+                            )  # pyright: ignore[reportArgumentType]
                         )
                         ids, all_ids = detection.pedestrian_crossing(
                             df,
