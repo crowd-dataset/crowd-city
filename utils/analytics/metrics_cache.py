@@ -294,6 +294,41 @@ class MetricsCache:
         return csv_index
 
     @staticmethod
+    def _index_csv_segments(
+        csv_files: Dict[str, str],
+    ) -> Dict[Tuple[str, str], List[Tuple[str, str, int]]]:
+        """Build ``(video, start)`` -> CSV records in one linear pass.
+
+        The previous metric path scanned every CSV filename for every mapped
+        segment. This secondary index makes each segment lookup O(1) average
+        time while preserving the original first-match ordering.
+        """
+        segment_index: Dict[
+            Tuple[str, str],
+            List[Tuple[str, str, int]],
+        ] = {}
+
+        for filename, file_path in csv_files.items():
+            if not filename.lower().endswith(".csv"):
+                continue
+
+            stem = os.path.splitext(filename)[0]
+            try:
+                video_id, start_text, fps_text = stem.rsplit("_", 2)
+                if not fps_text.isdigit():
+                    continue
+                fps = int(fps_text)
+            except (TypeError, ValueError):
+                continue
+
+            segment_index.setdefault(
+                (str(video_id), str(start_text)),
+                [],
+            ).append((filename, file_path, fps))
+
+        return segment_index
+
+    @staticmethod
     def _extract_fps_from_filename(vid: str, start_time: str, filename: str) -> Optional[int]:
         """
         Extract FPS from filenames matching:
@@ -336,6 +371,8 @@ class MetricsCache:
         data_folders = common.get_configs("data")
         subfolders = common.get_configs("sub_domain")
         csv_files = cls._index_csv_files(data_folders, subfolders)
+        csv_segments = cls._index_csv_segments(csv_files)
+        mapping_segments = _METADATA.segment_lookup(df_mapping)
 
         # 2) Prepare metric layers as raw per-video dictionaries (video_key -> metric_value)
         cellphone_metric: Dict[str, float] = {}
@@ -377,56 +414,42 @@ class MetricsCache:
 
                 for start_time, _tod in zip(start_times_list, time_of_day_list):
                     prefix = f"{vid}_{start_time}_"
-
-                    matches = [
-                        fname
-                        for fname in csv_files.keys()
-                        if fname.startswith(prefix) and fname.endswith(".csv")
-                    ]
+                    matches = csv_segments.get(
+                        (str(vid), str(start_time)),
+                        [],
+                    )
                     if not matches:
-                        _LOGGER.warning(f"[WARNING] File not found for prefix: {prefix}")
+                        _LOGGER.warning(
+                            f"[WARNING] File not found for prefix: {prefix}"
+                        )
                         continue
 
                     if len(matches) > 1:
                         _LOGGER.warning(
                             f"[WARNING] Multiple files found for prefix: {prefix}, "
-                            f"using first: {matches[0]}"
+                            f"using first: {matches[0][0]}"
                         )
 
-                    fps = cls._extract_fps_from_filename(str(vid), str(start_time), matches[0])
-                    if fps is None:
-                        _LOGGER.error(f"[ERROR] Could not extract fps from filename: {matches[0]}")
-                        continue
+                    filename, file_path, fps = matches[0]
 
-                    filename = f"{vid}_{start_time}_{fps}.csv"
-                    file_path = csv_files.get(filename)
-                    if not file_path:
-                        continue
-
-                    # 4) Use mapping metadata to compute segment duration
-                    key_for_meta = f"{vid}_{start_time}_{fps}"
-                    meta = _METADATA.find_values_with_video_id(df_mapping, key_for_meta)
-                    if meta is None:
-                        continue
-
-                    start_sec = meta[1]
-                    end_sec = meta[2]
-                    fps_from_meta = meta[17]
-
+                    # 4) Reuse the mapping segment dictionary built once for
+                    # this DataFrame instead of reparsing metadata per segment.
                     try:
-                        fps_final = int(fps_from_meta)
-                    except Exception:
-                        fps_final = fps
-
-                    try:
-                        duration = float(end_sec) - float(start_sec)  # type: ignore
-                    except Exception:
+                        start_key = int(str(start_time))
+                    except (TypeError, ValueError):
                         continue
 
+                    segment_meta = mapping_segments.get(
+                        (str(vid), start_key)
+                    )
+                    if segment_meta is None:
+                        continue
+
+                    duration = float(segment_meta[1])
                     if duration <= 0:
                         continue
 
-                    video_key = f"{vid}_{start_time}_{fps_final}"
+                    video_key = f"{vid}_{start_time}_{fps}"
 
                     # 5) Reuse aggregate counts captured during analysis.py's first CSV pass.
                     counts = cls._file_metrics_cache.get(filename)

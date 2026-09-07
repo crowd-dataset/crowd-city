@@ -7,12 +7,12 @@ objects to the parent process. Shared aggregation remains in analysis.py.
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Any, Dict, Optional
 
 import polars as pl
 
-from utils.analytics.durations import Duration
 from utils.crossing.detection import Detection
 from utils.crossing.metrics import Metrics
 import utils.crossing.metrics as crossing_metrics_module
@@ -26,7 +26,6 @@ _WORKER_BOUNDARY_RIGHT: float = 0.55
 
 _DETECTION = Detection()
 _METRICS = Metrics()
-_DURATION = Duration()
 
 YOLO_PERSON = 0
 YOLO_BICYCLE = 1
@@ -134,6 +133,157 @@ def _metric_counts_from_confidence_filtered(df: pl.DataFrame) -> Dict[str, int]:
     }
 
 
+TrackIndex = Dict[Any, pl.DataFrame]
+
+
+def _build_track_index(df: pl.DataFrame) -> TrackIndex:
+    """Build reusable tracks only for IDs that contain a person detection.
+
+    Timing historically selected rows by ``unique-id`` alone, so if a tracker
+    ID also contains another class those rows are intentionally retained.
+    IDs that never represent a person are excluded because crossing code never
+    queries them.
+    """
+    required = {"yolo-id", "unique-id", "frame-count"}
+    if df.height == 0 or not required.issubset(set(df.columns)):
+        return {}
+
+    person_ids = (
+        df
+        .filter(pl.col("yolo-id") == YOLO_PERSON)
+        .select("unique-id")
+        .unique()
+        .get_column("unique-id")
+    )
+    if len(person_ids) == 0:
+        return {}
+
+    ordered = (
+        df
+        .filter(pl.col("unique-id").is_in(person_ids))
+        .sort(["unique-id", "frame-count"])
+    )
+    track_index: TrackIndex = {}
+
+    for track in ordered.partition_by(
+        "unique-id",
+        maintain_order=True,
+    ):
+        if track.height == 0:
+            continue
+        unique_id = track.get_column("unique-id")[0]
+        track_index[unique_id] = track
+
+    return track_index
+
+
+def _track(
+    track_index: TrackIndex,
+    track_id: Any,
+) -> Optional[pl.DataFrame]:
+    """Return the cached rows for one tracker ID."""
+    return track_index.get(track_id)
+
+
+def _time_to_cross_from_track_index(
+    track_index: TrackIndex,
+    ids: list,
+    fps: float,
+) -> Dict[Any, float]:
+    """Match Metrics.time_to_cross without filtering and sorting per ID."""
+    if not ids or not math.isfinite(float(fps)) or float(fps) <= 0:
+        return {}
+
+    output: Dict[Any, float] = {}
+    for track_id in ids:
+        track = _track(track_index, track_id)
+        if track is None or track.height < 2 or "frame-count" not in track.columns:
+            continue
+
+        frames = []
+        for value in track.get_column("frame-count").to_list():
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric):
+                frames.append(numeric)
+
+        if len(frames) < 2:
+            continue
+
+        duration = (max(frames) - min(frames)) / float(fps)
+        if duration > 0:
+            output[track_id] = float(duration)
+
+    return output
+
+
+def _time_to_start_from_track_index(
+    mapping: pl.DataFrame,
+    track_index: TrackIndex,
+    track_ids: list,
+    source_id: str,
+    fps: float,
+):
+    """Match waiting time calculation while reusing already sorted tracks."""
+    if not track_ids or not math.isfinite(float(fps)) or float(fps) <= 0:
+        return None
+
+    checks_per_second = _METRICS._as_float(
+        _METRICS._get_config("check_per_sec_time", 3),
+        3,
+    )
+    if checks_per_second is None or checks_per_second <= 0:
+        return None
+
+    step = max(1, int(round(float(fps) / checks_per_second)))
+    durations: Dict[Any, int] = {}
+
+    for track_id in track_ids:
+        track = _track(track_index, track_id)
+        if track is None or track.height <= step:
+            continue
+        if not {"x-center", "height"}.issubset(set(track.columns)):
+            continue
+
+        x_values = track.get_column("x-center").cast(
+            pl.Float64,
+            strict=False,
+        ).to_numpy()
+        heights = track.get_column("height").cast(
+            pl.Float64,
+            strict=False,
+        ).drop_nulls()
+        if not len(x_values) or heights.len() == 0:
+            continue
+
+        margin = 0.1 * float(heights.median())
+        stable_samples = 0
+        for index in range(0, len(x_values) - step, step):
+            delta = abs(
+                float(x_values[index + step])
+                - float(x_values[index])
+            )
+            if delta <= margin:
+                stable_samples += 1
+            elif stable_samples >= 3:
+                break
+            else:
+                stable_samples = 0
+
+        if stable_samples >= 3:
+            durations[track_id] = stable_samples
+
+    if not durations:
+        return None
+
+    return crossing_metrics_module.grouping_class.locality_country_wrapper(
+        input_dict={source_id: durations},
+        mapping=mapping,
+    )
+
+
 def _object_counts(df: pl.DataFrame) -> Dict[str, int]:
     """Match the legacy per CSV COCO object counting path."""
     if df.height == 0:
@@ -175,8 +325,6 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
     file_path = os.fspath(task["file_path"])
     file_name = str(task["file_name"])
     filename_no_ext = str(task["filename_no_ext"])
-    video_id = str(task["video_id"])
-    start_index = int(task["start_index"])
     fps = float(task["fps"])
     locality_id = int(task["video_locality_id"])
     is_bbox_stream = bool(task["is_bbox_stream"])
@@ -213,6 +361,7 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
             & (pl.col("unique-id") != -1)
         )
 
+        track_index = _build_track_index(df) if is_bbox_stream else {}
         object_counts = _object_counts(df)
 
         ids = []
@@ -244,14 +393,14 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 boundary_right,
                 person_id=0,
                 fps=fps,
+                track_index=track_index,
                 **crossing_parameters,
             )
 
-            temp_data = _METRICS.time_to_cross(
-                df,
+            temp_data = _time_to_cross_from_track_index(
+                track_index,
                 ids,
-                filename_no_ext,
-                mapping,
+                fps,
             )
 
             speed_value = _METRICS.calculate_speed_of_crossing(
@@ -260,17 +409,15 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 {filename_no_ext: temp_data},
             )
 
-            time_value = _METRICS.time_to_start_cross(
+            time_value = _time_to_start_from_track_index(
                 mapping,
-                df,
-                {filename_no_ext: temp_data},
+                track_index,
+                list(temp_data.keys()),
+                filename_no_ext,
+                fps,
             )
 
-        time_video = _DURATION.get_duration(
-            mapping,
-            video_id,
-            start_index,
-        )
+        time_video = float(task.get("time_video", 0.0) or 0.0)
 
         return {
             "status": "ok",

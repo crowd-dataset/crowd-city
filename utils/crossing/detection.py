@@ -151,7 +151,8 @@ class Detection:
                             min_static_shared_frames: int = 8,
                             long_weak_road_frames: int = 90,
                             jitter_road_frames: int = 40,
-                            camera_min_road_frames: int = 5
+                            camera_min_road_frames: int = 5,
+                            track_index: Optional[dict[Any, pl.DataFrame]] = None
                             ) -> Tuple[List[Any], List[Any]]:
         """
         Identifies pedestrian tracks that satisfy a road-crossing criterion and filters false positives.
@@ -187,17 +188,63 @@ class Detection:
         rider_min_motion_steps_s = Detection._scale_frames(3, fps_value, base_fps_value, minimum=1)
         rider_short_shared_frames_s = Detection._scale_frames(8, fps_value, base_fps_value, minimum=1)
 
-        crossed_df = dataframe.filter(pl.col("yolo-id") == 0)
-        if crossed_df.height == 0:
-            return [], []
+        track_partitions: List[pl.DataFrame] = []
 
-        crossed_df = Detection._dedup_per_frame(crossed_df)
+        if track_index is not None:
+            # The worker has already partitioned the complete CSV once. Reuse
+            # those person tracks here instead of filtering, sorting and
+            # partitioning the full person table again.
+            for raw_track in track_index.values():
+                if raw_track.height == 0:
+                    continue
+                person_track = raw_track.filter(
+                    pl.col("yolo-id") == int(person_id)
+                )
+                if person_track.height == 0:
+                    continue
+                prepared = Detection._dedup_per_frame(person_track)
+                prepared = (
+                    prepared
+                    .select([
+                        "unique-id",
+                        "frame-count",
+                        "x-center",
+                        "y-center",
+                        "width",
+                        "height",
+                    ])
+                    .sort("frame-count")
+                )
+                if prepared.height > 0:
+                    track_partitions.append(prepared)
+        else:
+            crossed_df = dataframe.filter(pl.col("yolo-id") == 0)
+            if crossed_df.height == 0:
+                return [], []
 
-        tracks = (
-            crossed_df.select(["unique-id", "frame-count", "x-center", "y-center", "width", "height"])
-            .sort(["unique-id", "frame-count"])
-        )
-        if tracks.height == 0:
+            crossed_df = Detection._dedup_per_frame(crossed_df)
+
+            tracks = (
+                crossed_df
+                .select([
+                    "unique-id",
+                    "frame-count",
+                    "x-center",
+                    "y-center",
+                    "width",
+                    "height",
+                ])
+                .sort(["unique-id", "frame-count"])
+            )
+            if tracks.height == 0:
+                return [], []
+
+            track_partitions = tracks.partition_by(
+                "unique-id",
+                maintain_order=True,
+            )
+
+        if not track_partitions:
             return [], []
 
         left_hard = float(min_x) - float(tol)
@@ -287,13 +334,6 @@ class Detection:
         candidate_segments: List[Tuple[Any, int, int, float, float, int, float, float, float]] = []
         crossed_ids: List[Any] = []
         crossed_ids_seen = set()
-
-        # Partition the already sorted person tracks once rather than scanning
-        # the complete track table for every unique tracker ID.
-        track_partitions = tracks.partition_by(
-            "unique-id",
-            maintain_order=True,
-        )
 
         for tr in track_partitions:
             if tr.height == 0:

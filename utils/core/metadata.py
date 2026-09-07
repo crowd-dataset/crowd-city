@@ -80,12 +80,16 @@ class MetaData:
         cls._video_index_cache.clear()
 
     @classmethod
-    def _build_video_index(
+    def _build_indexes(
         cls,
         df: pl.DataFrame,
-    ) -> dict[tuple[str, int], tuple[Any, ...]]:
-        """Parse the mapping once and index all segments by video and start time."""
-        index: dict[tuple[str, int], tuple[Any, ...]] = {}
+    ) -> tuple[
+        dict[tuple[str, int], tuple[Any, ...]],
+        dict[tuple[str, int], tuple[Any, float]],
+    ]:
+        """Parse the mapping once and build all hot-path segment indexes."""
+        metadata_index: dict[tuple[str, int], tuple[Any, ...]] = {}
+        segment_index: dict[tuple[str, int], tuple[Any, float]] = {}
 
         for row in df.iter_rows(named=True):
             video_ids = cls._parse_videos_cell(row.get("videos"))
@@ -172,43 +176,78 @@ class MetaData:
                         vtype_list,            # 17, returned at position 18
                     )
 
+                    segment_key = (str(video), start_key)
+
                     # The old row scan returned the first match. setdefault
                     # preserves exactly that behaviour for duplicate keys.
-                    index.setdefault(
-                        (str(video), start_key),
+                    metadata_index.setdefault(
+                        segment_key,
                         metadata_without_fps,
                     )
 
-        return index
+                    try:
+                        duration_seconds = float(end_val) - float(start_value)
+                    except (TypeError, ValueError):
+                        duration_seconds = 0.0
+
+                    segment_index.setdefault(
+                        segment_key,
+                        (row.get("id"), float(duration_seconds)),
+                    )
+
+        return metadata_index, segment_index
 
     @classmethod
-    def _video_index(
+    def _indexes(
         cls,
         df: pl.DataFrame,
-    ) -> dict[tuple[str, int], tuple[Any, ...]]:
-        """Return the cached segment index for this exact DataFrame object."""
+    ) -> tuple[
+        dict[tuple[str, int], tuple[Any, ...]],
+        dict[tuple[str, int], tuple[Any, float]],
+    ]:
+        """Return cached metadata and segment indexes for this DataFrame."""
         cache_key = id(df)
         cached = cls._video_index_cache.get(cache_key)
 
         if cached is not None:
-            cached_df, index = cached
+            cached_df, metadata_index, segment_index = cached
             if cached_df is df:
                 cls._video_index_cache.move_to_end(cache_key)
-                return index
+                return metadata_index, segment_index
             del cls._video_index_cache[cache_key]
 
-        index = cls._build_video_index(df)
-        cls._video_index_cache[cache_key] = (df, index)
+        metadata_index, segment_index = cls._build_indexes(df)
+        cls._video_index_cache[cache_key] = (
+            df,
+            metadata_index,
+            segment_index,
+        )
         cls._video_index_cache.move_to_end(cache_key)
 
         while len(cls._video_index_cache) > cls._max_cached_dataframes:
             cls._video_index_cache.popitem(last=False)
 
         logger.debug(
-            f"Built metadata index for {df.height} mapping rows "
-            f"with {len(index)} video segments."
+            f"Built metadata indexes for {df.height} mapping rows "
+            f"with {len(metadata_index)} video segments."
         )
-        return index
+        return metadata_index, segment_index
+
+    @classmethod
+    def _video_index(
+        cls,
+        df: pl.DataFrame,
+    ) -> dict[tuple[str, int], tuple[Any, ...]]:
+        """Return the cached metadata index for this exact DataFrame object."""
+        return cls._indexes(df)[0]
+
+    @classmethod
+    def segment_lookup(
+        cls,
+        df: pl.DataFrame,
+    ) -> dict[tuple[str, int], tuple[Any, float]]:
+        """Return ``(video, start) -> (locality id, duration seconds)``."""
+        return cls._indexes(df)[1]
 
     def find_values_with_video_id(self, df: pl.DataFrame, key: str):
         """Return metadata for ``video_id_start_time_fps`` in constant time after indexing."""

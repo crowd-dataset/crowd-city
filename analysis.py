@@ -36,6 +36,7 @@ from utils.analytics.csv_parallel import (
     process_csv_task,
 )
 from utils.core.dataset_stats import Dataset_Stats
+from utils.core.metadata import MetaData
 from utils.core.tools import Tools
 from utils.crossing.detection import Detection
 from utils.crossing.metrics import Metrics
@@ -62,6 +63,7 @@ logger = CustomLogger(__name__)  # use custom logger
 # ---------------------------------------------------------------------
 
 tools = Tools()
+metadata = MetaData()
 maps = Maps()
 bivariate = Bivariate()
 stacked = Stacked()
@@ -1950,6 +1952,13 @@ def _build_integrated_speed_sources(
     if not math.isfinite(aspect_ratio) or aspect_ratio <= 0.0:
         aspect_ratio = 16.0 / 9.0
 
+    segment_lookup = metadata.segment_lookup(df_mapping_source)
+    location_by_id: Dict[int, dict] = {
+        int(row["id"]): row
+        for row in df_mapping_source.iter_rows(named=True)
+        if row.get("id") is not None
+    }
+
     output: list[dict[str, object]] = []
     for source_id, payload in crossing_tracks.items():
         bbox_csv = csv_by_source.get(str(source_id))
@@ -1967,16 +1976,16 @@ def _build_integrated_speed_sources(
                 f"Crossing motion report expected video_start_fps but received {source_id}; skipping."
             )
             continue
-        locality_id = geo.find_locality_id(df_mapping_source, video_id, start_index)
+        segment_meta = segment_lookup.get((video_id, start_index))
+        locality_id = segment_meta[0] if segment_meta is not None else None
         if locality_id is None:
             logger.warning(
                 f"Crossing motion report cannot map {source_id} to a CROWD city; skipping."
             )
             continue
-        location = df_mapping_source.filter(pl.col("id") == locality_id).head(1)
-        if location.height == 0:
+        row = location_by_id.get(int(locality_id))
+        if row is None:
             continue
-        row = location.row(0, named=True)
         ids: object = []
         if isinstance(payload, dict):
             ids = payload.get("ids", [])
@@ -2768,6 +2777,10 @@ if __name__ == "__main__":
             for row_id, locality, state, country in df_mapping.select(["id", "locality", "state", "country"]).iter_rows()  # noqa: E501
         }
 
+        # Parse mapping segment metadata once. All CSV task lookups below are
+        # direct dictionary accesses rather than row scans plus ast parsing.
+        segment_lookup = metadata.segment_lookup(df_mapping)
+
         all_speed = {}
         all_time = {}
 
@@ -2826,10 +2839,18 @@ if __name__ == "__main__":
                         )
                         continue
 
-                    video_locality_id = geo.find_locality_id(
-                        df_mapping,
-                        video_id,
-                        start_index,
+                    segment_meta = segment_lookup.get(
+                        (video_id, start_index)
+                    )
+                    video_locality_id = (
+                        segment_meta[0]
+                        if segment_meta is not None
+                        else None
+                    )
+                    time_video = (
+                        float(segment_meta[1])
+                        if segment_meta is not None
+                        else 0.0
                     )
 
                     place = (
@@ -2859,6 +2880,7 @@ if __name__ == "__main__":
                             "start_index": start_index,
                             "fps": fps,
                             "video_locality_id": int(video_locality_id),
+                            "time_video": time_video,
                             "is_bbox_stream": (
                                 str(subfolder).strip().lower() == "bbox"
                             ),

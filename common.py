@@ -8,16 +8,20 @@ Attributes:
     root_dir (TYPE): Description
 """
 # by Pavlo Bazilinskyy <pavlo.bazilinskyy@gmail.com>
-from typing import Dict
-import os
-import json
-import pickle
-import sys
-import pycountry
-from custom_logger import CustomLogger
-import subprocess
-import smtplib
+
 from email.message import EmailMessage
+from typing import Any, Dict, Tuple
+import json
+import os
+import pickle
+import smtplib
+import subprocess
+import sys
+
+import pycountry
+
+from custom_logger import CustomLogger
+
 
 root_dir = os.path.dirname(__file__)
 cache_dir = os.path.join(root_dir, '_cache')
@@ -25,6 +29,77 @@ log_dir = os.path.join(root_dir, '_logs')
 output_dir = os.path.join(root_dir, '_output')
 
 logger = CustomLogger(__name__)  # use custom logger
+
+
+# ---------------------------------------------------------------------
+# Configuration cache
+# ---------------------------------------------------------------------
+#
+# Configuration does not change during a normal analysis run. Previously every
+# get_configs() call reread config and default.config, because get_configs()
+# called check_config() first and then opened config again. In loops with many
+# CSV files this caused a large number of unnecessary filesystem reads and JSON
+# parses.
+#
+# Cache entries are process local. This is intentional: multiprocessing workers
+# load their own configuration once when they start.
+_CONFIG_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+
+def _load_config_once(
+    config_file_name: str = 'config',
+    config_default_file_name: str = 'default.config',
+):
+    """Load, validate, and cache configuration once per Python process."""
+    cache_key = (config_file_name, config_default_file_name)
+
+    if cache_key in _CONFIG_CACHE:
+        return _CONFIG_CACHE[cache_key]
+
+    config_path = os.path.join(root_dir, config_file_name)
+    default_path = os.path.join(root_dir, config_default_file_name)
+
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        logger.error(f"Config file {config_file_name} not found.")
+        return None
+    except json.decoder.JSONDecodeError:
+        logger.error(
+            "Config file badly formatted. Please update based on default.config."
+        )
+        return None
+
+    try:
+        with open(default_path) as f:
+            default = json.load(f)
+    except FileNotFoundError:
+        logger.error(
+            f"Default config file {config_default_file_name} not found."
+        )
+        return None
+    except json.decoder.JSONDecodeError:
+        logger.error(
+            "Default config file badly formatted. "
+            "Please update based on default.config."
+        )
+        return None
+
+    if len(config) < len(default):
+        logger.error(
+            f"Config file has {len(config)} variables, which is fewer than "
+            f"{len(default)} variables in default.config. Please update."
+        )
+        return None
+
+    _CONFIG_CACHE[cache_key] = config
+    return config
+
+
+def clear_config_cache() -> None:
+    """Clear cached configuration so the next lookup reloads it from disk."""
+    _CONFIG_CACHE.clear()
 
 
 def get_secrets(entry_name: str, secret_file_name: str = 'secret') -> Dict[str, str]:
@@ -42,72 +117,58 @@ def get_secrets(entry_name: str, secret_file_name: str = 'secret') -> Dict[str, 
         return json.load(f)[entry_name]
 
 
-def get_configs(entry_name: str, config_file_name: str = 'config', config_default_file_name: str = 'default.config'):
+def get_configs(
+    entry_name: str,
+    config_file_name: str = 'config',
+    config_default_file_name: str = 'default.config',
+):
     """
-    Open the config file and return the requested entry.
-    If no config file is found, open default.config.
+    Return a configuration value from the process-local cached configuration.
+
+    The first lookup reads and validates config and default.config. Subsequent
+    lookups use the in-memory dictionary and perform no configuration file I/O.
 
     Args:
-        entry_name (str): Description
-        config_file_name (str, optional): Description
-        config_default_file_name (str, optional): Description
+        entry_name (str): Configuration key.
+        config_file_name (str, optional): Main config filename.
+        config_default_file_name (str, optional): Default config filename.
 
     Returns:
-        TYPE: Description
+        Any: Value stored under entry_name.
     """
-    # check if config file is updated
-    if not check_config():
+    content = _load_config_once(
+        config_file_name=config_file_name,
+        config_default_file_name=config_default_file_name,
+    )
+    if content is None:
         sys.exit()
-    try:
-        with open(os.path.join(root_dir, config_file_name)) as f:
-            content = json.load(f)
-    except FileNotFoundError:
-        with open(os.path.join(root_dir, config_default_file_name)) as f:
-            content = json.load(f)
+
     return content[entry_name]
 
 
-def check_config(config_file_name: str = 'config',
-                 config_default_file_name: str = 'default.config'):
+def check_config(
+    config_file_name: str = 'config',
+    config_default_file_name: str = 'default.config',
+):
     """
-    Check if config file has at least as many rows as default.config.
+    Check whether config is valid.
+
+    Validation is cached, so repeated calls do not reread either JSON file.
 
     Args:
-        config_file_name (str, optional): Description
-        config_default_file_name (str, optional): Description
+        config_file_name (str, optional): Main config filename.
+        config_default_file_name (str, optional): Default config filename.
 
     Returns:
-        str: Description.
+        bool: True when the configuration is valid.
     """
-    # load config file
-    try:
-        with open(os.path.join(root_dir, config_file_name)) as f:
-            config = json.load(f)
-    except FileNotFoundError:
-        logger.error('Config file {} not found.', config_file_name)
-        return False
-    except json.decoder.JSONDecodeError:
-        logger.error('Config file badly formatted. Please update based on default.config.', config_file_name)
-        return False
-    # load default.config file
-    try:
-        with open(os.path.join(root_dir, config_default_file_name)) as f:
-            default = json.load(f)
-    except FileNotFoundError:
-        logger.error('Default config file {} not found.', config_file_name)
-        return False
-    except json.decoder.JSONDecodeError:
-        logger.error('Config file badly formatted. Please update based on default.config.', config_file_name)
-        return False
-    # check length of each file
-    if len(config) < len(default):
-        logger.error('Config file has {} variables, which is fewer than {} variables in default.config. Please'
-                     + ' update.',
-                     len(config),
-                     len(default))
-        return False
-    else:
-        return True
+    return (
+        _load_config_once(
+            config_file_name=config_file_name,
+            config_default_file_name=config_default_file_name,
+        )
+        is not None
+    )
 
 
 def search_dict(dictionary, search_for, nested=False):
@@ -166,8 +227,7 @@ def load_from_p(file, description_data='data'):
     path = os.path.join(os.path.join(root_dir, 'trust'), file)
     with open(path, 'rb') as f:
         data = pickle.load(f)
-    logger.info('Loaded ' + description_data + ' from pickle file {}.',
-                file)
+    logger.info('Loaded ' + description_data + ' from pickle file {}.', file)
     return data
 
 
@@ -307,20 +367,20 @@ def git_pull():
 # Send email with certain message
 def send_email(subject, content, sender, recipients):
     """
-    Send email with certain subject and content from sender to recipients.
+    Send email with certain message from sender to recipients.
 
     Args:
         subject (str): Subject of email.
-        content (str): Content of email.
+        content (str): Email body.
         sender (str): Email address to send from.
-        recipients (list): Email addresses to send to.
+        recipients (list): Email addresses to receive the message.
     """
     msg = EmailMessage()
     msg.set_content(content)
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
-    # Try to send email
+
     try:
         with smtplib.SMTP_SSL(get_secrets("email_smtp"), 465) as smtp:
             smtp.login(get_secrets("email_account"), get_secrets("email_password"))
