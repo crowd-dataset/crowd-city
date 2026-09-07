@@ -51,13 +51,11 @@ class Youtube_Helper:
         self.resolution (str): The video resolution. Initialised as None and set later when needed.
         self.video_title (str): The title of the video.
         """
-        self.tracking_model = common.get_configs("tracking_model")
         self.bbox_tracker = common.get_configs("bbox_tracker")
         self.resolution = None
         self.mapping = pd.read_csv(common.get_configs("mapping"))
         self.confidence = 0.0
         self.display_frame_tracking = common.get_configs("display_frame_tracking")
-        self.display_frame_segmentation = common.get_configs("display_frame_segmentation")
         self.output_path = common.get_configs("videos")
         self.save_annoted_img = common.get_configs("save_annoted_img")
         self.save_tracked_img = common.get_configs("save_tracked_img")

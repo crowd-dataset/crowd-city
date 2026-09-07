@@ -1,5 +1,8 @@
 import ast
 import math
+from collections import OrderedDict
+from typing import Any, ClassVar
+
 import polars as pl
 from custom_logger import CustomLogger
 
@@ -7,27 +10,29 @@ logger = CustomLogger(__name__)  # use custom logger
 
 
 class MetaData:
+    """Metadata lookup helper with a shared per DataFrame video index."""
+
+    # Shared by every MetaData instance used across IO, detection, metrics,
+    # grouping, and analysis. Each entry keeps a strong DataFrame reference so
+    # Python cannot reuse the object id while the cache entry is alive.
+    _video_index_cache: ClassVar[OrderedDict] = OrderedDict()
+    _max_cached_dataframes: ClassVar[int] = 8
+
     def __init__(self) -> None:
         pass
 
     @staticmethod
     def _parse_videos_cell(v: str | None) -> list[str]:
-        """
-        Robustly parse mapping 'videos' cell into list of ids.
-
-        Handles examples:
-          [D_LyZL4P3_k]
-          "[ikOjqfFj-7o,GDXBW8LRFu4]"
-          ["a","b"]
-          []
-        """
+        """Robustly parse a mapping ``videos`` cell into video IDs."""
         if not isinstance(v, str):
             return []
+
         s = v.strip()
-        # remove surrounding quotes if present
-        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        if (s.startswith('"') and s.endswith('"')) or (
+            s.startswith("'") and s.endswith("'")
+        ):
             s = s[1:-1].strip()
-        # remove surrounding brackets if present
+
         if s.startswith("[") and s.endswith("]"):
             s = s[1:-1]
 
@@ -58,7 +63,7 @@ class MetaData:
 
     @staticmethod
     def _eq_expr(colname: str, value) -> pl.Expr:
-        """Type-aware equality expression to reduce mismatches (str/int/float)."""
+        """Type aware equality expression to reduce mismatches."""
         if value is None:
             return pl.col(colname).is_null()
         if isinstance(value, float):
@@ -67,48 +72,27 @@ class MetaData:
             return pl.col(colname).cast(pl.Float64, strict=False) == pl.lit(float(value))
         if isinstance(value, int):
             return pl.col(colname).cast(pl.Int64, strict=False) == pl.lit(int(value))
-        # fallback string compare
         return pl.col(colname).cast(pl.Utf8, strict=False) == pl.lit(str(value))
 
-    def find_values_with_video_id(self, df: pl.DataFrame, key: str):
-        """Extracts relevant data from a DataFrame based on a given key.
+    @classmethod
+    def clear_video_index_cache(cls) -> None:
+        """Clear all cached mapping indexes."""
+        cls._video_index_cache.clear()
 
-        Args:
-            df (DataFrame): The DataFrame containing the data.
-            key (str): The key to search for in the DataFrame.
+    @classmethod
+    def _build_video_index(
+        cls,
+        df: pl.DataFrame,
+    ) -> dict[tuple[str, int], tuple[Any, ...]]:
+        """Parse the mapping once and index all segments by video and start time."""
+        index: dict[tuple[str, int], tuple[Any, ...]] = {}
 
-        Returns:
-            tuple: A tuple containing information related to the key, including:
-                - Video ID
-                - Start time
-                - End time
-                - Time of day
-                - locality
-                - State
-                - Latitude
-                - Longitude
-                - Country
-                - GDP per capita
-                - Population
-                - Population of the country
-                - Traffic mortality
-                - Continent
-                - Literacy rate
-                - Average height
-                - ISO-3 code for country
-                - Fps of the video
-                - Type of vehicle
-        """
-        vid, start_str, fps_str = key.rsplit("_", 2)
-
-        # Iterate rows (Polars)
         for row in df.iter_rows(named=True):
-            # Extracting data from the mapping row
-            video_ids = self._parse_videos_cell(row.get("videos"))
-            start_times = self._safe_literal_eval(row.get("start_time"))
-            end_times = self._safe_literal_eval(row.get("end_time"))
-            time_of_day = self._safe_literal_eval(row.get("time_of_day"))
-            vehicle_type = self._safe_literal_eval(row.get("vehicle_type"))
+            video_ids = cls._parse_videos_cell(row.get("videos"))
+            start_times = cls._safe_literal_eval(row.get("start_time"))
+            end_times = cls._safe_literal_eval(row.get("end_time"))
+            time_of_day = cls._safe_literal_eval(row.get("time_of_day"))
+            vehicle_type = cls._safe_literal_eval(row.get("vehicle_type"))
 
             if not (
                 isinstance(start_times, list)
@@ -119,7 +103,7 @@ class MetaData:
                 continue
 
             locality = row.get("locality")
-            state = self._state_or_unknown(row.get("state"))
+            state = cls._state_or_unknown(row.get("state"))
             latitude = row.get("lat")
             longitude = row.get("lon")
             country = row.get("country")
@@ -132,103 +116,144 @@ class MetaData:
             avg_height = row.get("avg_height")
             iso3 = row.get("iso3")
 
-            # Iterate through each video, start time list, end time list, etc.
+            try:
+                pop_i = int(population) if population is not None else 0
+            except Exception:
+                pop_i = 0
+
+            try:
+                gdp_i = int(gdp) if gdp is not None else 0
+            except Exception:
+                gdp_i = 0
+
+            gpd_capita = (gdp_i / pop_i) if pop_i > 0 else 0
+
             for video, start_list, end_list, tod_list, vtype_list in zip(
-                video_ids, start_times, end_times, time_of_day, vehicle_type
+                video_ids,
+                start_times,
+                end_times,
+                time_of_day,
+                vehicle_type,
             ):
-                if video != vid:
+                if not (
+                    isinstance(start_list, list)
+                    and isinstance(end_list, list)
+                    and isinstance(tod_list, list)
+                ):
                     continue
 
-                if not isinstance(start_list, list) or not isinstance(end_list, list) or not isinstance(tod_list, list):  # noqa: E501
-                    continue
-
-                logger.debug(f"Finding values for {video} start={start_list}, end={end_list}")
-
-                try:
-                    start_target = int(start_str)
-                except Exception:
-                    continue
-
-                for idx, s in enumerate(start_list):
+                for idx, start_value in enumerate(start_list):
                     try:
-                        if int(s) != start_target:
-                            continue
+                        start_key = int(start_value)
                     except Exception:
                         continue
-
-                    # GDP per capita (avoid div-by-zero)
-                    try:
-                        pop_i = int(population) if population is not None else 0
-                    except Exception:
-                        pop_i = 0
-                    try:
-                        gdp_i = int(gdp) if gdp is not None else 0
-                    except Exception:
-                        gdp_i = 0
-
-                    gpd_capita = (gdp_i / pop_i) if pop_i > 0 else 0
 
                     end_val = end_list[idx] if idx < len(end_list) else None
                     tod_val = tod_list[idx] if idx < len(tod_list) else None
 
-                    # Return relevant information once found (same positional tuple)
-                    return (
-                        video,                # 0
-                        s,                    # 1
-                        end_val,              # 2
-                        tod_val,              # 3
-                        locality,                 # 4
-                        state,                # 5
-                        latitude,             # 6
-                        longitude,            # 7
-                        country,              # 8
-                        gpd_capita,           # 9
-                        population,           # 10
-                        population_country,   # 11
-                        traffic_mortality,    # 12
-                        continent,            # 13
-                        literacy_rate,        # 14
-                        avg_height,           # 15
-                        iso3,                 # 16
-                        int(fps_str),         # 17
-                        vtype_list,           # 18
+                    metadata_without_fps = (
+                        video,                 # 0
+                        start_value,           # 1
+                        end_val,               # 2
+                        tod_val,               # 3
+                        locality,              # 4
+                        state,                 # 5
+                        latitude,              # 6
+                        longitude,             # 7
+                        country,               # 8
+                        gpd_capita,            # 9
+                        population,            # 10
+                        population_country,    # 11
+                        traffic_mortality,     # 12
+                        continent,             # 13
+                        literacy_rate,         # 14
+                        avg_height,            # 15
+                        iso3,                  # 16
+                        vtype_list,            # 17, returned at position 18
                     )
 
-        return None
+                    # The old row scan returned the first match. setdefault
+                    # preserves exactly that behaviour for duplicate keys.
+                    index.setdefault(
+                        (str(video), start_key),
+                        metadata_without_fps,
+                    )
 
-    def get_value(self, df: pl.DataFrame, column_name1: str, column_value1,
-                  column_name2: str | None, column_value2, target_column: str):
-        """
-        Retrieves a value from the target_column based on the condition
-        that both column_name1 matches column_value1 and column_name2 matches column_value2.
+        return index
 
-        Parameters:
-        df (pandas.DataFrame): The DataFrame containing the mapping file.
-        column_name1 (str): The first column to search for the matching value.
-        column_value1 (str): The value to search for in column_name1.
-        column_name2 (str): The second column to search for the matching value.
-        column_value2 (str): The value to search for in column_name2. If "unknown", the value is treated as NaN.
-        target_column (str): The column from which to retrieve the corresponding value.
+    @classmethod
+    def _video_index(
+        cls,
+        df: pl.DataFrame,
+    ) -> dict[tuple[str, int], tuple[Any, ...]]:
+        """Return the cached segment index for this exact DataFrame object."""
+        cache_key = id(df)
+        cached = cls._video_index_cache.get(cache_key)
 
-        Returns:
-        Any: The value from target_column that corresponds to the matching values in both
-             column_name1 and column_name2.
-        """
+        if cached is not None:
+            cached_df, index = cached
+            if cached_df is df:
+                cls._video_index_cache.move_to_end(cache_key)
+                return index
+            del cls._video_index_cache[cache_key]
+
+        index = cls._build_video_index(df)
+        cls._video_index_cache[cache_key] = (df, index)
+        cls._video_index_cache.move_to_end(cache_key)
+
+        while len(cls._video_index_cache) > cls._max_cached_dataframes:
+            cls._video_index_cache.popitem(last=False)
+
+        logger.debug(
+            f"Built metadata index for {df.height} mapping rows "
+            f"with {len(index)} video segments."
+        )
+        return index
+
+    def find_values_with_video_id(self, df: pl.DataFrame, key: str):
+        """Return metadata for ``video_id_start_time_fps`` in constant time after indexing."""
+        try:
+            vid, start_str, fps_str = str(key).rsplit("_", 2)
+            start_target = int(start_str)
+            fps = int(fps_str)
+        except (TypeError, ValueError):
+            return None
+
+        result = self._video_index(df).get((vid, start_target))
+        if result is None:
+            return None
+
+        # Preserve the legacy 19 element tuple contract exactly.
+        return result[:17] + (fps, result[17])
+
+    def get_value(
+        self,
+        df: pl.DataFrame,
+        column_name1: str,
+        column_value1,
+        column_name2: str | None,
+        column_value2,
+        target_column: str,
+    ):
+        """Retrieve a target value based on one or two column conditions."""
         if column_name2 is None or column_value2 is None:
             out = (
-                df.filter(self._eq_expr(column_name1, column_value1)).select(target_column).head(1)
+                df.filter(self._eq_expr(column_name1, column_value1))
+                .select(target_column)
+                .head(1)
             )
             return out.item(0, target_column) if out.height > 0 else None
 
-        # Treat "unknown" as NULL
         if isinstance(column_value2, str) and column_value2 == "unknown":
             column_value2 = None
 
-        # Treat NaN as NULL-like
         if isinstance(column_value2, float) and math.isnan(column_value2):
             column_value2 = None
 
-        filt = self._eq_expr(column_name1, column_value1) & self._eq_expr(column_name2, column_value2)
+        filt = self._eq_expr(column_name1, column_value1) & self._eq_expr(
+            column_name2,
+            column_value2,
+        )
 
         out = df.filter(filt).select(target_column).head(1)
         return out.item(0, target_column) if out.height > 0 else None

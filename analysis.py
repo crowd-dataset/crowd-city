@@ -13,6 +13,8 @@ import math
 import os
 import pickle
 import warnings
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from typing import Set, Optional, Dict
 
 import polars as pl
@@ -28,10 +30,16 @@ from utils.analytics.geo import Geo
 from utils.analytics.io import IO
 from utils.analytics.mapping_enrichment import Mapping_Enrich
 from utils.analytics.metrics_cache import MetricsCache
+from utils.analytics.csv_parallel import (
+    COCO_CLASSES as PARALLEL_COCO_CLASSES,
+    initialise_csv_worker,
+    process_csv_task,
+)
 from utils.core.dataset_stats import Dataset_Stats
 from utils.core.tools import Tools
 from utils.crossing.detection import Detection
 from utils.crossing.metrics import Metrics
+import utils.crossing.metrics as crossing_metrics_module
 from utils.plotting.bivariate import Bivariate
 from utils.plotting.correlations import Correlations
 from utils.plotting.crossings import Crossings
@@ -2769,205 +2777,281 @@ if __name__ == "__main__":
 
         min_conf = common.get_configs("min_confidence")
 
-        for folder_path in common.get_configs("data"):  # Iterable[str]
+        # ------------------------------------------------------------------
+        # Concurrent CSV processing
+        # ------------------------------------------------------------------
+        csv_tasks = []
+
+        boundary_left_default = float(common.get_configs("boundary_left"))
+        boundary_right_default = float(common.get_configs("boundary_right"))
+
+        for folder_path in common.get_configs("data"):
             if not os.path.exists(folder_path):
                 logger.warning(f"Folder does not exist: {folder_path}.")
                 continue
-
-            found_any = False
 
             for subfolder in common.get_configs("sub_domain"):
                 subfolder_path = os.path.join(folder_path, subfolder)
                 if not os.path.exists(subfolder_path):
                     continue
 
-                found_any = True
-
-                for file_name in tqdm(os.listdir(subfolder_path), desc=f"Processing files in {subfolder_path}"):
+                for file_name in tqdm(
+                    os.listdir(subfolder_path),
+                    desc=f"Indexing files in {subfolder_path}",
+                ):
                     filtered: Optional[str] = analytics_IO.filter_csv_files(
-                        file=file_name, df_mapping=df_mapping
+                        file=file_name,
+                        df_mapping=df_mapping,
                     )
                     if filtered is None:
                         continue
 
-                    file_str: str = os.fspath(filtered)
-
+                    file_str = os.fspath(filtered)
                     if file_str in MISC_FILES:
                         continue
 
-                    filename_no_ext = os.path.splitext(file_str)[0]
-                    logger.debug(f"{filename_no_ext}: fetching values.")
-
                     file_path = os.path.join(subfolder_path, file_str)
-
-                    # Polars read + filter
-                    df = pl.read_csv(file_path)
-                    df = df.filter(
-                        (pl.col("confidence") >= min_conf)
-                        & pl.col("unique-id").is_not_null()
-                        & (pl.col("unique-id") != -1)
-                    )
-
-                    # After reading the file, clean up the filename
                     base_name = tools.clean_csv_filename(file_str)
                     filename_no_ext = os.path.splitext(base_name)[0]
 
                     try:
-                        video_id, start_index, fps = filename_no_ext.rsplit("_", 2)
-                    except ValueError:
-                        logger.warning(f"Unexpected filename format: {filename_no_ext}")
+                        video_id, start_index_text, fps_text = (
+                            filename_no_ext.rsplit("_", 2)
+                        )
+                        start_index = int(start_index_text)
+                        fps = float(fps_text)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            f"Unexpected filename format: {filename_no_ext}"
+                        )
                         continue
 
-                    video_locality_id = geo.find_locality_id(df_mapping, video_id, int(start_index))
+                    video_locality_id = geo.find_locality_id(
+                        df_mapping,
+                        video_id,
+                        start_index,
+                    )
 
-                    place = id_to_place.get(int(video_locality_id)) if video_locality_id is not None else None
+                    place = (
+                        id_to_place.get(int(video_locality_id))
+                        if video_locality_id is not None
+                        else None
+                    )
                     if place is None:
-                        logger.warning(f"{file_str}: no mapping row found for id={video_locality_id}.")
+                        logger.warning(
+                            f"{file_str}: no mapping row found for "
+                            f"id={video_locality_id}."
+                        )
                         continue
 
                     video_locality, video_state, video_country = place
-                    logger.debug(f"{file_str}: found values {video_locality}, {video_state}, {video_country}.")
-
-                    # Get the number of number and unique id of the object crossing the road
-                    # ids give the unique of the person who cross the road after applying the filter, while
-                    # all_ids gives every unique_id of the person who crosses the road
-                    is_bbox_stream = str(subfolder).strip().lower() == "bbox"
-                    if is_bbox_stream:
-                        crossing_parameters = dict(waymo_crossing_parameters)
-                        boundary_left = float(
-                            crossing_parameters.pop(
-                                "boundary_left",
-                                common.get_configs("boundary_left"),
-                            )  # pyright: ignore[reportArgumentType]
-                        )
-                        boundary_right = float(
-                            crossing_parameters.pop(
-                                "boundary_right",
-                                common.get_configs("boundary_right"),
-                            )  # pyright: ignore[reportArgumentType]
-                        )
-                        ids, all_ids = detection.pedestrian_crossing(
-                            df,
-                            filename_no_ext,
-                            df_mapping,
-                            boundary_left,
-                            boundary_right,
-                            person_id=0,
-                            fps=float(fps),
-                            **crossing_parameters,
-                        )
-                        # Save crossing results only for the calibrated bbox +
-                        # BoT SORT stream.  A later pass over the segmentation
-                        # folder must not overwrite these values with an empty
-                        # result for the same video.
-                        pedestrian_crossing_count[filename_no_ext] = {"ids": ids}
-                        pedestrian_crossing_count_all[filename_no_ext] = {"ids": all_ids}
-
-                        # Saves the time to cross in form
-                        # {name_time: {id(s): time(s)}}.
-                        temp_data = metrics.time_to_cross(
-                            df,
-                            ids,
-                            filename_no_ext,
-                            df_mapping,
-                        )
-                        data[filename_no_ext] = temp_data
-                    else:
-                        # Waymo calibration and CROWD deployment both use the
-                        # bbox plus BoT SORT stream. Segmentation rows are kept
-                        # for the legacy object statistics below, but never
-                        # become a second crossing/speed measurement.
-                        ids, all_ids, temp_data = [], [], {}
-
-                    # List of all 80 class names in COCO order
-                    coco_classes = [
-                        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
-                        "boat", "traffic_light", "fire_hydrant", "stop_sign", "parking_meter", "bench",
-                        "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
-                        "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-                        "skis", "snowboard", "sports_ball", "kite", "baseball_bat", "baseball_glove",
-                        "skateboard", "surfboard", "tennis_racket", "bottle", "wine_glass", "cup",
-                        "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-                        "broccoli", "carrot", "hot_dog", "pizza", "donut", "cake", "chair", "couch",
-                        "potted_plant", "bed", "dining_table", "toilet", "tv", "laptop", "mouse",
-                        "remote", "keyboard", "cellphone", "microwave", "oven", "toaster", "sink",
-                        "refrigerator", "book", "clock", "vase", "scissors", "teddy_bear",
-                        "hair_drier", "toothbrush",
-                    ]
-
-                    # --- Ensure all needed columns exist and are integer type ---
-                    missing = [c for c in coco_classes if c not in df_mapping.columns]
-                    if missing:
-                        df_mapping = df_mapping.with_columns([pl.lit(0).cast(pl.Int64).alias(c) for c in missing])
-
-                    df_mapping = df_mapping.with_columns([
-                        pl.col(c).cast(pl.Int64, strict=False).fill_null(0).alias(c) for c in coco_classes
-                    ])
-
-                    # also ensure aggregated columns exist
-                    if "total_time" not in df_mapping.columns:
-                        df_mapping = df_mapping.with_columns(pl.lit(0).alias("total_time"))
-                    if "total_crossing_detect" not in df_mapping.columns:
-                        df_mapping = df_mapping.with_columns(pl.lit(0).cast(pl.Int64).alias("total_crossing_detect"))
-
-                    # --- Count unique objects per yolo-id ---
-                    counts_df = (
-                        df.unique(subset=["yolo-id", "unique-id"])
-                          .group_by("yolo-id")
-                          .len()
-                          .rename({"len": "count"})
+                    logger.debug(
+                        f"{file_str}: found values {video_locality}, "
+                        f"{video_state}, {video_country}."
                     )
 
-                    id_to_count = {int(r["yolo-id"]): int(r["count"]) for r in counts_df.to_dicts()}
-                    counters = {class_name: int(id_to_count.get(i, 0)) for i, class_name in enumerate(coco_classes)}
-
-                    # --- Update df_mapping for the given video_locality_id ---
-                    df_mapping = df_mapping.with_columns([
-                        pl.when(pl.col("id") == video_locality_id)
-                          .then(pl.col(class_name) + pl.lit(counters[class_name]))
-                          .otherwise(pl.col(class_name))
-                          .alias(class_name)
-                        for class_name in coco_classes
-                    ])
-
-                    # Add duration of segment
-                    time_video = duration.get_duration(df_mapping, video_id, int(start_index))
-                    df_mapping = df_mapping.with_columns(
-                        pl.when(pl.col("id") == video_locality_id)
-                          .then(pl.col("total_time") + pl.lit(time_video))
-                          .otherwise(pl.col("total_time"))
-                          .alias("total_time")
+                    csv_tasks.append(
+                        {
+                            "file_path": file_path,
+                            "file_name": file_str,
+                            "filename_no_ext": filename_no_ext,
+                            "video_id": video_id,
+                            "start_index": start_index,
+                            "fps": fps,
+                            "video_locality_id": int(video_locality_id),
+                            "is_bbox_stream": (
+                                str(subfolder).strip().lower() == "bbox"
+                            ),
+                        }
                     )
 
-                    # Add total crossing detected
-                    df_mapping = df_mapping.with_columns(
-                        pl.when(pl.col("id") == video_locality_id)
-                          .then(pl.col("total_crossing_detect") + pl.lit(len(ids)).cast(pl.Int64))
-                          .otherwise(pl.col("total_crossing_detect"))
-                          .alias("total_crossing_detect")
+        worker_env = os.environ.get("CROWD_CSV_WORKERS", "").strip()
+        if worker_env:
+            try:
+                csv_workers = max(1, int(worker_env))
+            except ValueError:
+                logger.warning(
+                    f"Invalid CROWD_CSV_WORKERS={worker_env!r}; using default."
+                )
+                csv_workers = min(common.get_configs("cpu_worker"), max(1, os.cpu_count() or 1))
+        else:
+            csv_workers = min(common.get_configs("cpu_worker"), max(1, os.cpu_count() or 1))
+
+        csv_workers = min(csv_workers, len(csv_tasks)) if csv_tasks else 1
+
+        logger.info(
+            f"Analysing {len(csv_tasks)} CSV files with "
+            f"{csv_workers} worker process"
+            f"{'es' if csv_workers != 1 else ''}."
+        )
+
+        aggregate_by_locality = {}
+
+        pipeline_model = dict(
+            getattr(crossing_metrics_module, "_PIPELINE_MODEL", {}) or {}
+        )
+        speed_model = dict(
+            getattr(crossing_metrics_module, "_SPEED_MODEL", {}) or {}
+        )
+
+        worker_init_args = (
+            df_mapping,
+            dict(waymo_crossing_parameters),
+            float(min_conf),
+            boundary_left_default,
+            boundary_right_default,
+            pipeline_model,
+            speed_model,
+        )
+
+        def merge_worker_result(result):
+            if result.get("status") != "ok":
+                logger.error(
+                    f"CSV analysis failed: "
+                    f"{result.get('message', result.get('file_name', 'unknown'))}"
+                )
+                return
+
+            metrics_cache.seed_file_metrics(
+                result["file_name"],
+                result["metric_counts"],
+            )
+
+            locality_id = int(result["video_locality_id"])
+            bucket = aggregate_by_locality.setdefault(
+                locality_id,
+                {
+                    "object_counts": {},
+                    "total_time": 0.0,
+                    "total_crossing_detect": 0,
+                },
+            )
+
+            for class_name, value in result["object_counts"].items():
+                bucket["object_counts"][class_name] = (
+                    int(bucket["object_counts"].get(class_name, 0))
+                    + int(value)
+                )
+
+            bucket["total_time"] += float(result["time_video"] or 0)
+
+            if result["is_bbox_stream"]:
+                filename_no_ext = result["filename_no_ext"]
+                ids = result["ids"]
+                all_ids = result["all_ids"]
+                temp_data = result["temp_data"]
+
+                pedestrian_crossing_count[filename_no_ext] = {"ids": ids}
+                pedestrian_crossing_count_all[filename_no_ext] = {
+                    "ids": all_ids
+                }
+                data[filename_no_ext] = temp_data
+                bucket["total_crossing_detect"] += len(ids)
+
+                speed_value = result["speed_value"]
+                if speed_value is not None:
+                    for outer_key, inner_dict in speed_value.items():
+                        all_speed.setdefault(outer_key, {}).update(inner_dict)
+
+                time_value = result["time_value"]
+                if time_value is not None:
+                    for outer_key, inner_dict in time_value.items():
+                        all_time.setdefault(outer_key, {}).update(inner_dict)
+
+        if csv_workers == 1:
+            initialise_csv_worker(*worker_init_args)
+            result_iterator = (
+                process_csv_task(task)
+                for task in csv_tasks
+            )
+            for result in tqdm(
+                result_iterator,
+                total=len(csv_tasks),
+                desc="Analysing CSV files",
+            ):
+                merge_worker_result(result)
+        else:
+            mp_context = multiprocessing.get_context("spawn")
+
+            with ProcessPoolExecutor(
+                max_workers=csv_workers,
+                mp_context=mp_context,
+                initializer=initialise_csv_worker,
+                initargs=worker_init_args,
+            ) as executor:
+                result_iterator = executor.map(
+                    process_csv_task,
+                    csv_tasks,
+                    chunksize=1,
+                )
+
+                for result in tqdm(
+                    result_iterator,
+                    total=len(csv_tasks),
+                    desc="Analysing CSV files",
+                ):
+                    merge_worker_result(result)
+
+        if aggregate_by_locality:
+            update_rows = []
+
+            for locality_id, bucket in aggregate_by_locality.items():
+                row = {
+                    "id": int(locality_id),
+                    "_parallel_total_time": float(bucket["total_time"]),
+                    "_parallel_total_crossing_detect": int(
+                        bucket["total_crossing_detect"]
+                    ),
+                }
+
+                object_counts = bucket["object_counts"]
+                for class_name in PARALLEL_COCO_CLASSES:
+                    row[f"_parallel_{class_name}"] = int(
+                        object_counts.get(class_name, 0)
                     )
 
-                    # Aggregated values
-                    if is_bbox_stream:
-                        speed_value = metrics.calculate_speed_of_crossing(
-                            df_mapping,
-                            df,
-                            {filename_no_ext: temp_data},
-                        )
+                update_rows.append(row)
 
-                        if speed_value is not None:
-                            for outer_key, inner_dict in speed_value.items():
-                                all_speed.setdefault(outer_key, {}).update(inner_dict)
+            parallel_updates = pl.DataFrame(update_rows)
 
-                        time_value = metrics.time_to_start_cross(
-                            df_mapping,
-                            df,
-                            {filename_no_ext: temp_data},
-                        )
+            df_mapping = df_mapping.join(
+                parallel_updates,
+                on="id",
+                how="left",
+            )
 
-                        if time_value is not None:
-                            for outer_key, inner_dict in time_value.items():
-                                all_time.setdefault(outer_key, {}).update(inner_dict)
+            df_mapping = df_mapping.with_columns(
+                [
+                    (
+                        pl.col(class_name)
+                        + pl.col(f"_parallel_{class_name}").fill_null(0)
+                    ).alias(class_name)
+                    for class_name in PARALLEL_COCO_CLASSES
+                ]
+                + [
+                    (
+                        pl.col("total_time")
+                        + pl.col("_parallel_total_time").fill_null(0)
+                    ).alias("total_time"),
+                    (
+                        pl.col("total_crossing_detect")
+                        + pl.col(
+                            "_parallel_total_crossing_detect"
+                        ).fill_null(0)
+                    ).alias("total_crossing_detect"),
+                ]
+            )
+
+            df_mapping = df_mapping.drop(
+                [
+                    f"_parallel_{class_name}"
+                    for class_name in PARALLEL_COCO_CLASSES
+                ]
+                + [
+                    "_parallel_total_time",
+                    "_parallel_total_crossing_detect",
+                ]
+            )
 
         person_counter = df_mapping.select(pl.col("person").sum()).item()
         bicycle_counter = df_mapping.select(pl.col("bicycle").sum()).item()
@@ -3596,8 +3680,11 @@ if __name__ == "__main__":
         ])
 
         df_mapping = df_mapping.filter(
-            (pl.col("population_locality") >= float(population_threshold)) |
-            (pl.col("population_locality") >= float(min_percentage) * pl.col("population_country"))
+            (pl.col("population_locality") >= float(population_threshold))
+            | (
+                pl.col("population_locality")
+                >= float(min_percentage) * pl.col("population_country")
+            )
         )
 
         # Remove the rows of the cities where the footage recorded is less than threshold
@@ -3786,7 +3873,7 @@ if __name__ == "__main__":
 
     # CROWD is always analysed. Optional Waymo preparation is controlled by
     # config and cannot stop the CROWD report when Waymo is unavailable.
-    _run_integrated_speed_reporting(df_mapping_raw, pedestrian_crossing_count)
+    _run_integrated_speed_reporting(df_mapping, pedestrian_crossing_count)
 
     logger.info("Detected:")
     logger.info(f"person: {person_counter}; bicycle: {bicycle_counter}; car: {car_counter}")

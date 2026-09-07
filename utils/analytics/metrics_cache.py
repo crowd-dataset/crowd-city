@@ -75,6 +75,7 @@ class MetricsCache:
     - calculate_traffic_signs(df_mapping)
     - calculate_traffic(df_mapping, ...flags...)
     - get_unique_values(df, value, ...)
+    - seed_file_metrics(filename, counts)
     - clear_cache()
 
     Cache format
@@ -141,7 +142,7 @@ class MetricsCache:
                 cls._record_loaded_dataframe(source, dataframe)
             except Exception as exc:
                 # Metrics observation must never make an otherwise valid CSV read fail.
-                _LOGGER.debug("Could not capture metrics from %s: %s", source, exc)
+                _LOGGER.debug(f"Could not capture metrics from {source}: {exc}")
             return dataframe
 
         pl.read_csv = observed_read_csv
@@ -191,6 +192,16 @@ class MetricsCache:
             pl.col("confidence").cast(pl.Float64, strict=False) >= float(min_conf)
         )
         cls._file_metrics_cache[os.path.basename(source_path)] = cls._metric_counts_from_dataframe(filtered)
+
+    @classmethod
+    def seed_file_metrics(cls, filename: str, counts: Dict[str, int]) -> None:
+        """Store compact per file counts produced by a worker process."""
+        expected = cls._empty_metric_counts()
+        normalised = {
+            name: int(counts.get(name, 0) or 0)
+            for name in expected
+        }
+        cls._file_metrics_cache[os.path.basename(os.fspath(filename))] = normalised
 
     @staticmethod
     def _empty_metric_counts() -> FileMetricCounts:
@@ -291,7 +302,7 @@ class MetricsCache:
         Returns:
             int FPS if pattern matches, otherwise None.
         """
-        pattern = r"^%s_%s_(\d+)\.csv$" % (re.escape(str(vid)), re.escape(str(start_time)))
+        pattern = rf"^{re.escape(str(vid))}_{re.escape(str(start_time))}_(\\d+)\\.csv$"
         match = re.match(pattern, filename)
         if not match:
             return None
@@ -365,7 +376,7 @@ class MetricsCache:
                     continue
 
                 for start_time, _tod in zip(start_times_list, time_of_day_list):
-                    prefix = "%s_%s_" % (vid, start_time)
+                    prefix = f"{vid}_{start_time}_"
 
                     matches = [
                         fname
@@ -373,28 +384,27 @@ class MetricsCache:
                         if fname.startswith(prefix) and fname.endswith(".csv")
                     ]
                     if not matches:
-                        _LOGGER.warning("[WARNING] File not found for prefix: %s", prefix)
+                        _LOGGER.warning(f"[WARNING] File not found for prefix: {prefix}")
                         continue
 
                     if len(matches) > 1:
                         _LOGGER.warning(
-                            "[WARNING] Multiple files found for prefix: %s, using first: %s",
-                            prefix,
-                            matches[0],
+                            f"[WARNING] Multiple files found for prefix: {prefix}, "
+                            f"using first: {matches[0]}"
                         )
 
                     fps = cls._extract_fps_from_filename(str(vid), str(start_time), matches[0])
                     if fps is None:
-                        _LOGGER.error("[ERROR] Could not extract fps from filename: %s", matches[0])
+                        _LOGGER.error(f"[ERROR] Could not extract fps from filename: {matches[0]}")
                         continue
 
-                    filename = "%s_%s_%s.csv" % (vid, start_time, fps)
+                    filename = f"{vid}_{start_time}_{fps}.csv"
                     file_path = csv_files.get(filename)
                     if not file_path:
                         continue
 
                     # 4) Use mapping metadata to compute segment duration
-                    key_for_meta = "%s_%s_%s" % (vid, start_time, fps)
+                    key_for_meta = f"{vid}_{start_time}_{fps}"
                     meta = _METADATA.find_values_with_video_id(df_mapping, key_for_meta)
                     if meta is None:
                         continue
@@ -416,7 +426,7 @@ class MetricsCache:
                     if duration <= 0:
                         continue
 
-                    video_key = "%s_%s_%s" % (vid, start_time, fps_final)
+                    video_key = f"{vid}_{start_time}_{fps_final}"
 
                     # 5) Reuse aggregate counts captured during analysis.py's first CSV pass.
                     counts = cls._file_metrics_cache.get(filename)
@@ -428,7 +438,7 @@ class MetricsCache:
                         try:
                             df = cls._original_read_csv(file_path)
                         except Exception as exc:
-                            _LOGGER.warning("[WARNING] Failed reading %s: %s", file_path, exc)
+                            _LOGGER.warning(f"[WARNING] Failed reading {file_path}: {exc}")
                             continue
 
                         required_cols = {"confidence", "yolo-id", "unique-id"}
@@ -471,9 +481,8 @@ class MetricsCache:
                         ) * 1000.0
 
         _LOGGER.info(
-            "MetricsCache reused first-pass aggregates for %s CSV files; fallback disk reads: %s.",
-            reused_files,
-            fallback_reads,
+            f"MetricsCache reused first-pass aggregates for {reused_files} CSV files; "
+            f"fallback disk reads: {fallback_reads}."
         )
 
         # 8) Wrap metrics with grouping layer and store into the class cache
@@ -492,7 +501,7 @@ class MetricsCache:
         cls._all_metrics_cache = {}
 
         for idx, (name, layer) in enumerate(metric_layers, start=1):
-            _LOGGER.info("[%s/%s] Wrapping '%s' ...", idx, len(metric_layers), name)
+            _LOGGER.info(f"[{idx}/{len(metric_layers)}] Wrapping '{name}' ...")
             wrapped = _GROUPING.locality_country_wrapper(
                 input_dict=layer,
                 mapping=df_mapping,
