@@ -86,10 +86,11 @@ def _load_config_once(
         )
         return None
 
-    if len(config) < len(default):
+    missing_keys = [key for key in default if key not in config]
+    if missing_keys:
         logger.error(
-            f"Config file has {len(config)} variables, which is fewer than "
-            f"{len(default)} variables in default.config. Please update."
+            f"Config file is missing {len(missing_keys)} variable(s): "
+            f"{', '.join(missing_keys)}. Please update based on default.config."
         )
         return None
 

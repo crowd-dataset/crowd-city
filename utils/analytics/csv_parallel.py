@@ -1,8 +1,10 @@
 """
-Parallel CSV worker for crowd-city analysis.
+Parallel detection-file worker for crowd-city analysis.
 
-Each worker owns its own Polars DataFrame and returns only compact Python
-objects to the parent process. Shared aggregation remains in analysis.py.
+Detection files can be CSV or Parquet. Parquet is preferred by analysis.py
+when both formats are available. Each worker owns its own Polars DataFrame and
+returns only compact Python objects to the parent process. Shared aggregation
+remains in analysis.py.
 """
 
 from __future__ import annotations
@@ -312,14 +314,51 @@ def _object_counts(df: pl.DataFrame) -> Dict[str, int]:
     }
 
 
+
+def _read_confidence_filtered(file_path: str) -> pl.DataFrame:
+    """Read one detection file and apply the confidence filter as early as possible.
+
+    Parquet uses the lazy scanner so Polars can apply predicate pushdown and
+    use Parquet statistics before materialising the DataFrame. CSV keeps the
+    existing eager read path for backwards compatibility.
+    """
+    suffix = os.path.splitext(file_path)[1].lower()
+
+    if suffix == ".parquet":
+        lazy_df = pl.scan_parquet(file_path, use_statistics=True)
+        schema_names = set(lazy_df.collect_schema().names())
+        if "confidence" not in schema_names:
+            raise ValueError("confidence column is missing")
+
+        return (
+            lazy_df
+            .filter(
+                pl.col("confidence").cast(pl.Float64, strict=False)
+                >= float(_WORKER_MIN_CONFIDENCE)
+            )
+            .collect()
+        )
+
+    if suffix == ".csv":
+        raw_df = pl.read_csv(file_path)
+        if "confidence" not in raw_df.columns:
+            raise ValueError("confidence column is missing")
+
+        return raw_df.filter(
+            pl.col("confidence").cast(pl.Float64, strict=False)
+            >= float(_WORKER_MIN_CONFIDENCE)
+        )
+
+    raise ValueError(f"Unsupported detection file format: {suffix or '<none>'}")
+
 def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
-    """Read and analyse one CSV, returning only compact mergeable results."""
+    """Read and analyse one detection file, returning compact mergeable results."""
     mapping = _WORKER_MAPPING
     if mapping is None:
         return {
             "status": "error",
             "file_name": str(task.get("file_name", "")),
-            "message": "CSV worker was not initialised.",
+            "message": "Detection worker was not initialised.",
         }
 
     file_path = os.fspath(task["file_path"])
@@ -330,19 +369,7 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
     is_bbox_stream = bool(task["is_bbox_stream"])
 
     try:
-        raw_df = pl.read_csv(file_path)
-
-        if "confidence" not in raw_df.columns:
-            return {
-                "status": "error",
-                "file_name": file_name,
-                "message": f"{file_name}: confidence column is missing.",
-            }
-
-        confidence_filtered = raw_df.filter(
-            pl.col("confidence").cast(pl.Float64, strict=False)
-            >= float(_WORKER_MIN_CONFIDENCE)
-        )
+        confidence_filtered = _read_confidence_filtered(file_path)
 
         metric_counts = _metric_counts_from_confidence_filtered(
             confidence_filtered

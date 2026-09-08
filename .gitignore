@@ -66,3 +66,7 @@ Dockerfile
 
 # log of upgrades
 upgrade_log.json
+
+# test files
+transfer.py
+sync_detection_parquet.py

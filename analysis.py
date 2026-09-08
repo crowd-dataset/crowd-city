@@ -30,6 +30,11 @@ from utils.analytics.geo import Geo
 from utils.analytics.io import IO
 from utils.analytics.mapping_enrichment import Mapping_Enrich
 from utils.analytics.metrics_cache import MetricsCache
+from utils.analytics.parquet_store import (
+    DETECTION_FOLDER,
+    configured_parquet_roots,
+    sync_detection_parquet_store,
+)
 from utils.analytics.csv_parallel import (
     COCO_CLASSES as PARALLEL_COCO_CLASSES,
     initialise_csv_worker,
@@ -1931,18 +1936,17 @@ def _build_integrated_speed_sources(
     df_mapping_source: "pl.DataFrame",
     crossing_tracks: Dict[str, object],
 ) -> list[dict[str, object]]:
-    """Map processed CROWD bbox CSV files to their city and crossing IDs."""
-    csv_by_source: Dict[str, str] = {}
-    for data_root in common.get_configs("data"):
-        bbox_root = os.path.join(os.fspath(data_root), "bbox")
+    """Map processed CROWD bbox Parquet files to city and crossing IDs."""
+    parquet_by_source: Dict[str, str] = {}
+    for parquet_root in configured_parquet_roots():
+        bbox_root = os.path.join(os.fspath(parquet_root), "bbox")
         if not os.path.isdir(bbox_root):
             continue
         for file_name in os.listdir(bbox_root):
-            if not file_name.lower().endswith(".csv"):
+            if not file_name.lower().endswith(".parquet"):
                 continue
-            clean_name = tools.clean_csv_filename(file_name)
-            source_id = os.path.splitext(clean_name)[0]
-            csv_by_source[source_id] = os.path.join(bbox_root, file_name)
+            source_id = os.path.splitext(file_name)[0]
+            parquet_by_source[source_id] = os.path.join(bbox_root, file_name)
 
     aspect_ratio_text = os.environ.get("CROWD_BBOX_ASPECT_RATIO", str(16.0 / 9.0))
     try:
@@ -1961,10 +1965,10 @@ def _build_integrated_speed_sources(
 
     output: list[dict[str, object]] = []
     for source_id, payload in crossing_tracks.items():
-        bbox_csv = csv_by_source.get(str(source_id))
-        if bbox_csv is None:
+        bbox_parquet = parquet_by_source.get(str(source_id))
+        if bbox_parquet is None:
             logger.warning(
-                f"Crossing motion report cannot find the bbox CSV for {source_id}; skipping."
+                f"Crossing motion report cannot find the bbox Parquet file for {source_id}; skipping."
             )
             continue
         try:
@@ -1996,7 +2000,10 @@ def _build_integrated_speed_sources(
         output.append(
             {
                 "source_id": str(source_id),
-                "bbox_csv": bbox_csv,
+                # The reporting API retains the historical key name
+                # ``bbox_csv``, but the path is a Parquet file. A loader
+                # adapter installed below handles it transparently.
+                "bbox_csv": bbox_parquet,
                 "fps": fps,
                 "aspect_ratio": aspect_ratio,
                 "locality": row.get("locality") or "Unknown",
@@ -2008,6 +2015,24 @@ def _build_integrated_speed_sources(
     return output
 
 
+def _install_parquet_bbox_loader() -> None:
+    """Teach the legacy crossing report loader to consume Parquet paths."""
+    if getattr(crossing_metrics_module, "_CROWD_PARQUET_LOADER_INSTALLED", False):
+        return
+
+    original_loader = crossing_metrics_module.load_bbox_csv
+
+    def load_bbox_source(path):
+        source_path = os.fspath(path)
+        if os.path.splitext(source_path)[1].lower() == ".parquet":
+            dataframe = pl.read_parquet(source_path)
+            return crossing_metrics_module.bbox_rows_from_polars(dataframe)
+        return original_loader(path)
+
+    crossing_metrics_module.load_bbox_csv = load_bbox_source
+    crossing_metrics_module._CROWD_PARQUET_LOADER_INSTALLED = True
+
+
 def _run_integrated_speed_reporting(
     df_mapping_source: "pl.DataFrame",
     crossing_tracks: Dict[str, object],
@@ -2017,6 +2042,7 @@ def _run_integrated_speed_reporting(
         logger.info("Integrated crossing motion report disabled by CROWD_SPEED_REPORT.")
         return
     try:
+        _install_parquet_bbox_loader()
         from utils.crossing.metrics import run_integrated_speed_report
 
         output_root = os.environ.get(
@@ -2086,6 +2112,15 @@ def _prepare_waymo_tuned_parameters() -> Dict[str, object]:
 # Execute analysis
 if __name__ == "__main__":
     logger.info("Analysis started.")
+
+    parquet_summary = sync_detection_parquet_store()
+    logger.info(
+        f"Parquet source ready: {parquet_summary['stored_files']} stored file(s); "
+        f"{parquet_summary['source_files']} CSV file(s) currently available, "
+        f"{parquet_summary['converted']} converted or refreshed, "
+        f"{parquet_summary['reused']} corresponding Parquet file(s) reused, "
+        f"{parquet_summary.get('skipped_empty', 0)} empty CSV file(s) skipped."
+    )
 
     waymo_crossing_parameters = _prepare_waymo_tuned_parameters()
     city_limit = _normalise_city_limit(common.get_configs("n_cities"))
@@ -2784,108 +2819,102 @@ if __name__ == "__main__":
         all_speed = {}
         all_time = {}
 
-        logger.info("Processing csv files.")
+        logger.info("Processing detection files from the Parquet store.")
         pedestrian_crossing_count, data = {}, {}
         pedestrian_crossing_count_all = {}
 
         min_conf = common.get_configs("min_confidence")
 
         # ------------------------------------------------------------------
-        # Concurrent CSV processing
+        # Concurrent bbox processing
         # ------------------------------------------------------------------
         csv_tasks = []
 
         boundary_left_default = float(common.get_configs("boundary_left"))
         boundary_right_default = float(common.get_configs("boundary_right"))
 
-        for folder_path in common.get_configs("data"):
-            if not os.path.exists(folder_path):
-                logger.warning(f"Folder does not exist: {folder_path}.")
+        for folder_path in configured_parquet_roots():
+            bbox_path = os.path.join(folder_path, DETECTION_FOLDER)
+            if not os.path.exists(bbox_path):
+                logger.warning(f"Folder does not exist: {bbox_path}.")
                 continue
 
-            for subfolder in common.get_configs("sub_domain"):
-                subfolder_path = os.path.join(folder_path, subfolder)
-                if not os.path.exists(subfolder_path):
+            detection_files = analytics_IO.parquet_detection_files(bbox_path)
+            for file_name in tqdm(
+                detection_files,
+                desc=f"Indexing detection files in {bbox_path}",
+            ):
+                filtered: Optional[str] = analytics_IO.filter_detection_file(
+                    file=file_name,
+                    df_mapping=df_mapping,
+                )
+                if filtered is None:
                     continue
 
-                for file_name in tqdm(
-                    os.listdir(subfolder_path),
-                    desc=f"Indexing files in {subfolder_path}",
-                ):
-                    filtered: Optional[str] = analytics_IO.filter_csv_files(
-                        file=file_name,
-                        df_mapping=df_mapping,
-                    )
-                    if filtered is None:
-                        continue
+                file_str = os.fspath(filtered)
+                if file_str in MISC_FILES:
+                    continue
 
-                    file_str = os.fspath(filtered)
-                    if file_str in MISC_FILES:
-                        continue
+                file_path = os.path.join(bbox_path, file_str)
+                filename_no_ext = os.path.splitext(file_str)[0]
 
-                    file_path = os.path.join(subfolder_path, file_str)
-                    base_name = tools.clean_csv_filename(file_str)
-                    filename_no_ext = os.path.splitext(base_name)[0]
+                try:
+                    video_id, start_index_text, fps_text = (
+                        filename_no_ext.rsplit("_", 2)
+                    )
+                    start_index = int(start_index_text)
+                    fps = float(fps_text)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"Unexpected filename format: {filename_no_ext}"
+                    )
+                    continue
 
-                    try:
-                        video_id, start_index_text, fps_text = (
-                            filename_no_ext.rsplit("_", 2)
-                        )
-                        start_index = int(start_index_text)
-                        fps = float(fps_text)
-                    except (TypeError, ValueError):
-                        logger.warning(
-                            f"Unexpected filename format: {filename_no_ext}"
-                        )
-                        continue
+                segment_meta = segment_lookup.get(
+                    (video_id, start_index)
+                )
+                video_locality_id = (
+                    segment_meta[0]
+                    if segment_meta is not None
+                    else None
+                )
+                time_video = (
+                    float(segment_meta[1])
+                    if segment_meta is not None
+                    else 0.0
+                )
 
-                    segment_meta = segment_lookup.get(
-                        (video_id, start_index)
+                place = (
+                    id_to_place.get(int(video_locality_id))
+                    if video_locality_id is not None
+                    else None
+                )
+                if place is None:
+                    logger.warning(
+                        f"{file_str}: no mapping row found for "
+                        f"id={video_locality_id}."
                     )
-                    video_locality_id = (
-                        segment_meta[0]
-                        if segment_meta is not None
-                        else None
-                    )
-                    time_video = (
-                        float(segment_meta[1])
-                        if segment_meta is not None
-                        else 0.0
-                    )
+                    continue
 
-                    place = (
-                        id_to_place.get(int(video_locality_id))
-                        if video_locality_id is not None
-                        else None
-                    )
-                    if place is None:
-                        logger.warning(
-                            f"{file_str}: no mapping row found for "
-                            f"id={video_locality_id}."
-                        )
-                        continue
+                video_locality, video_state, video_country = place
+                logger.debug(
+                    f"{file_str}: found values {video_locality}, "
+                    f"{video_state}, {video_country}."
+                )
 
-                    video_locality, video_state, video_country = place
-                    logger.debug(
-                        f"{file_str}: found values {video_locality}, "
-                        f"{video_state}, {video_country}."
-                    )
-
-                    csv_tasks.append(
-                        {
-                            "file_path": file_path,
-                            "file_name": file_str,
-                            "filename_no_ext": filename_no_ext,
-                            "video_id": video_id,
-                            "start_index": start_index,
-                            "fps": fps,
-                            "video_locality_id": int(video_locality_id),
-                            "time_video": time_video,
-                            "is_bbox_stream": (
-                                str(subfolder).strip().lower() == "bbox"
-                            ),
-                        }
-                    )
+                csv_tasks.append(
+                    {
+                        "file_path": file_path,
+                        "file_name": file_str,
+                        "filename_no_ext": filename_no_ext,
+                        "video_id": video_id,
+                        "start_index": start_index,
+                        "fps": fps,
+                        "video_locality_id": int(video_locality_id),
+                        "time_video": time_video,
+                        "is_bbox_stream": True,
+                    }
+                )
 
         worker_env = os.environ.get("CROWD_CSV_WORKERS", "").strip()
         if worker_env:
@@ -2902,7 +2931,7 @@ if __name__ == "__main__":
         csv_workers = min(csv_workers, len(csv_tasks)) if csv_tasks else 1
 
         logger.info(
-            f"Analysing {len(csv_tasks)} CSV files with "
+            f"Analysing {len(csv_tasks)} detection files with "
             f"{csv_workers} worker process"
             f"{'es' if csv_workers != 1 else ''}."
         )
@@ -2929,7 +2958,7 @@ if __name__ == "__main__":
         def merge_worker_result(result):
             if result.get("status") != "ok":
                 logger.error(
-                    f"CSV analysis failed: "
+                    f"Detection analysis failed: "
                     f"{result.get('message', result.get('file_name', 'unknown'))}"
                 )
                 return
@@ -2989,7 +3018,7 @@ if __name__ == "__main__":
             for result in tqdm(
                 result_iterator,
                 total=len(csv_tasks),
-                desc="Analysing CSV files",
+                desc="Analysing detection files",
             ):
                 merge_worker_result(result)
         else:
@@ -3010,7 +3039,7 @@ if __name__ == "__main__":
                 for result in tqdm(
                     result_iterator,
                     total=len(csv_tasks),
-                    desc="Analysing CSV files",
+                    desc="Analysing detection files",
                 ):
                     merge_worker_result(result)
 

@@ -3,16 +3,16 @@ metrics_cache.py
 
 Purpose
 -------
-Compute and cache per-video detection metrics derived from YOLO CSV outputs, then wrap/aggregate
+Compute and cache per-video detection metrics derived from YOLO detection files, then wrap/aggregate
 those metrics via Grouping.locality_country_wrapper() using the mapping dataframe.
 
 Key design points
 -----------------
 - Uses a class-level cache so multiple downstream calls do not re-scan the filesystem or re-read CSVs.
-- Captures small per-file aggregate counts when analysis.py reads each detection CSV for the first time.
-- Reuses those aggregates later so the normal analysis path does not read the same CSV files twice.
-- Falls back to reading a CSV when it was not observed during the main analysis pass.
-- Indexes CSV files once per compute run for fast lookup by filename/prefix.
+- Captures small per-file aggregate counts when analysis.py reads each detection file for the first time.
+- Reuses those aggregates later so the normal analysis path does not read the same detection files twice.
+- Falls back to reading Parquet or CSV when it was not observed during the main analysis pass.
+- Indexes detection files once per compute run, preferring Parquet over CSV.
 - Computes rates per minute for most object classes.
 - Computes a specialised cellphones-per-person normalised measure.
 
@@ -35,6 +35,7 @@ from tqdm import tqdm
 
 import common
 from custom_logger import CustomLogger
+from utils.analytics.parquet_store import DETECTION_FOLDER, configured_parquet_roots
 from utils.core.grouping import Grouping
 from utils.core.metadata import MetaData
 
@@ -67,7 +68,7 @@ _LOGGER = CustomLogger(__name__)
 
 class MetricsCache:
     """
-    Compute and cache metrics derived from YOLO detection CSVs.
+    Compute and cache metrics derived from YOLO detection files.
 
     Public entrypoints
     ------------------
@@ -84,7 +85,7 @@ class MetricsCache:
     Example keys:
       "cellphones", "traffic_signs", "vehicles", "bicycles", "cars", "motorcycles", "buses", "trucks", "persons"
 
-    _file_metrics_cache stores only compact aggregate counts per CSV filename. It does not retain
+    _file_metrics_cache stores only compact aggregate counts per detection filename. It does not retain
     the full detection DataFrame, so using the single-pass path has a small memory footprint.
     """
 
@@ -125,11 +126,9 @@ class MetricsCache:
 
         try:
             data_folders = common.get_configs("data") or []
-            subfolders = common.get_configs("sub_domain") or []
             cls._capture_roots = tuple(
-                os.path.realpath(os.path.join(os.fspath(folder), os.fspath(subfolder)))
+                os.path.realpath(os.path.join(os.fspath(folder), DETECTION_FOLDER))
                 for folder in data_folders
-                for subfolder in subfolders
             )
         except Exception:
             cls._capture_roots = ()
@@ -273,25 +272,39 @@ class MetricsCache:
         return re.findall(r"[\w-]+", videos_cell)
 
     @staticmethod
-    def _index_csv_files(data_folders: Sequence[str], subfolders: Sequence[str]) -> Dict[str, str]:
-        """
-        Build a filename -> full_path index for detection CSVs.
+    def _index_csv_files(data_folders: Sequence[str]) -> Dict[str, str]:
+        """Build a filename -> full path index from fixed ``bbox`` folders.
 
-        This allows O(1) lookup once we know the exact filename, and quick prefix checks when only
-        vid/start_time is known.
+        The method name is retained for backwards compatibility. The Parquet
+        mirror is the normal source, although CSV remains accepted by the
+        fallback reader for compatibility.
         """
-        csv_index: Dict[str, str] = {}
+        detection_index: Dict[str, str] = {}
+
         for folder_path in data_folders:
-            for sub in subfolders:
-                sub_path = os.path.join(folder_path, sub)
-                if not os.path.exists(sub_path):
+            bbox_path = os.path.join(folder_path, DETECTION_FOLDER)
+            if not os.path.exists(bbox_path):
+                continue
+
+            selected_by_stem: Dict[str, Tuple[str, str]] = {}
+            for fname in os.listdir(bbox_path):
+                if fname.startswith("."):
                     continue
 
-                for fname in os.listdir(sub_path):
-                    if fname.endswith(".csv"):
-                        csv_index[fname] = os.path.join(sub_path, fname)
+                stem, extension = os.path.splitext(fname)
+                extension = extension.lower()
+                if extension not in {".csv", ".parquet"}:
+                    continue
 
-        return csv_index
+                record = (fname, os.path.join(bbox_path, fname))
+                current = selected_by_stem.get(stem)
+                if current is None or extension == ".parquet":
+                    selected_by_stem[stem] = record
+
+            for fname, file_path in selected_by_stem.values():
+                detection_index[fname] = file_path
+
+        return detection_index
 
     @staticmethod
     def _index_csv_segments(
@@ -309,7 +322,8 @@ class MetricsCache:
         ] = {}
 
         for filename, file_path in csv_files.items():
-            if not filename.lower().endswith(".csv"):
+            extension = os.path.splitext(filename)[1].lower()
+            if extension not in {".csv", ".parquet"}:
                 continue
 
             stem = os.path.splitext(filename)[0]
@@ -332,12 +346,12 @@ class MetricsCache:
     def _extract_fps_from_filename(vid: str, start_time: str, filename: str) -> Optional[int]:
         """
         Extract FPS from filenames matching:
-            {vid}_{start_time}_{fps}.csv
+            {vid}_{start_time}_{fps}.csv or .parquet
 
         Returns:
             int FPS if pattern matches, otherwise None.
         """
-        pattern = rf"^{re.escape(str(vid))}_{re.escape(str(start_time))}_(\\d+)\\.csv$"
+        pattern = rf"^{re.escape(str(vid))}_{re.escape(str(start_time))}_(\d+)\.(?:csv|parquet)$"
         match = re.match(pattern, filename)
         if not match:
             return None
@@ -367,10 +381,9 @@ class MetricsCache:
         The normal path reuses aggregate counts captured when analysis.py first loaded each detection
         CSV. A disk read is performed only for files that were not observed during that first pass.
         """
-        # 1) Build an index of available detection CSVs
-        data_folders = common.get_configs("data")
-        subfolders = common.get_configs("sub_domain")
-        csv_files = cls._index_csv_files(data_folders, subfolders)
+        # 1) Build an index of available detection files, preferring Parquet
+        data_folders = configured_parquet_roots()
+        csv_files = cls._index_csv_files(data_folders)
         csv_segments = cls._index_csv_segments(csv_files)
         mapping_segments = _METADATA.segment_lookup(df_mapping)
 
@@ -392,7 +405,7 @@ class MetricsCache:
         # 3) Iterate mapping rows (Polars)
         mapping_iter = df_mapping.select(["videos", "start_time", "time_of_day"]).iter_rows(named=True)
 
-        for row in tqdm(mapping_iter, total=df_mapping.height, desc="Analysing the csv files:"):
+        for row in tqdm(mapping_iter, total=df_mapping.height, desc="Analysing detection files:"):
             videos_cell = row.get("videos")
             start_time_cell = row.get("start_time")
             time_of_day_cell = row.get("time_of_day")
@@ -459,18 +472,51 @@ class MetricsCache:
                         # Preserve previous behaviour for files that were skipped or otherwise not
                         # observed in the main pass.
                         try:
-                            df = cls._original_read_csv(file_path)
+                            extension = os.path.splitext(file_path)[1].lower()
+                            required_cols = {"confidence", "yolo-id", "unique-id"}
+
+                            if extension == ".parquet":
+                                lazy_df = pl.scan_parquet(
+                                    file_path,
+                                    use_statistics=True,
+                                )
+                                schema_names = set(
+                                    lazy_df.collect_schema().names()
+                                )
+                                if not required_cols.issubset(schema_names):
+                                    continue
+
+                                df = (
+                                    lazy_df
+                                    .filter(
+                                        pl.col("confidence").cast(
+                                            pl.Float64,
+                                            strict=False,
+                                        ) >= min_conf
+                                    )
+                                    .select(["yolo-id", "unique-id"])
+                                    .collect()
+                                )
+                            else:
+                                df = cls._original_read_csv(file_path)
+                                if not required_cols.issubset(set(df.columns)):
+                                    continue
+                                df = (
+                                    df
+                                    .filter(
+                                        pl.col("confidence").cast(
+                                            pl.Float64,
+                                            strict=False,
+                                        ) >= min_conf
+                                    )
+                                    .select(["yolo-id", "unique-id"])
+                                )
                         except Exception as exc:
-                            _LOGGER.warning(f"[WARNING] Failed reading {file_path}: {exc}")
+                            _LOGGER.warning(
+                                f"[WARNING] Failed reading {file_path}: {exc}"
+                            )
                             continue
 
-                        required_cols = {"confidence", "yolo-id", "unique-id"}
-                        if not required_cols.issubset(set(df.columns)):
-                            continue
-
-                        df = df.filter(
-                            pl.col("confidence").cast(pl.Float64, strict=False) >= min_conf
-                        )
                         counts = cls._metric_counts_from_dataframe(df)
                         cls._file_metrics_cache[filename] = counts
                         fallback_reads += 1
@@ -504,7 +550,7 @@ class MetricsCache:
                         ) * 1000.0
 
         _LOGGER.info(
-            f"MetricsCache reused first-pass aggregates for {reused_files} CSV files; "
+            f"MetricsCache reused first-pass aggregates for {reused_files} detection files; "
             f"fallback disk reads: {fallback_reads}."
         )
 
