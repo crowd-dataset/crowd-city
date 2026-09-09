@@ -1,8 +1,9 @@
 """Persistent Parquet store for CROWD detection CSV files.
 
-Detection CSV files are treated as optional ingestion inputs. Before analysis
-starts, this module converts any new or updated CSV from each ``data/bbox``
-folder into the corresponding ``parquet_data/bbox`` folder.
+Detection CSV files are treated as optional ingestion inputs. When
+``sync_parquet_on_start`` is enabled, this module converts any new or updated
+CSV from each ``data/bbox`` folder into the corresponding
+``parquet_data/bbox`` folder.
 
 Parquet files are persistent: a Parquet file is never deleted merely because
 its source CSV is missing. This allows the CSV directories to be emptied after
@@ -207,6 +208,14 @@ def _convert_one(
         raise
 
 
+def _sync_on_start_enabled() -> bool:
+    """Return whether CSV to Parquet synchronisation should run at startup."""
+    value = common.get_configs("sync_parquet_on_start")
+    if not isinstance(value, bool):
+        raise ValueError("sync_parquet_on_start must be true or false")
+    return value
+
+
 def sync_detection_parquet_store(
     force: bool = False,
     compression: str = DEFAULT_COMPRESSION,
@@ -214,13 +223,33 @@ def sync_detection_parquet_store(
 ) -> Dict[str, int]:
     """Add new or updated CSV detections to the persistent Parquet store.
 
-    Existing up to date Parquet files are reused. A target is regenerated when
-    it is missing, empty, older than its source CSV, or ``force=True``.
+    When ``sync_parquet_on_start`` is false, return immediately without
+    discovering CSV files, counting Parquet files, comparing timestamps, or
+    converting anything. Existing Parquet files remain untouched and the
+    normal analysis continues using the configured Parquet store.
+
+    When enabled, existing up to date Parquet files are reused. A target is
+    regenerated when it is missing, empty, older than its source CSV, or
+    ``force=True``.
 
     Empty source CSVs are skipped and reported, not treated as fatal errors.
     Parquet files whose source CSV is absent are deliberately retained. This
     supports a Parquet only workflow after the initial conversion.
     """
+    if not _sync_on_start_enabled():
+        logger.info(
+            "Parquet synchronisation skipped because "
+            "sync_parquet_on_start is false."
+        )
+        return {
+            "source_files": 0,
+            "converted": 0,
+            "reused": 0,
+            "skipped_empty": 0,
+            "stored_files": 0,
+            "errors": 0,
+        }
+
     jobs = _discover_jobs()
     stored_before = _count_parquet_files()
 

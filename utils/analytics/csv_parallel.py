@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 
 import polars as pl
 
+import common
 from utils.crossing.detection import Detection
 from utils.crossing.metrics import Metrics
 import utils.crossing.metrics as crossing_metrics_module
@@ -25,6 +26,7 @@ _WORKER_CROSSING_PARAMETERS: Dict[str, Any] = {}
 _WORKER_MIN_CONFIDENCE: float = 0.0
 _WORKER_BOUNDARY_LEFT: float = 0.45
 _WORKER_BOUNDARY_RIGHT: float = 0.55
+_WORKER_PROCESSING_FPS: Optional[float] = None
 
 _DETECTION = Detection()
 _METRICS = Metrics()
@@ -69,12 +71,16 @@ def initialise_csv_worker(
     global _WORKER_MIN_CONFIDENCE
     global _WORKER_BOUNDARY_LEFT
     global _WORKER_BOUNDARY_RIGHT
+    global _WORKER_PROCESSING_FPS
 
     _WORKER_MAPPING = mapping
     _WORKER_CROSSING_PARAMETERS = dict(crossing_parameters or {})
     _WORKER_MIN_CONFIDENCE = float(min_confidence)
     _WORKER_BOUNDARY_LEFT = float(boundary_left)
     _WORKER_BOUNDARY_RIGHT = float(boundary_right)
+    _WORKER_PROCESSING_FPS = _normalise_processing_fps(
+        common.get_configs("processing_fps")
+    )
 
     # The Waymo speed model is loaded in the parent before the worker pool
     # starts. Copy the already loaded model state into each spawned process so
@@ -84,6 +90,96 @@ def initialise_csv_worker(
     os.environ["CROWD_CROSSING_SPEED_UNIT"] = (
         "m/s" if crossing_metrics_module._SPEED_MODEL else "relative"
     )
+
+
+def _normalise_processing_fps(value: object) -> Optional[float]:
+    """Return the configured target analysis FPS, or None for native FPS."""
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, bool):
+        raise ValueError("processing_fps must be a positive number or null")
+
+    try:
+        fps = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "processing_fps must be a positive number or null"
+        ) from error
+
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError(
+            "processing_fps must be a positive finite number or null"
+        )
+
+    return fps
+
+
+def _resample_detection_fps(
+    df: pl.DataFrame,
+    source_fps: float,
+    target_fps: Optional[float],
+) -> tuple[pl.DataFrame, float]:
+    """Downsample detections to a common analysis FPS and reindex frames.
+
+    The detection files retain their original frame numbers. When a lower
+    processing FPS is configured, this function keeps frames on a deterministic
+    sampling grid and rewrites ``frame-count`` to the corresponding processing
+    frame index. Downstream code can therefore use the returned effective FPS
+    directly for timing and frame-scaled thresholds.
+
+    Sources below the configured target are never upsampled. In that case all
+    available frames are retained and the native source FPS remains effective.
+    """
+    if not math.isfinite(source_fps) or source_fps <= 0:
+        raise ValueError(f"Invalid source FPS: {source_fps}")
+
+    if target_fps is None or target_fps >= source_fps:
+        return df, float(source_fps)
+
+    if df.height == 0 or "frame-count" not in df.columns:
+        return df, float(target_fps)
+
+    frame_expr = pl.col("frame-count").cast(pl.Float64, strict=False)
+    finite_frames = (
+        df
+        .select(frame_expr.alias("_source_frame"))
+        .filter(pl.col("_source_frame").is_not_null())
+        .filter(pl.col("_source_frame").is_finite())
+    )
+    if finite_frames.height == 0:
+        return df.clear(), float(target_fps)
+
+    first_frame = float(finite_frames.get_column("_source_frame").min())
+    ratio = float(target_fps) / float(source_fps)
+    inverse_ratio = float(source_fps) / float(target_fps)
+
+    sampled = (
+        df
+        .with_columns(frame_expr.alias("_source_frame"))
+        .filter(pl.col("_source_frame").is_not_null())
+        .filter(pl.col("_source_frame").is_finite())
+        .with_columns(
+            ((pl.col("_source_frame") - first_frame) * ratio)
+            .round(0)
+            .cast(pl.Int64)
+            .alias("_processing_frame")
+        )
+        .with_columns(
+            (
+                first_frame
+                + pl.col("_processing_frame").cast(pl.Float64) * inverse_ratio
+            )
+            .round(0)
+            .alias("_expected_source_frame")
+        )
+        .filter(pl.col("_source_frame") == pl.col("_expected_source_frame"))
+        .drop("frame-count", "_source_frame", "_expected_source_frame")
+        .rename({"_processing_frame": "frame-count"})
+    )
+
+    return sampled, float(target_fps)
 
 
 def _empty_metric_counts() -> Dict[str, int]:
@@ -314,7 +410,6 @@ def _object_counts(df: pl.DataFrame) -> Dict[str, int]:
     }
 
 
-
 def _read_confidence_filtered(file_path: str) -> pl.DataFrame:
     """Read one detection file and apply the confidence filter as early as possible.
 
@@ -351,6 +446,48 @@ def _read_confidence_filtered(file_path: str) -> pl.DataFrame:
 
     raise ValueError(f"Unsupported detection file format: {suffix or '<none>'}")
 
+
+def _limit_detection_duration(
+    df: pl.DataFrame,
+    duration_seconds: float,
+    fps: float,
+) -> pl.DataFrame:
+    """Keep only detection frames inside the mapped analysis duration.
+
+    ``duration_seconds`` comes from MetaData.segment_lookup(). For the one
+    segment that reaches a city's footage cap it may be shorter than the
+    original segment. Using the first observed frame as the origin works for
+    both relative and absolute frame-count conventions.
+    """
+    if (
+        df.height == 0
+        or duration_seconds <= 0
+        or not math.isfinite(duration_seconds)
+        or fps <= 0
+        or not math.isfinite(fps)
+        or "frame-count" not in df.columns
+    ):
+        return df
+
+    frame_values = (
+        df
+        .get_column("frame-count")
+        .cast(pl.Float64, strict=False)
+        .drop_nulls()
+    )
+    if len(frame_values) == 0:
+        return df
+
+    first_frame = float(frame_values.min())
+    last_allowed_frame = first_frame + duration_seconds * fps
+
+    return df.filter(
+        pl.col("frame-count")
+        .cast(pl.Float64, strict=False)
+        <= last_allowed_frame
+    )
+
+
 def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
     """Read and analyse one detection file, returning compact mergeable results."""
     mapping = _WORKER_MAPPING
@@ -364,12 +501,34 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
     file_path = os.fspath(task["file_path"])
     file_name = str(task["file_name"])
     filename_no_ext = str(task["filename_no_ext"])
-    fps = float(task["fps"])
+    source_fps = float(task["fps"])
     locality_id = int(task["video_locality_id"])
     is_bbox_stream = bool(task["is_bbox_stream"])
 
     try:
         confidence_filtered = _read_confidence_filtered(file_path)
+
+        # MetaData.segment_lookup supplies the original mapped duration for
+        # ordinary segments and the remaining budget for the final capped
+        # segment. Trim before every count and crossing calculation so no
+        # detections outside the requested per-city footage are analysed.
+        time_video = float(task.get("time_video", 0.0) or 0.0)
+        confidence_filtered = _limit_detection_duration(
+            confidence_filtered,
+            time_video,
+            source_fps,
+        )
+
+        # Apply a common processing frame rate after duration clipping. For
+        # example, a 30 FPS source analysed with processing_fps=5 keeps roughly
+        # every sixth source frame and rewrites frame-count onto a 5 FPS clock.
+        # A 3 FPS source remains at 3 FPS because missing frames are not
+        # synthesised.
+        confidence_filtered, fps = _resample_detection_fps(
+            confidence_filtered,
+            source_fps,
+            _WORKER_PROCESSING_FPS,
+        )
 
         metric_counts = _metric_counts_from_confidence_filtered(
             confidence_filtered
@@ -444,8 +603,6 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 fps,
             )
 
-        time_video = float(task.get("time_video", 0.0) or 0.0)
-
         return {
             "status": "ok",
             "file_name": file_name,
@@ -460,6 +617,8 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "object_counts": object_counts,
             "metric_counts": metric_counts,
             "time_video": float(time_video or 0),
+            "source_fps": float(source_fps),
+            "processing_fps": float(fps),
         }
 
     except Exception as exc:

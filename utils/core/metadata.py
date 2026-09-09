@@ -4,6 +4,8 @@ from collections import OrderedDict
 from typing import Any, ClassVar
 
 import polars as pl
+
+import common
 from custom_logger import CustomLogger
 
 logger = CustomLogger(__name__)  # use custom logger
@@ -74,6 +76,45 @@ class MetaData:
             return pl.col(colname).cast(pl.Int64, strict=False) == pl.lit(int(value))
         return pl.col(colname).cast(pl.Utf8, strict=False) == pl.lit(str(value))
 
+    @staticmethod
+    def _normalise_max_footage_seconds(value: object) -> float | None:
+        """Convert the optional per-city footage cap from hours to seconds."""
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        if isinstance(value, bool):
+            raise ValueError(
+                "max_footage_hours_per_city must be a positive number or null"
+            )
+
+        try:
+            hours = float(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "max_footage_hours_per_city must be a positive number or null"
+            ) from error
+
+        if not math.isfinite(hours) or hours < 0:
+            raise ValueError(
+                "max_footage_hours_per_city must be a positive finite number or null"
+            )
+
+        # null is the canonical no-cap value. Keep zero working for older local
+        # configuration files that used the previous convention.
+        if hours == 0:
+            return None
+
+        return hours * 3600.0
+
+    @staticmethod
+    def _city_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
+        """Return the same city identity used by n_cities selection."""
+        return tuple(
+            "" if row.get(column) is None else str(row.get(column))
+            for column in ("locality", "state", "iso3", "country")
+        )
+
     @classmethod
     def clear_video_index_cache(cls) -> None:
         """Clear all cached mapping indexes."""
@@ -87,9 +128,32 @@ class MetaData:
         dict[tuple[str, int], tuple[Any, ...]],
         dict[tuple[str, int], tuple[Any, float]],
     ]:
-        """Parse the mapping once and build all hot-path segment indexes."""
+        """Parse the mapping once and build all hot-path segment indexes.
+
+        ``analysis.py`` applies ``n_cities`` before this method is called.
+        Therefore city ranking is always based on each city's full available
+        footage. ``max_footage_hours_per_city`` is applied only afterwards to
+        the already selected cities.
+
+        Segments are consumed in their existing mapping order. If the final
+        segment would cross the configured cap, its effective duration is
+        shortened to the remaining budget. The worker then trims detection
+        frames to the same duration.
+        """
         metadata_index: dict[tuple[str, int], tuple[Any, ...]] = {}
         segment_index: dict[tuple[str, int], tuple[Any, float]] = {}
+
+        max_footage_seconds = cls._normalise_max_footage_seconds(
+            common.get_configs("max_footage_hours_per_city")
+        )
+        available_seconds_by_city: dict[
+            tuple[str, str, str, str],
+            float,
+        ] = {}
+        selected_seconds_by_city: dict[
+            tuple[str, str, str, str],
+            float,
+        ] = {}
 
         for row in df.iter_rows(named=True):
             video_ids = cls._parse_videos_cell(row.get("videos"))
@@ -119,6 +183,7 @@ class MetaData:
             literacy_rate = row.get("literacy_rate")
             avg_height = row.get("avg_height")
             iso3 = row.get("iso3")
+            city_key = cls._city_key(row)
 
             try:
                 pop_i = int(population) if population is not None else 0
@@ -155,10 +220,55 @@ class MetaData:
                     end_val = end_list[idx] if idx < len(end_list) else None
                     tod_val = tod_list[idx] if idx < len(tod_list) else None
 
+                    try:
+                        full_duration_seconds = float(end_val) - float(start_value)
+                    except (TypeError, ValueError):
+                        full_duration_seconds = 0.0
+
+                    if (
+                        not math.isfinite(full_duration_seconds)
+                        or full_duration_seconds < 0
+                    ):
+                        full_duration_seconds = 0.0
+
+                    available_seconds_by_city[city_key] = (
+                        available_seconds_by_city.get(city_key, 0.0)
+                        + full_duration_seconds
+                    )
+
+                    duration_seconds = full_duration_seconds
+                    effective_end_val = end_val
+
+                    if max_footage_seconds is not None:
+                        already_selected = selected_seconds_by_city.get(
+                            city_key,
+                            0.0,
+                        )
+                        remaining_seconds = (
+                            max_footage_seconds - already_selected
+                        )
+
+                        if remaining_seconds <= 0:
+                            continue
+
+                        if duration_seconds > remaining_seconds:
+                            duration_seconds = remaining_seconds
+                            clipped_end = float(start_value) + duration_seconds
+                            effective_end_val = (
+                                int(clipped_end)
+                                if clipped_end.is_integer()
+                                else clipped_end
+                            )
+
+                    selected_seconds_by_city[city_key] = (
+                        selected_seconds_by_city.get(city_key, 0.0)
+                        + duration_seconds
+                    )
+
                     metadata_without_fps = (
                         video,                 # 0
                         start_value,           # 1
-                        end_val,               # 2
+                        effective_end_val,     # 2
                         tod_val,               # 3
                         locality,              # 4
                         state,                 # 5
@@ -185,15 +295,28 @@ class MetaData:
                         metadata_without_fps,
                     )
 
-                    try:
-                        duration_seconds = float(end_val) - float(start_value)
-                    except (TypeError, ValueError):
-                        duration_seconds = 0.0
-
                     segment_index.setdefault(
                         segment_key,
                         (row.get("id"), float(duration_seconds)),
                     )
+
+        if max_footage_seconds is not None:
+            capped_city_count = sum(
+                1
+                for available_seconds in available_seconds_by_city.values()
+                if available_seconds > max_footage_seconds + 1e-9
+            )
+            selected_total_seconds = sum(selected_seconds_by_city.values())
+
+            logger.info(
+                "Applied max_footage_hours_per_city={:.2f}: "
+                "{} of {} indexed cities had more footage than the cap; "
+                "{:.2f} total footage hours were selected.",
+                max_footage_seconds / 3600.0,
+                capped_city_count,
+                len(available_seconds_by_city),
+                selected_total_seconds / 3600.0,
+            )
 
         return metadata_index, segment_index
 
