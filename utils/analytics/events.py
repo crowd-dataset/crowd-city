@@ -1,6 +1,5 @@
 import os
-from typing import Dict, Optional, Tuple
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import polars as pl
 from tqdm import tqdm
@@ -45,6 +44,10 @@ class Events:
 
         Only columns required by the event calculations are materialised.
         The confidence filter is applied lazily before collection.
+
+        Detection schemas are normalised here because historical Parquet files
+        may store the same field with different inferred types. Tracker IDs are
+        treated as opaque strings, while frame and YOLO class IDs are numeric.
         """
         file_path = cls._find_detection_path(str(video_key))
         if file_path is None:
@@ -63,18 +66,32 @@ class Events:
                 )
                 return None
 
-            columns = ["unique-id", "frame-count", "yolo-id"]
+            expressions = [
+                pl.col("unique-id")
+                .cast(pl.Utf8, strict=False)
+                .alias("unique-id"),
+                pl.col("frame-count")
+                .cast(pl.Int64, strict=False)
+                .alias("frame-count"),
+                pl.col("yolo-id")
+                .cast(pl.Int64, strict=False)
+                .alias("yolo-id"),
+            ]
 
             if "confidence" in schema_names:
-                columns.append("confidence")
                 lazy = lazy.filter(
                     pl.col("confidence").cast(
                         pl.Float64,
                         strict=False,
                     ) >= min_conf
                 )
+                expressions.append(
+                    pl.col("confidence")
+                    .cast(pl.Float64, strict=False)
+                    .alias("confidence")
+                )
 
-            return lazy.select(columns).collect()
+            return lazy.select(expressions).collect()
 
         except Exception as exc:
             logger.error(
@@ -82,6 +99,25 @@ class Events:
                 f"{video_key}: {exc}"
             )
             return None
+
+    @staticmethod
+    def _normalise_crossing_ids(values) -> List[str]:
+        """Return crossing tracker IDs in the same string format as event data."""
+        output: List[str] = []
+        for value in values:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if not text or text.lower() in {"nan", "none", "null"}:
+                continue
+            try:
+                numeric = float(text)
+                if numeric.is_integer():
+                    text = str(int(numeric))
+            except (TypeError, ValueError):
+                pass
+            output.append(text)
+        return output
 
     @staticmethod
     def crossing_event_with_traffic_equipment(
@@ -156,7 +192,7 @@ class Events:
             count_with_equipment = 0
             count_without_equipment = 0
 
-            uids = list(crossings.keys())
+            uids = Events._normalise_crossing_ids(crossings.keys())
             if not uids:
                 continue
 
@@ -166,11 +202,9 @@ class Events:
                 .group_by("unique-id")
                 .agg([
                     pl.col("frame-count")
-                    .cast(pl.Int64, strict=False)
                     .min()
                     .alias("_fmin"),
                     pl.col("frame-count")
-                    .cast(pl.Int64, strict=False)
                     .max()
                     .alias("_fmax"),
                 ])
@@ -181,16 +215,8 @@ class Events:
                     continue
 
                 seg = value.filter(
-                    (
-                        pl.col("frame-count")
-                        .cast(pl.Int64, strict=False)
-                        >= int(fmin)
-                    )
-                    & (
-                        pl.col("frame-count")
-                        .cast(pl.Int64, strict=False)
-                        <= int(fmax)
-                    )
+                    (pl.col("frame-count") >= int(fmin))
+                    & (pl.col("frame-count") <= int(fmax))
                 )
 
                 has_equipment = seg.select(
@@ -299,7 +325,7 @@ class Events:
             if not required.issubset(set(value.columns)):
                 continue
 
-            ids = list(df_ids.keys())
+            ids = Events._normalise_crossing_ids(df_ids.keys())
             if not ids:
                 continue
 
@@ -309,11 +335,9 @@ class Events:
                 .group_by("unique-id")
                 .agg([
                     pl.col("frame-count")
-                    .cast(pl.Int64, strict=False)
                     .min()
                     .alias("_fmin"),
                     pl.col("frame-count")
-                    .cast(pl.Int64, strict=False)
                     .max()
                     .alias("_fmax"),
                 ])
@@ -324,16 +348,8 @@ class Events:
                     continue
 
                 seg = value.filter(
-                    (
-                        pl.col("frame-count")
-                        .cast(pl.Int64, strict=False)
-                        >= int(fmin)
-                    )
-                    & (
-                        pl.col("frame-count")
-                        .cast(pl.Int64, strict=False)
-                        <= int(fmax)
-                    )
+                    (pl.col("frame-count") >= int(fmin))
+                    & (pl.col("frame-count") <= int(fmax))
                 )
 
                 yolo_9_exists = seg.select(

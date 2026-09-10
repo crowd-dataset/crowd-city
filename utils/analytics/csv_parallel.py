@@ -410,6 +410,44 @@ def _object_counts(df: pl.DataFrame) -> Dict[str, int]:
     }
 
 
+
+def _normalise_detection_schema(df: pl.DataFrame) -> pl.DataFrame:
+    # Normalise detection column types across CSV and Parquet sources.
+    if df.height == 0:
+        return df
+
+    expressions = []
+
+    if "yolo-id" in df.columns:
+        expressions.append(
+            pl.col("yolo-id").cast(pl.Int64, strict=False).alias("yolo-id")
+        )
+
+    if "unique-id" in df.columns:
+        expressions.append(
+            pl.col("unique-id").cast(pl.Utf8, strict=False).alias("unique-id")
+        )
+
+    if "frame-count" in df.columns:
+        expressions.append(
+            pl.col("frame-count").cast(pl.Int64, strict=False).alias("frame-count")
+        )
+
+    for column in (
+        "x-center",
+        "y-center",
+        "width",
+        "height",
+        "confidence",
+    ):
+        if column in df.columns:
+            expressions.append(
+                pl.col(column).cast(pl.Float64, strict=False).alias(column)
+            )
+
+    return df.with_columns(expressions) if expressions else df
+
+
 def _read_confidence_filtered(file_path: str) -> pl.DataFrame:
     """Read one detection file and apply the confidence filter as early as possible.
 
@@ -425,7 +463,7 @@ def _read_confidence_filtered(file_path: str) -> pl.DataFrame:
         if "confidence" not in schema_names:
             raise ValueError("confidence column is missing")
 
-        return (
+        filtered = (
             lazy_df
             .filter(
                 pl.col("confidence").cast(pl.Float64, strict=False)
@@ -433,16 +471,18 @@ def _read_confidence_filtered(file_path: str) -> pl.DataFrame:
             )
             .collect()
         )
+        return _normalise_detection_schema(filtered)
 
     if suffix == ".csv":
         raw_df = pl.read_csv(file_path)
         if "confidence" not in raw_df.columns:
             raise ValueError("confidence column is missing")
 
-        return raw_df.filter(
+        filtered = raw_df.filter(
             pl.col("confidence").cast(pl.Float64, strict=False)
             >= float(_WORKER_MIN_CONFIDENCE)
         )
+        return _normalise_detection_schema(filtered)
 
     raise ValueError(f"Unsupported detection file format: {suffix or '<none>'}")
 
@@ -542,9 +582,15 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 "message": f"{file_name}: required detection columns are missing.",
             }
 
+        uid_text = (
+            pl.col("unique-id")
+            .cast(pl.Utf8, strict=False)
+            .str.strip_chars()
+            .str.to_lowercase()
+        )
         df = confidence_filtered.filter(
-            pl.col("unique-id").is_not_null()
-            & (pl.col("unique-id") != -1)
+            uid_text.is_not_null()
+            & ~uid_text.is_in(["", "-1", "-1.0", "nan", "none", "null"])
         )
 
         track_index = _build_track_index(df) if is_bbox_stream else {}
