@@ -162,34 +162,10 @@ def get_configs(
     if content is None:
         sys.exit()
 
-    # These options change which detections are analysed. Therefore a cached
-    # whole-dataset results.pickle must not be reused while either option is
-    # active. analysis.py already bypasses that cache when always_analyse is
-    # true, so make the existing switch effective automatically.
-    if entry_name == "always_analyse":
-        cap_value = content.get("max_footage_hours_per_city")
-        if cap_value is not None and not (
-            isinstance(cap_value, str) and not cap_value.strip()
-        ):
-            try:
-                # Zero remains accepted as a backwards-compatible spelling of
-                # no cap, although null is now the canonical configuration.
-                if float(cap_value) != 0:
-                    return True
-            except (TypeError, ValueError):
-                # Force a fresh analysis so MetaData can raise a clear
-                # validation error for an invalid non-empty cap value.
-                return True
-
-        processing_fps = content.get("processing_fps")
-        if processing_fps is not None and not (
-            isinstance(processing_fps, str) and not processing_fps.strip()
-        ):
-            # A configured processing FPS changes frame sampling and therefore
-            # every downstream crossing, timing, speed, and object calculation.
-            # Invalid non-empty values also force a fresh run so the worker can
-            # surface the validation error instead of silently loading cache.
-            return True
+    # Cache reuse is decided in analysis.py using the configuration metadata
+    # stored with results.pickle. Settings such as max_footage_hours_per_city
+    # and processing_fps are part of that cache fingerprint, so they must not
+    # silently force always_analyse=True here.
 
     return content[entry_name]
 

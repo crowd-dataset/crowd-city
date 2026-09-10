@@ -30,6 +30,7 @@ from utils.analytics.geo import Geo
 from utils.analytics.io import IO
 from utils.analytics.mapping_enrichment import Mapping_Enrich
 from utils.analytics.metrics_cache import MetricsCache
+from utils.analytics.structure import analyse_structure
 from utils.analytics.parquet_store import (
     DETECTION_FOLDER,
     configured_parquet_roots,
@@ -52,6 +53,7 @@ from utils.plotting.crossings import Crossings
 from utils.plotting.distributions import Distributions
 from utils.plotting.maps import Maps
 from utils.plotting.stacked import Stacked
+from utils.plotting.structure import StructurePlots
 
 # ---------------------------------------------------------------------
 # Global configuration
@@ -86,6 +88,7 @@ crossing = Crossings()
 geo = Geo()
 correlation = Correlations()
 aggregation = Aggregation()
+structure_plots = StructurePlots()
 
 # ---------------------------------------------------------------------
 # Constants
@@ -1803,7 +1806,6 @@ def _normalise_city_limit(value: object) -> int:
     if not math.isfinite(numeric) or not numeric.is_integer():
         raise ValueError("n_cities must be a finite integer")
     return int(numeric)
-
 
 
 # ---------------------------------------------------------------------
@@ -3984,7 +3986,11 @@ if __name__ == "__main__":
         results_list[27] = avg_speed_country  # Update country speed
         results_list[26] = df_mapping         # Update mapping (polars)
         with open(file_results, "wb") as file:
-            pickle.dump(tuple(results_list), file)
+            pickle.dump(
+                tuple(results_list[:CACHE_RESULTS_COUNT])
+                + (_build_cache_metadata(current_cache_config),),
+                file,
+            )
         logger.info("Updated speed values in the pickle file.")
 
     # --- Check if reanalysis of waiting time is required ---
@@ -4008,7 +4014,11 @@ if __name__ == "__main__":
         results_list[28] = avg_time_country  # Update country waiting time
         results_list[26] = df_mapping        # Update mapping
         with open(file_results, "wb") as file:
-            pickle.dump(tuple(results_list), file)
+            pickle.dump(
+                tuple(results_list[:CACHE_RESULTS_COUNT])
+                + (_build_cache_metadata(current_cache_config),),
+                file,
+            )
         logger.info("Updated time values in the pickle file.")
 
     # --- Remove countries/cities with insufficient crossing detections ---
@@ -4040,9 +4050,32 @@ if __name__ == "__main__":
     os.makedirs(common.output_dir, exist_ok=True)
     df_mapping.write_csv(os.path.join(common.output_dir, "mapping_updated.csv"))
 
-    # CROWD is always analysed. Optional Waymo preparation is controlled by
-    # config and cannot stop the CROWD report when Waymo is unavailable.
-    _run_integrated_speed_reporting(df_mapping, pedestrian_crossing_count)
+    # The main crossing speed values are already stored in results.pickle.
+    # On a cache hit, reuse all_speed and its derived aggregates instead of
+    # reopening every bbox file solely for the integrated diagnostic report.
+    # Set CROWD_SPEED_REPORT_FORCE=true to explicitly request that expensive
+    # diagnostic pass even when the main analysis cache is reused.
+    if use_cached_results and not _environment_truthy(
+        "CROWD_SPEED_REPORT_FORCE",
+        False,
+    ):
+        cached_speed_tracks = sum(
+            len(tracks)
+            for videos in (all_speed or {}).values()
+            if isinstance(videos, dict)
+            for tracks in videos.values()
+            if isinstance(tracks, dict)
+        )
+        logger.info(
+            "Using %s cached crossing speed values from results.pickle; "
+            "skipping the integrated raw bbox speed report scan.",
+            cached_speed_tracks,
+        )
+    else:
+        _run_integrated_speed_reporting(
+            df_mapping,
+            pedestrian_crossing_count,
+        )
 
     logger.info("Detected:")
     logger.info(f"person: {person_counter}; bicycle: {bicycle_counter}; car: {car_counter}")
@@ -4298,6 +4331,45 @@ if __name__ == "__main__":
                                        cross_evnt_locality, vehicle_locality, cellphone_locality,
                                        traffic_sign_locality, all_speed, all_time, avg_time_locality,
                                        avg_speed_locality)
+
+        # ---------------------------------------------------------------------
+        # City-level structure diagnostics
+        #
+        # A k-means partition always returns k groups, so before any grouping
+        # is reported the data are tested for cluster tendency (Hopkins, gap
+        # statistic, silhouette). The same pass reports the gradient
+        # correlations, the split-half reliability of each city estimate, and
+        # the two measurement artefacts that constrain interpretation: the
+        # initiation-time floor and the within-video normalisation of the
+        # motion index. Every value is logged as well as plotted.
+        # ---------------------------------------------------------------------
+        try:
+            structure_result = analyse_structure(
+                df_mapping=df_mapping,
+                avg_speed_locality=avg_speed_locality,
+                avg_time_locality=avg_time_locality,
+                pedestrian_cross_locality=pedestrian_cross_locality,
+                crossings_with_traffic_equipment_locality=(
+                    crossings_with_traffic_equipment_locality
+                ),
+                crossings_without_traffic_equipment_locality=(
+                    crossings_without_traffic_equipment_locality
+                ),
+                all_speed=all_speed,
+                all_time=all_time,
+                all_speed_locality=all_speed_locality,
+                all_time_locality=all_time_locality,
+                checks_per_second=float(
+                    common.get_configs("check_per_sec_time") or 3
+                ),
+            )
+            if structure_result.get("status") == "complete":
+                structure_result["city_table"].write_csv(
+                    os.path.join(common.output_dir, "structure_city_level.csv")
+                )
+                structure_plots.plot_all(structure_result)
+        except Exception as error:
+            logger.error(f"Structure diagnostics failed: {error}")
 
         # ---------------------------------------------------------------------
         # Locality-level bivariate plots
