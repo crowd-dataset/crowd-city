@@ -156,8 +156,21 @@ class Correlations:
                     final_dict[f'{locality}_{lat}_{long}'][f"gini_{condition}"] = gini
                     final_dict[f'{locality}_{lat}_{long}'][f"traffic_index_{condition}"] = traffic_index
                     final_dict[f'{locality}_{lat}_{long}'][f"continent_{condition}"] = continent
+                    # GMP is already a metropolitan-level economic measure.
+                    # Keep it directly rather than dividing by country population.
+                    # Missing GMP remains None and is ignored by pandas correlation.
                     if gdp_locality is not None:
-                        final_dict[f'{locality}_{lat}_{long}'][f"gmp_{condition}"] = gdp_locality/population_country
+                        try:
+                            gmp_value = float(gdp_locality)
+                        except (TypeError, ValueError):
+                            gmp_value = None
+
+                        if gmp_value is not None and np.isfinite(gmp_value):
+                            final_dict[f'{locality}_{lat}_{long}'][f"gmp_{condition}"] = gmp_value
+                        else:
+                            final_dict[f'{locality}_{lat}_{long}'][f"gmp_{condition}"] = None
+                    else:
+                        final_dict[f'{locality}_{lat}_{long}'][f"gmp_{condition}"] = None
 
         # Initialise an empty list to store the rows for the DataFrame
         data_day, data_night = [], []
