@@ -1805,6 +1805,96 @@ def _normalise_city_limit(value: object) -> int:
     return int(numeric)
 
 
+
+# ---------------------------------------------------------------------
+# Analysis results cache metadata
+# ---------------------------------------------------------------------
+
+CACHE_CONFIG_KEYS: tuple[str, ...] = (
+    "countries_analyse",
+    "n_cities",
+    "max_footage_hours_per_city",
+    "processing_fps",
+    "vehicles_analyse",
+)
+CACHE_RESULTS_COUNT = 43
+CACHE_METADATA_VERSION = 1
+
+
+def _current_cache_config() -> Dict[str, object]:
+    # Return the configuration values that determine results.pickle reuse.
+    return {
+        key: common.get_configs(key)
+        for key in CACHE_CONFIG_KEYS
+    }
+
+
+def _build_cache_metadata(cache_config: Dict[str, object]) -> Dict[str, object]:
+    # Build metadata appended to results.pickle after the 43 result values.
+    return {
+        "__results_cache_metadata__": CACHE_METADATA_VERSION,
+        "config": dict(cache_config),
+    }
+
+
+def _cache_config_from_payload(payload: object) -> Optional[Dict[str, object]]:
+    # Extract cache configuration from a new-format results payload.
+    if not isinstance(payload, (tuple, list)):
+        return None
+    if len(payload) <= CACHE_RESULTS_COUNT:
+        return None
+
+    metadata_value = payload[CACHE_RESULTS_COUNT]
+    if not isinstance(metadata_value, dict):
+        return None
+    if metadata_value.get("__results_cache_metadata__") != CACHE_METADATA_VERSION:
+        return None
+
+    config_value = metadata_value.get("config")
+    if not isinstance(config_value, dict):
+        return None
+
+    return dict(config_value)
+
+
+def _load_results_cache(
+    path: str,
+) -> tuple[Optional[tuple], Optional[Dict[str, object]]]:
+    # Load the 43 result values plus optional cache metadata.
+    try:
+        with open(path, "rb") as file:
+            payload = pickle.load(file)
+    except Exception as error:
+        logger.warning(
+            f"Could not read cached analysis results from {path}: {error}. "
+            "The analysis will be recomputed."
+        )
+        return None, None
+
+    if not isinstance(payload, (tuple, list)) or len(payload) < CACHE_RESULTS_COUNT:
+        logger.warning(
+            f"Cached analysis results in {path} have an unexpected format. "
+            "The analysis will be recomputed."
+        )
+        return None, None
+
+    results = tuple(payload[:CACHE_RESULTS_COUNT])
+    cached_config = _cache_config_from_payload(payload)
+    return results, cached_config
+
+
+def _cache_config_differences(
+    cached_config: Dict[str, object],
+    current_config: Dict[str, object],
+) -> Dict[str, tuple[object, object]]:
+    # Return changed settings as cached/current value pairs.
+    return {
+        key: (cached_config.get(key), current_config.get(key))
+        for key in CACHE_CONFIG_KEYS
+        if cached_config.get(key) != current_config.get(key)
+    }
+
+
 def _segment_duration_seconds(start_value: object, end_value: object) -> float:
     """Sum aligned segment durations from scalar or nested mapping values."""
     def parse(value: object) -> object:
@@ -2124,15 +2214,43 @@ if __name__ == "__main__":
 
     waymo_crossing_parameters = _prepare_waymo_tuned_parameters()
     city_limit = _normalise_city_limit(common.get_configs("n_cities"))
-    use_cached_results = (
-        os.path.exists(file_results)
-        and not common.get_configs("always_analyse")
-        and city_limit == 0
-    )
-    if city_limit != 0 and os.path.exists(file_results):
+
+    current_cache_config = _current_cache_config()
+    cached_results: Optional[tuple] = None
+    cached_config: Optional[Dict[str, object]] = None
+    use_cached_results = False
+
+    if os.path.exists(file_results) and not common.get_configs("always_analyse"):
+        cached_results, cached_config = _load_results_cache(file_results)
+
+        if cached_results is not None and cached_config == current_cache_config:
+            use_cached_results = True
+            logger.info(
+                "Using cached analysis results from {} because the cache "
+                "configuration matches the current configuration: {}.",
+                file_results,
+                current_cache_config,
+            )
+        elif cached_results is not None and cached_config is None:
+            logger.info(
+                "Existing {} has no cache configuration metadata; "
+                "reanalysing once and upgrading the pickle format.",
+                file_results,
+            )
+        elif cached_results is not None and cached_config is not None:
+            differences = _cache_config_differences(
+                cached_config,
+                current_cache_config,
+            )
+            logger.info(
+                "Cached analysis configuration differs from the current "
+                "configuration; reanalysing. Changed values: {}.",
+                differences,
+            )
+    elif os.path.exists(file_results) and common.get_configs("always_analyse"):
         logger.info(
-            "n_cities is active; bypassing results.pickle so the selected city set "
-            "is analysed from the source CSV files."
+            "always_analyse is true; bypassing cached analysis results in {}.",
+            file_results,
         )
 
     if use_cached_results:
@@ -2181,7 +2299,7 @@ if __name__ == "__main__":
              df_mapping_raw,                                # 40
              pedestrian_cross_locality_all,                     # 41
              pedestrian_cross_country_all                   # 42
-             ) = pickle.load(file)
+             ) = cached_results
 
         logger.info("Loaded analysis results from pickle file.")
         log_rollups(df_mapping)
@@ -3833,7 +3951,7 @@ if __name__ == "__main__":
                     df_mapping_raw,                               # 40
                     pedestrian_cross_locality_all,                    # 41
                     pedestrian_cross_country_all,                 # 42
-                ),
+                ) + (_build_cache_metadata(current_cache_config),),
                 file,
             )
 
