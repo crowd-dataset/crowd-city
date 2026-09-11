@@ -250,7 +250,7 @@ class Metrics:
         df_mapping: pl.DataFrame,
         all_speed: dict,
     ):
-        """Average the dimensionless relative motion index by locality."""
+        """Average the dimensionless crossing speed index by locality."""
         del df_mapping
         averages: dict = {}
         complete: dict = {}
@@ -273,7 +273,7 @@ class Metrics:
         df_mapping: pl.DataFrame,
         all_speed: dict,
     ):
-        """Average the dimensionless relative motion index by country."""
+        """Average the dimensionless crossing speed index by country."""
         grouped: dict[str, list[float]] = {}
         minimum = self._as_float(self._get_config("min_speed_limit", 0), 0)
         maximum = self._as_float(self._get_config("max_speed_limit", 1e20), 1e20)
@@ -409,6 +409,7 @@ class Metrics:
             if values
         }
         return averages, grouped
+
 
 REPORT_BUILD_ID = "crowd_waymo_crossing_report_v24_20260822"
 PERSON_CLASS_ID = 0
@@ -1788,7 +1789,7 @@ def analyse_crowd_sources(
             }
         )
         if index % 50 == 0 or index == len(sources):
-            log(f"CROWD crossing motion analysed {index}/{len(sources)} bbox CSV files")
+            log(f"CROWD crossing speed analysed {index}/{len(sources)} bbox CSV files")
 
     by_city_sources: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
     by_city_tracks: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
@@ -1974,7 +1975,7 @@ def _resolve_waymo_output_path(
             reversed(candidate_parts)
         ).index(split_name)
         relocated = index_path.parent.joinpath(
-            *candidate_parts[split_position + 1 :]
+            *candidate_parts[split_position + 1:]
         )
         if relocated.exists() or relocated.parent.exists():
             return relocated

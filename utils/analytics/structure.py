@@ -322,7 +322,7 @@ def build_city_table(
     ])
 
     logger.info(
-        "[structure] Built city table: {} cities, {} with a motion index, "
+        "[structure] Built city table: {} cities, {} with a crossing speed, "
         "{} with an initiation time.",
         table.height,
         table["speed"].drop_nulls().len(),
@@ -706,7 +706,7 @@ def gradient_correlations(
     city_table: pl.DataFrame,
     predictors: Sequence[str] = GRADIENT_PREDICTORS,
     metrics: Sequence[Tuple[str, str]] = (
-        ("speed", "relative crossing motion index"),
+        ("speed", "crossing speed"),
         ("time", "crossing initiation time"),
     ),
 ) -> Dict[str, Any]:
@@ -755,7 +755,7 @@ def gradient_correlations(
             "n": int(pair.height),
         }
         logger.info(
-            "[structure] Motion index vs initiation time: rho={:+.3f} "
+            "[structure] Crossing speed vs initiation time: rho={:+.3f} "
             "p={:.4f}{} n={}. {}",
             rho,
             p_value,
@@ -773,7 +773,7 @@ def gradient_correlations(
 def continent_contrasts(
     city_table: pl.DataFrame,
     metrics: Sequence[Tuple[str, str]] = (
-        ("speed", "relative crossing motion index"),
+        ("speed", "crossing speed"),
         ("time", "crossing initiation time"),
         ("pct_unsignalised", "crossings without traffic signals (%)"),
     ),
@@ -894,7 +894,7 @@ def split_half_reliability(
 
     time_scale = 1.0 / checks_per_second if checks_per_second else 1.0
     sources = [
-        ("speed", "relative crossing motion index", _tracks_per_city(all_speed)),
+        ("speed", "crossing speed", _tracks_per_city(all_speed)),
         ("time", "crossing initiation time (s)", _tracks_per_city(all_time, time_scale)),
     ]
 
@@ -1054,9 +1054,9 @@ def initiation_time_floor(
     }
 
 
-def motion_index_scale(all_speed: dict) -> Dict[str, Any]:
-    """Describe the per-track motion index and state its normalisation."""
-    logger.info("\n=== [structure] F) Scale of the crossing motion metric ===")
+def crossing_speed_scale(all_speed: dict) -> Dict[str, Any]:
+    """Describe the per-track crossing speed and state its normalisation."""
+    logger.info("\n=== [structure] F) Scale of the crossing speed metric ===")
 
     values = _finite([
         value
@@ -1096,9 +1096,11 @@ def motion_index_scale(all_speed: dict) -> Dict[str, Any]:
         logger.info(
             "[structure] The Waymo metric speed model did not qualify for "
             "this run, so values are a within-video relative index: each "
-            "track's motion proxy divided by the median proxy of the "
-            "eligible tracks in the same clip. A value of 1.0 means 'as fast "
-            "as a typical pedestrian in that same video'. Between-city "
+            "track's motion proxy divided by the median proxy of every "
+            "eligible person track in the same clip, not only the "
+            "crossing ones. A value of 1.0 means 'as fast as a typical "
+            "detected pedestrian in that same video', so crossing tracks "
+            "sit below 1.0 as a rule. Between-city "
             "comparison assumes the within-clip reference populations are "
             "comparable, and the values must never be reported as m/s."
         )
@@ -1118,7 +1120,7 @@ def day_night_contrast(
 
     results: Dict[str, List[Dict[str, Any]]] = {}
     metrics = [
-        ("speed", "n_speed", "relative crossing motion index"),
+        ("speed", "n_speed", "crossing speed"),
         ("time", "n_time", "crossing initiation time (s)"),
     ]
 
@@ -1239,6 +1241,6 @@ def analyse_structure(
             all_time,
             checks_per_second=checks_per_second,
         ),
-        "motion_scale": motion_index_scale(all_speed),
+        "motion_scale": crossing_speed_scale(all_speed),
         "day_night": day_night_contrast(city_table),
     }

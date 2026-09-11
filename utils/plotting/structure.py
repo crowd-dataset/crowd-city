@@ -64,7 +64,7 @@ def _metric_label() -> str:
     return (
         "Crossing speed (m/s)"
         if os.environ.get("CROWD_CROSSING_SPEED_UNIT") == "m/s"
-        else "Relative crossing motion index"
+        else "Crossing speed"
     )
 
 

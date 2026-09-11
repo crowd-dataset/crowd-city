@@ -20,7 +20,7 @@ def crossing_metric_label() -> str:
     return (
         "Crossing speed (m/s)"
         if os.environ.get("CROWD_CROSSING_SPEED_UNIT") == "m/s"
-        else "Relative crossing motion"
+        else "Crossing speed"
     )
 
 
@@ -74,7 +74,7 @@ class Correlations:
             country = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "country")
             iso_code = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "iso3")
             continent = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "continent")
-            population_country = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "population_country")  # noqa: E501
+            population_country = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "population_country")  # noqa: E501,F841
             gdp_locality = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "gmp")
             traffic_mortality = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "traffic_mortality")  # noqa: E501
             literacy_rate = metadata_class.get_value(df_mapping, "locality", locality, "lat", float(lat), "literacy_rate")  # noqa: E501

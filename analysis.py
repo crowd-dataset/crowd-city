@@ -49,7 +49,7 @@ from utils.crossing.metrics import Metrics
 import utils.crossing.metrics as crossing_metrics_module
 from utils.plotting.bivariate import Bivariate
 from utils.plotting.correlations import Correlations
-from utils.plotting.crossings import Crossings
+from utils.plotting.crossings import Crossings, crossing_metric_label
 from utils.plotting.distributions import Distributions
 from utils.plotting.maps import Maps
 from utils.plotting.stacked import Stacked
@@ -1833,10 +1833,48 @@ def _current_cache_config() -> Dict[str, object]:
 
 def _build_cache_metadata(cache_config: Dict[str, object]) -> Dict[str, object]:
     # Build metadata appended to results.pickle after the 43 result values.
+    # The speed unit records what the cached values actually are, so a later
+    # cached run labels its figures from the data rather than from whichever
+    # Waymo model happens to be installed at that moment.
     return {
         "__results_cache_metadata__": CACHE_METADATA_VERSION,
         "config": dict(cache_config),
+        "speed_unit": os.environ.get("CROWD_CROSSING_SPEED_UNIT", "relative"),
     }
+
+
+def _speed_unit_from_payload(payload: object) -> Optional[str]:
+    # Return the crossing speed unit recorded alongside the cached results.
+    if not isinstance(payload, (tuple, list)):
+        return None
+    if len(payload) <= CACHE_RESULTS_COUNT:
+        return None
+    metadata_value = payload[CACHE_RESULTS_COUNT]
+    if not isinstance(metadata_value, dict):
+        return None
+    unit = metadata_value.get("speed_unit")
+    return str(unit) if unit else None
+
+
+def _apply_cached_speed_unit(unit: Optional[str]) -> None:
+    # Make figure labels describe the cached values, not the installed model.
+    model_unit = os.environ.get("CROWD_CROSSING_SPEED_UNIT", "relative")
+    if unit is None:
+        # Pickles written before the unit was recorded predate the metric speed
+        # rollout, so their speed values are the dimensionless relative index.
+        unit = "relative"
+        logger.warning(
+            "The cached results record no crossing speed unit; assuming the "
+            "relative index. Recompute the speeds to report metres per second."
+        )
+    if unit != model_unit:
+        logger.warning(
+            "Cached crossing speed values are in '{}' but the installed Waymo "
+            "model reports '{}'. Labelling figures as '{}' to match the data. "
+            "Run recompute_speed_mps.py to refresh the cached values.",
+            unit, model_unit, unit,
+        )
+    os.environ["CROWD_CROSSING_SPEED_UNIT"] = unit
 
 
 def _cache_config_from_payload(payload: object) -> Optional[Dict[str, object]]:
@@ -1882,6 +1920,7 @@ def _load_results_cache(
 
     results = tuple(payload[:CACHE_RESULTS_COUNT])
     cached_config = _cache_config_from_payload(payload)
+    _apply_cached_speed_unit(_speed_unit_from_payload(payload))
     return results, cached_config
 
 
@@ -2131,7 +2170,7 @@ def _run_integrated_speed_reporting(
 ) -> None:
     """Create CROWD city reports and optional processed Waymo figures."""
     if not _environment_truthy("CROWD_SPEED_REPORT", True):
-        logger.info("Integrated crossing motion report disabled by CROWD_SPEED_REPORT.")
+        logger.info("Integrated crossing speed report disabled by CROWD_SPEED_REPORT.")
         return
     try:
         _install_parquet_bbox_loader()
@@ -2154,7 +2193,7 @@ def _run_integrated_speed_reporting(
         )
         crowd_summary = summary.get("crowd", {})
         logger.info(
-            "CROWD crossing motion report: "
+            "CROWD crossing speed report: "
             f"cities={crowd_summary.get('cities_analysed', 0)}, "
             f"crossings={crowd_summary.get('detected_crossing_tracks', 0)}, "
             f"valid={crowd_summary.get('valid_relative_motion_tracks', 0)}."
@@ -2162,7 +2201,7 @@ def _run_integrated_speed_reporting(
         if summary.get("waymo", {}).get("status") == "skipped":
             logger.info("Waymo report skipped because processed Waymo files were not found.")
     except Exception as error:
-        logger.error(f"Integrated crossing motion reporting failed: {error}")
+        logger.error(f"Integrated crossing speed reporting failed: {error}")
 
 
 def _prepare_waymo_tuned_parameters() -> Dict[str, object]:
@@ -3967,8 +4006,8 @@ if __name__ == "__main__":
     if common.get_configs("reanalyse_speed"):
         # NOTE: if your Metrics/Mapping_Enrich now expect polars, keep as-is;
         # if any still expects pandas, convert inside those functions (not here).
-        avg_speed_country = metrics.avg_speed_of_crossing_country(df_mapping, all_speed)
-        avg_speed_locality = metrics.avg_speed_of_crossing_locality(df_mapping, all_speed)
+        avg_speed_country, all_speed_country = metrics.avg_speed_of_crossing_country(df_mapping, all_speed)
+        avg_speed_locality, all_speed_locality = metrics.avg_speed_of_crossing_locality(df_mapping, all_speed)
         df_mapping = mapping_enrich.add_speed_and_time_to_mapping(
             df_mapping=df_mapping,
             avg_speed_locality=avg_speed_locality,
@@ -3984,6 +4023,8 @@ if __name__ == "__main__":
         results_list = list(results)
         results_list[25] = avg_speed_locality     # Update locality speed
         results_list[27] = avg_speed_country  # Update country speed
+        results_list[36] = all_speed_locality  # Keep per-track speeds consistent
+        results_list[38] = all_speed_country   # Keep per-track speeds consistent
         results_list[26] = df_mapping         # Update mapping (polars)
         with open(file_results, "wb") as file:
             pickle.dump(
@@ -3995,8 +4036,8 @@ if __name__ == "__main__":
 
     # --- Check if reanalysis of waiting time is required ---
     if common.get_configs("reanalyse_waiting_time"):
-        avg_time_country = metrics.avg_time_to_start_cross_country(df_mapping, all_time)
-        avg_time_locality = metrics.avg_time_to_start_cross_locality(df_mapping, all_time)
+        avg_time_country, all_time_country = metrics.avg_time_to_start_cross_country(df_mapping, all_time)
+        avg_time_locality, all_time_locality = metrics.avg_time_to_start_cross_locality(df_mapping, all_time)
         df_mapping = mapping_enrich.add_speed_and_time_to_mapping(
             df_mapping=df_mapping,
             avg_time_locality=avg_time_locality,
@@ -4012,6 +4053,8 @@ if __name__ == "__main__":
         results_list = list(results)
         results_list[24] = avg_time_locality     # Update locality waiting time
         results_list[28] = avg_time_country  # Update country waiting time
+        results_list[37] = all_time_locality  # Keep per-track times consistent
+        results_list[39] = all_time_country   # Keep per-track times consistent
         results_list[26] = df_mapping        # Update mapping
         with open(file_results, "wb") as file:
             pickle.dump(
@@ -4110,11 +4153,13 @@ if __name__ == "__main__":
                              name="speed",
                              min_threshold=common.get_configs("min_speed_limit"),
                              max_threshold=common.get_configs("max_speed_limit"), df_mapping=df_mapping,
+                             xaxis_title=crossing_metric_label(),
                              save_file=True, data_file=file_results)
 
     # ------------All values----------------- #
     distribution.hist(data_index=22,
                       name="speed",
+                      xaxis_title=crossing_metric_label(),
                       marginal="violin",
                       nbins=100,
                       raw=True,
@@ -4127,6 +4172,7 @@ if __name__ == "__main__":
 
     distribution.hist(data_index=39,
                       name="time",
+                      xaxis_title="Crossing initiation time (s)",
                       marginal="violin",
                       # nbins=100,
                       raw=True,
@@ -4140,6 +4186,7 @@ if __name__ == "__main__":
     # ------------Filtered values----------------- #
     distribution.hist(data_index=38,
                       name="speed_filtered",
+                      xaxis_title=crossing_metric_label(),
                       marginal="violin",
                       nbins=100,
                       raw=False,
@@ -4152,6 +4199,7 @@ if __name__ == "__main__":
 
     distribution.hist(data_index=37,
                       name="time_filtered",
+                      xaxis_title="Crossing initiation time (s)",
                       marginal="violin",
                       # nbins=100,
                       raw=False,
@@ -4264,7 +4312,7 @@ if __name__ == "__main__":
                            order_by="alphabetical",
                            metric="speed",
                            data_view="combined",
-                           title_text="Mean relative crossing motion index",
+                           title_text=crossing_metric_label(mean=True),
                            filename="speed_crossing_alphabetical",
                            font_size_captions=common.get_configs("font_size") + 8,
                            left_margin=80,
@@ -4275,7 +4323,7 @@ if __name__ == "__main__":
                            order_by="alphabetical",
                            metric="speed",
                            data_view="day",
-                           title_text="Mean relative crossing motion index",
+                           title_text=crossing_metric_label(mean=True),
                            filename="speed_crossing_alphabetical_day",
                            font_size_captions=common.get_configs("font_size") + 8,
                            left_margin=80,
@@ -4286,7 +4334,7 @@ if __name__ == "__main__":
                            order_by="alphabetical",
                            metric="speed",
                            data_view="night",
-                           title_text="Mean relative crossing motion index",
+                           title_text=crossing_metric_label(mean=True),
                            filename="speed_crossing_alphabetical_night",
                            font_size_captions=common.get_configs("font_size") + 8,
                            left_margin=80,
@@ -4297,7 +4345,7 @@ if __name__ == "__main__":
                            order_by="average",
                            metric="speed",
                            data_view="combined",
-                           title_text="Mean relative crossing motion index",
+                           title_text=crossing_metric_label(mean=True),
                            filename="speed_crossing_avg",
                            font_size_captions=common.get_configs("font_size") + 8,
                            left_margin=10,
@@ -4308,7 +4356,7 @@ if __name__ == "__main__":
                            order_by="average",
                            metric="speed",
                            data_view="day",
-                           title_text="Mean relative crossing motion index",
+                           title_text=crossing_metric_label(mean=True),
                            filename="speed_crossing_avg_day",
                            font_size_captions=common.get_configs("font_size") + 8,
                            left_margin=10,
@@ -4319,7 +4367,7 @@ if __name__ == "__main__":
                            order_by="average",
                            metric="speed",
                            data_view="night",
-                           title_text="Mean relative crossing motion index",
+                           title_text=crossing_metric_label(mean=True),
                            filename="speed_crossing_avg_night",
                            font_size_captions=common.get_configs("font_size") + 8,
                            left_margin=10,
@@ -4341,7 +4389,7 @@ if __name__ == "__main__":
         # correlations, the split-half reliability of each city estimate, and
         # the two measurement artefacts that constrain interpretation: the
         # initiation-time floor and the within-video normalisation of the
-        # motion index. Every value is logged as well as plotted.
+        # crossing speed. Every value is logged as well as plotted.
         # ---------------------------------------------------------------------
         try:
             structure_result = analyse_structure(
@@ -4463,33 +4511,33 @@ if __name__ == "__main__":
                 marginal_y=None,  # type: ignore
             )
 
-        # Mean crossing motion vs crossing initiation time
+        # Mean crossing speed vs crossing initiation time
         _locality_scatter(
             LOCALITY_SPEED,
             LOCALITY_TIME,
-            xaxis_title="Relative crossing motion index",
+            xaxis_title=crossing_metric_label(),
             yaxis_title="Crossing initiation time (in s)",
             legend_x=0.01,
             legend_y=1.0,
             label_distance_factor=3.0,
         )
 
-        # Daytime crossing motion vs daytime crossing initiation time
+        # Daytime crossing speed vs daytime crossing initiation time
         _locality_scatter(
             LOCALITY_SPEED_DAY,
             LOCALITY_TIME_DAY,
-            xaxis_title="Relative crossing motion index during daytime",
+            xaxis_title=f"{crossing_metric_label()} during daytime",
             yaxis_title="Crossing initiation time during daytime (in s)",
             legend_x=0.01,
             legend_y=1.0,
             label_distance_factor=3.0,
         )
 
-        # Night-time crossing motion vs night-time crossing initiation time
+        # Night-time crossing speed vs night-time crossing initiation time
         _locality_scatter(
             LOCALITY_SPEED_NIGHT,
             LOCALITY_TIME_NIGHT,
-            xaxis_title="Relative crossing motion index during night time",
+            xaxis_title=f"{crossing_metric_label()} during night time",
             yaxis_title="Crossing initiation time during night time (in s)",
             legend_x=0.87,
             legend_y=1.0,
@@ -4509,7 +4557,7 @@ if __name__ == "__main__":
         _locality_scatter(
             LOCALITY_SPEED,
             "population_locality",
-            xaxis_title="Mean relative crossing motion index",
+            xaxis_title=crossing_metric_label(mean=True),
             yaxis_title="Population of locality",
             label_distance_factor=3.0,
         )
@@ -4527,7 +4575,7 @@ if __name__ == "__main__":
         _locality_scatter(
             LOCALITY_SPEED,
             "traffic_mortality",
-            xaxis_title="Mean relative crossing motion index",
+            xaxis_title=crossing_metric_label(mean=True),
             yaxis_title="National traffic mortality rate (per 100,000 of population)",
             label_distance_factor=2.0,
         )
@@ -4547,7 +4595,7 @@ if __name__ == "__main__":
         _locality_scatter(
             LOCALITY_SPEED,
             "literacy_rate",
-            xaxis_title="Mean relative crossing motion index",
+            xaxis_title=crossing_metric_label(mean=True),
             yaxis_title="Literacy rate",
             legend_x=0.87,
             legend_y=0.01,
@@ -4567,7 +4615,7 @@ if __name__ == "__main__":
         _locality_scatter(
             LOCALITY_SPEED,
             "gini",
-            xaxis_title="Mean relative crossing motion index",
+            xaxis_title=crossing_metric_label(mean=True),
             yaxis_title="Gini coefficient",
             label_distance_factor=2.0,
         )
@@ -4585,7 +4633,7 @@ if __name__ == "__main__":
         _locality_scatter(
             LOCALITY_SPEED,
             "traffic_index",
-            xaxis_title="Mean relative crossing motion index",
+            xaxis_title=crossing_metric_label(mean=True),
             yaxis_title="Traffic index",
             label_distance_factor=2.0,
         )
@@ -4616,7 +4664,7 @@ if __name__ == "__main__":
             _locality_scatter(
                 LOCALITY_SPEED,
                 "cellphone_normalised",
-                xaxis_title="Mean relative crossing motion index",
+                xaxis_title=crossing_metric_label(mean=True),
                 yaxis_title="Mobile phones detected (normalised over time)",
                 label_distance_factor=3.0,
                 source_df=cellphone_df,
@@ -4896,7 +4944,7 @@ if __name__ == "__main__":
                                    order_by="condition",
                                    metric="speed",
                                    data_view="combined",
-                                   title_text="Mean relative crossing motion index",
+                                   title_text=crossing_metric_label(mean=True),
                                    filename="crossing_speed_combined_country",
                                    font_size_captions=common.get_configs("font_size") + 28,
                                    legend_x=0.92,
@@ -4924,7 +4972,7 @@ if __name__ == "__main__":
                                    order_by="condition",
                                    metric="speed",
                                    data_view="combined",
-                                   title_text="Mean relative crossing motion index",
+                                   title_text=crossing_metric_label(mean=True),
                                    filename="crossing_speed_combined_country_raw",
                                    font_size_captions=common.get_configs("font_size") + 28,
                                    raw=True,
@@ -4966,7 +5014,7 @@ if __name__ == "__main__":
                                    order_by="average",
                                    metric="speed",
                                    data_view="combined",
-                                   title_text="Mean relative crossing motion index",
+                                   title_text=crossing_metric_label(mean=True),
                                    filename="crossing_speed_avg_country",
                                    font_size_captions=common.get_configs("font_size") + 8,
                                    legend_x=0.87,
@@ -4978,7 +5026,7 @@ if __name__ == "__main__":
                                    order_by="alphabetical",
                                    metric="speed",
                                    data_view="combined",
-                                   title_text="Mean relative crossing motion index",
+                                   title_text=crossing_metric_label(mean=True),
                                    filename="crossing_speed_alphabetical_country",
                                    font_size_captions=common.get_configs("font_size"),
                                    legend_x=0.94,
@@ -5009,7 +5057,7 @@ if __name__ == "__main__":
                                    order_by="average",
                                    metric="speed",
                                    data_view="day",
-                                   title_text="Mean relative crossing motion index",
+                                   title_text=crossing_metric_label(mean=True),
                                    filename="crossing_speed_avg_day_country",
                                    font_size_captions=common.get_configs("font_size"),
                                    top_margin=100)
@@ -5018,7 +5066,7 @@ if __name__ == "__main__":
                                    order_by="alphabetical",
                                    metric="speed",
                                    data_view="day",
-                                   title_text="Mean relative crossing motion index",
+                                   title_text=crossing_metric_label(mean=True),
                                    filename="crossing_speed_alphabetical_day_country",
                                    font_size_captions=common.get_configs("font_size"),
                                    top_margin=100)
@@ -5045,7 +5093,7 @@ if __name__ == "__main__":
                                    order_by="average",
                                    metric="speed",
                                    data_view="night",
-                                   title_text="Mean relative crossing motion index",
+                                   title_text=crossing_metric_label(mean=True),
                                    filename="crossing_speed_avg_night_country",
                                    font_size_captions=common.get_configs("font_size"),
                                    top_margin=100)
@@ -5054,7 +5102,7 @@ if __name__ == "__main__":
                                    order_by="alphabetical",
                                    metric="speed",
                                    data_view="night",
-                                   title_text="Mean relative crossing motion index",
+                                   title_text=crossing_metric_label(mean=True),
                                    filename="crossing_speed_alphabetical_night_country",
                                    font_size_captions=common.get_configs("font_size"),
                                    top_margin=100)
@@ -5083,7 +5131,7 @@ if __name__ == "__main__":
                           y="time_crossing_day_night_country_avg",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Mean relative crossing motion index',
+                          xaxis_title=crossing_metric_label(mean=True),
                           yaxis_title='Crossing initiation time (s)',
                           pretty_text=False,
                           marker_size=10,
@@ -5106,7 +5154,7 @@ if __name__ == "__main__":
                           y="time_crossing_day_country",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Relative crossing motion index during daytime',
+                          xaxis_title=f"{crossing_metric_label()} during daytime",
                           yaxis_title='Crossing initiation time during daytime (in s)',
                           pretty_text=False,
                           marker_size=10,
@@ -5129,7 +5177,7 @@ if __name__ == "__main__":
                           y="time_crossing_night_country",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Relative crossing motion index during night time',
+                          xaxis_title=f"{crossing_metric_label()} during night time",
                           yaxis_title='Crossing initiation time during night time (in s)',
                           pretty_text=False,
                           marker_size=10,
@@ -5175,7 +5223,7 @@ if __name__ == "__main__":
                           y="population_country",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Mean relative crossing motion index',
+                          xaxis_title=crossing_metric_label(mean=True),
                           yaxis_title='Population of country',
                           pretty_text=False,
                           marker_size=10,
@@ -5221,7 +5269,7 @@ if __name__ == "__main__":
                           y="traffic_mortality",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Mean relative crossing motion index',
+                          xaxis_title=crossing_metric_label(mean=True),
                           yaxis_title='National traffic mortality rate (per 100,000 of population)',
                           pretty_text=False,
                           marker_size=10,
@@ -5267,7 +5315,7 @@ if __name__ == "__main__":
                           y="literacy_rate",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Mean relative crossing motion index',
+                          xaxis_title=crossing_metric_label(mean=True),
                           yaxis_title='Literacy rate',
                           pretty_text=False,
                           marker_size=10,
@@ -5313,7 +5361,7 @@ if __name__ == "__main__":
                           y="gini",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Mean relative crossing motion index',
+                          xaxis_title=crossing_metric_label(mean=True),
                           yaxis_title='Gini coefficient',
                           pretty_text=False,
                           marker_size=10,
@@ -5360,7 +5408,7 @@ if __name__ == "__main__":
                           y="med_age",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Mean relative crossing motion index',
+                          xaxis_title=crossing_metric_label(mean=True),
                           yaxis_title='Median age (in years)',
                           pretty_text=False,
                           marker_size=10,
@@ -5408,7 +5456,7 @@ if __name__ == "__main__":
                           y="cellphone_normalised",
                           color="continent",
                           text="iso3",
-                          xaxis_title='Mean relative crossing motion index',
+                          xaxis_title=crossing_metric_label(mean=True),
                           yaxis_title='Mobile phones detected (normalised over time)',
                           pretty_text=False,
                           marker_size=10,
@@ -5425,7 +5473,7 @@ if __name__ == "__main__":
         # Mean speed of crossing (used to be plots_class.map)
         maps.map_world(df=df_countries.to_pandas(),
                        color="speed_crossing_day_night_country_avg",
-                       title="Mean relative crossing motion index",
+                       title=crossing_metric_label(mean=True),
                        show_colorbar=True,
                        colorbar_title="",                 # keep your empty title behavior
                        filter_zero_nan=True,              # preserves old map() filtering
@@ -5546,11 +5594,11 @@ if __name__ == "__main__":
                 logger.info("No non-zero speed rows found; cannot compute min non-zero speed.")
 
             logger.info(
-                "Mean relative crossing motion index (non-zero): "
+                f"Mean {crossing_metric_label().lower()} (non-zero): "
                 f"{float(speed_mean) if speed_mean is not None else float('nan'):.2f}"
             )
             logger.info(
-                "Standard deviation of relative crossing motion index (non-zero): "
+                f"Standard deviation of {crossing_metric_label().lower()} (non-zero): "
                 f"{float(speed_std) if speed_std is not None else float('nan'):.2f}"
             )
 

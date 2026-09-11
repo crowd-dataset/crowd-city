@@ -31,7 +31,7 @@ def crossing_metric_label(mean: bool = False) -> str:
     metric = (
         "crossing speed (m/s)"
         if os.environ.get("CROWD_CROSSING_SPEED_UNIT") == "m/s"
-        else "relative crossing motion index"
+        else "crossing speed"
     )
     return f"Mean {metric}" if mean else metric.capitalize()
 
@@ -433,7 +433,7 @@ class Crossings:
         self._log_day_night_differences(
             records,
             "speed",
-            "crossing motion",
+            "crossing speed",
         )
         self._log_day_night_differences(
             records,
@@ -442,7 +442,7 @@ class Crossings:
         )
 
         self._log_values(
-            "relative crossing motion",
+            "crossing speed",
             [record["speed_0"] for record in records.values()],
             [record["speed_1"] for record in records.values()],
         )
@@ -569,7 +569,7 @@ class Crossings:
         self._log_day_night_differences(
             records,
             "speed",
-            "crossing motion",
+            "crossing speed",
         )
         self._log_day_night_differences(
             records,
@@ -578,7 +578,7 @@ class Crossings:
         )
 
         self._log_values(
-            "relative crossing motion",
+            "crossing speed",
             [record["speed_0"] for record in records.values()],
             [record["speed_1"] for record in records.values()],
         )
@@ -705,7 +705,7 @@ class Crossings:
                         x=[speed_day],
                         y=[speed_label],
                         orientation="h",
-                        name=f"{label} crossing motion during day",
+                        name=f"{label} crossing speed during day",
                         marker=dict(color=C.BAR_COLOR_1),
                         showlegend=False,
                         text=[""],
@@ -720,7 +720,7 @@ class Crossings:
                         x=[speed_night],
                         y=[speed_label],
                         orientation="h",
-                        name=f"{label} crossing motion during night",
+                        name=f"{label} crossing speed during night",
                         marker=dict(color=C.BAR_COLOR_2),
                         showlegend=False,
                         text=[""],
