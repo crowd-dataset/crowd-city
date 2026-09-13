@@ -6,7 +6,7 @@ Keep this module free of Plotly/Pandas imports to avoid heavy import side effect
 
 from __future__ import annotations
 
-from typing import Final, Tuple
+from typing import Final, Tuple, Dict
 
 # -----------------------------------------------------------------------------
 # Color constants (Plotly-compatible RGB strings)
@@ -38,7 +38,21 @@ EXPORT_SCALE: Final[int] = 1
 
 SCALE = 1
 
+# Colour-blind safe continent palette (Okabe-Ito), shared by any figure that
+# encodes continent so the same continent reads the same colour throughout.
+CONTINENT_COLORS: Final[Dict[str, str]] = {
+    "Africa": "#E69F00",
+    "Asia": "#0072B2",
+    "Europe": "#009E73",
+    "North America": "#D55E00",
+    "Oceania": "#CC79A7",
+    "South America": "#56B4E9",
+}
+CONTINENT_FALLBACK_COLOR: Final[str] = "#666666"
+
 __all__ = [
+    "CONTINENT_COLORS",
+    "CONTINENT_FALLBACK_COLOR",
     "BAR_COLORS",
     "BAR_COLOR_1",
     "BAR_COLOR_2",

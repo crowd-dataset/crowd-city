@@ -545,9 +545,9 @@ class StructurePlots:
                     ),
                     row=1, col=column,
                 )
-            fig.update_xaxes(tickangle=-30, tickfont=_font(-5), row=1, col=column)
+            fig.update_xaxes(tickangle=-30, tickfont=_font(-2), row=1, col=column)
 
-        fig.update_annotations(font=_font(-2))
+        fig.update_annotations(font=_font(2))
         fig.update_layout(
             template=common.get_configs("plotly_template"),
             font=_font(),

@@ -31,6 +31,7 @@ from utils.analytics.io import IO
 from utils.analytics.mapping_enrichment import Mapping_Enrich
 from utils.analytics.metrics_cache import MetricsCache
 from utils.analytics.structure import analyse_structure
+from utils.analytics import speed_recompute
 from utils.analytics.parquet_store import (
     DETECTION_FOLDER,
     configured_parquet_roots,
@@ -1871,8 +1872,9 @@ def _apply_cached_speed_unit(unit: Optional[str]) -> None:
         logger.warning(
             "Cached crossing speed values are in '{}' but the installed Waymo "
             "model reports '{}'. Labelling figures as '{}' to match the data. "
-            "Run recompute_speed_mps.py to refresh the cached values.",
-            unit, model_unit, unit,
+            "Set reanalyse_speed to true to recompute the speeds in '{}' and "
+            "save them, or run recompute_speed_mps.py separately.",
+            unit, model_unit, unit, model_unit,
         )
     os.environ["CROWD_CROSSING_SPEED_UNIT"] = unit
 
@@ -1899,8 +1901,8 @@ def _cache_config_from_payload(payload: object) -> Optional[Dict[str, object]]:
 
 def _load_results_cache(
     path: str,
-) -> tuple[Optional[tuple], Optional[Dict[str, object]]]:
-    # Load the 43 result values plus optional cache metadata.
+) -> tuple[Optional[tuple], Optional[Dict[str, object]], Optional[str]]:
+    # Load the 43 result values plus optional cache metadata and speed unit.
     try:
         with open(path, "rb") as file:
             payload = pickle.load(file)
@@ -1909,19 +1911,22 @@ def _load_results_cache(
             f"Could not read cached analysis results from {path}: {error}. "
             "The analysis will be recomputed."
         )
-        return None, None
+        return None, None, None
 
     if not isinstance(payload, (tuple, list)) or len(payload) < CACHE_RESULTS_COUNT:
         logger.warning(
             f"Cached analysis results in {path} have an unexpected format. "
             "The analysis will be recomputed."
         )
-        return None, None
+        return None, None, None
 
     results = tuple(payload[:CACHE_RESULTS_COUNT])
     cached_config = _cache_config_from_payload(payload)
-    _apply_cached_speed_unit(_speed_unit_from_payload(payload))
-    return results, cached_config
+    # The recorded unit is returned rather than applied here: it describes the
+    # cached values only, so it must not relabel a full reanalysis that is
+    # about to recompute the speeds from scratch.
+    cached_speed_unit = _speed_unit_from_payload(payload)
+    return results, cached_config, cached_speed_unit
 
 
 def _cache_config_differences(
@@ -2262,10 +2267,15 @@ if __name__ == "__main__":
     use_cached_results = False
 
     if os.path.exists(file_results) and not common.get_configs("always_analyse"):
-        cached_results, cached_config = _load_results_cache(file_results)
+        cached_results, cached_config, cached_speed_unit = _load_results_cache(
+            file_results,
+        )
 
         if cached_results is not None and cached_config == current_cache_config:
             use_cached_results = True
+            # Only now that the cached values will actually be reused does
+            # their recorded unit describe the data the figures will show.
+            _apply_cached_speed_unit(cached_speed_unit)
             logger.info(
                 "Using cached analysis results from {} because the cache "
                 "configuration matches the current configuration: {}.",
@@ -4004,6 +4014,38 @@ if __name__ == "__main__":
 
         # --- Check if reanalysis of speed is required ---
     if common.get_configs("reanalyse_speed"):
+        # Re-derive the per-track speeds when the cached values carry a
+        # different unit from the one the installed Waymo model produces.
+        # Without this the aggregates below would re-average stale values and
+        # the pickle would keep the old unit under a new label.
+        target_unit = speed_recompute.metric_speed_unit()
+        cached_unit = os.environ.get("CROWD_CROSSING_SPEED_UNIT", "relative")
+        if cached_unit != target_unit:
+            logger.info(
+                "Cached crossing speed is in '{}' but the installed model "
+                "produces '{}'; recomputing per-track speeds from the "
+                "detection files.",
+                cached_unit, target_unit,
+            )
+            recomputed, track_count, failures = speed_recompute.recompute_all_speed(
+                df_mapping=df_mapping,
+                wanted=set(pedestrian_crossing_count.keys()),
+            )
+            if recomputed and not failures:
+                all_speed = recomputed
+                os.environ["CROWD_CROSSING_SPEED_UNIT"] = target_unit
+                logger.info(
+                    "Crossing speed recomputed in {} for {} tracks.",
+                    target_unit, track_count,
+                )
+            else:
+                logger.error(
+                    "Crossing speed recomputation produced {} values with {} "
+                    "failed files; keeping the cached '{}' values so the saved "
+                    "unit still matches the saved data.",
+                    len(recomputed), failures, cached_unit,
+                )
+
         # NOTE: if your Metrics/Mapping_Enrich now expect polars, keep as-is;
         # if any still expects pandas, convert inside those functions (not here).
         avg_speed_country, all_speed_country = metrics.avg_speed_of_crossing_country(df_mapping, all_speed)
@@ -4021,6 +4063,7 @@ if __name__ == "__main__":
         with open(file_results, "rb") as file:
             results = pickle.load(file)
         results_list = list(results)
+        results_list[22] = all_speed          # Update per-track speeds
         results_list[25] = avg_speed_locality     # Update locality speed
         results_list[27] = avg_speed_country  # Update country speed
         results_list[36] = all_speed_locality  # Keep per-track speeds consistent

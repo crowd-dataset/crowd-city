@@ -890,7 +890,7 @@ class Crossings:
             width=4960,
             scale=C.SCALE,
             save_final=True,
-            save_eps=False,
+            save_eps=True,
             save_png=False,
         )
 
@@ -1171,7 +1171,7 @@ class Crossings:
             width=2480,
             height=max(C.BASE_HEIGHT_PER_ROW * rows, C.BASE_HEIGHT_PER_ROW),
             scale=C.SCALE,
-            save_eps=False,
+            save_eps=True,
             save_final=True,
         )
 
