@@ -1872,8 +1872,8 @@ def _apply_cached_speed_unit(unit: Optional[str]) -> None:
         logger.warning(
             "Cached crossing speed values are in '{}' but the installed Waymo "
             "model reports '{}'. Labelling figures as '{}' to match the data. "
-            "Set reanalyse_speed to true to recompute the speeds in '{}' and "
-            "save them, or run recompute_speed_mps.py separately.",
+            "Set reanalyse_speed to true and rerun analysis.py to recompute "
+            "crossing speeds in '{}'.",
             unit, model_unit, unit, model_unit,
         )
     os.environ["CROWD_CROSSING_SPEED_UNIT"] = unit
@@ -4050,6 +4050,33 @@ if __name__ == "__main__":
         # if any still expects pandas, convert inside those functions (not here).
         avg_speed_country, all_speed_country = metrics.avg_speed_of_crossing_country(df_mapping, all_speed)
         avg_speed_locality, all_speed_locality = metrics.avg_speed_of_crossing_locality(df_mapping, all_speed)
+        # Re-deriving the per-track speeds replaces every average wholesale,
+        # and the metric speed model rejects tracks that the relative index
+        # accepted. A locality left without a single valid track is simply
+        # absent from the new averages, so its cached column would silently
+        # keep the old relative value under the new label. Clear the speed
+        # columns first and let the enrichment repopulate only what the
+        # recomputed data actually supports.
+        speed_columns = [
+            column
+            for column in (
+                "speed_crossing_day_locality",
+                "speed_crossing_night_locality",
+                "speed_crossing_day_night_locality_avg",
+                "speed_crossing_day_country",
+                "speed_crossing_night_country",
+                "speed_crossing_day_night_country_avg",
+            )
+            if column in df_mapping.columns
+        ]
+        if speed_columns:
+            df_mapping = df_mapping.with_columns(
+                [
+                    pl.lit(None).cast(pl.Float64).alias(column)
+                    for column in speed_columns
+                ]
+            )
+
         df_mapping = mapping_enrich.add_speed_and_time_to_mapping(
             df_mapping=df_mapping,
             avg_speed_locality=avg_speed_locality,

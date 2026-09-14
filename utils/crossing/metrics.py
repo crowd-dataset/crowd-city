@@ -206,6 +206,7 @@ class Metrics:
                 aspect_ratio,
                 scene_profile,
             )
+            stature_scale = stature_scale_for_source(df_mapping, source_id)
             values: Dict[str, float] = {}
             for track_id in selected_ids:
                 features = features_by_track.get(track_id)
@@ -213,7 +214,9 @@ class Metrics:
                     continue
                 prediction = _predict_metric_speed(features, _SPEED_MODEL)
                 if prediction.get("speed_status") == "valid":
-                    values[track_id] = float(prediction["estimated_speed_mps"])
+                    values[track_id] = (
+                        float(prediction["estimated_speed_mps"]) * stature_scale
+                    )
             if not values:
                 return None
             return grouping_class.locality_country_wrapper(
@@ -416,6 +419,11 @@ PERSON_CLASS_ID = 0
 DEFAULT_ASPECT_RATIO = 16.0 / 9.0
 DEFAULT_PERSON_HEIGHT_M = 1.70
 
+# Mean adult stature of the population the Waymo speed model was calibrated on.
+# Waymo Open Dataset is recorded in the United States, whose mean stature in the
+# project mapping is 170.0 cm, which is also DEFAULT_PERSON_HEIGHT_M.
+WAYMO_CALIBRATION_STATURE_CM = 170.0
+
 SCENE_MOTION_SETTINGS: Dict[str, float] = {
     "maximum_pair_gap_frames": 2,
     "window_radius_frames": 3,
@@ -584,6 +592,52 @@ def truthy(value: Any, default: bool = False) -> bool:
     if text in {"0", "false", "no", "n", "off", ""}:
         return False
     return default
+
+
+def stature_scale_for_source(df_mapping: "pl.DataFrame", source_id: Any) -> float:
+    """Return the factor rescaling a Waymo-calibrated speed to local stature.
+
+    Every geometric speed proxy is proportional to an assumed person height
+    divided by the observed bounding box height, so a prediction inherits the
+    stature of the population the model was calibrated on. Waymo is recorded in
+    the United States, so an uncorrected prediction over-estimates the speed of
+    shorter populations and under-estimates taller ones in direct proportion to
+    the stature ratio. Across the analysed countries that ratio spans about 12
+    per cent and is correlated with the very covariates the study regresses
+    crossing speed against, so leaving it uncorrected biases those estimates.
+
+    The factor is exactly 1.0 on the calibration population, so every reported
+    Waymo validation metric remains valid.
+
+    This correction is DISABLED by default because its strength cannot be
+    determined from Waymo. A model that attenuates its proxy-to-speed response
+    also attenuates any bias carried by that proxy, so the bias is closer to
+    (stature ratio) ** beta, where beta is the model calibration slope (0.35 in
+    the current frozen model), than to the full ratio. Applying the full ratio
+    demonstrably overshoots: on the analysed cities it drove the correlation
+    between city speed and national stature from +0.07 to +0.31 rather than
+    towards zero. Waymo is recorded in one country, so it contains no stature
+    variation with which to estimate beta. Measuring it requires ground truth
+    from a second population; nuScenes (Singapore and Boston) is the obvious
+    candidate and nuscenes-devkit is already a project dependency.
+
+    Set CROWD_STATURE_CORRECTION=true to enable, and
+    CROWD_STATURE_CORRECTION_EXPONENT to set the exponent (default 1.0, full
+    strength). Treat any non-zero exponent as unvalidated until it is estimated
+    against a second-population ground truth.
+    """
+    if not truthy(os.environ.get("CROWD_STATURE_CORRECTION", "false"), False):
+        return 1.0
+    result = metadata_class.find_values_with_video_id(df_mapping, str(source_id))
+    if result is None:
+        return 1.0
+    stature_cm = safe_float(result[15])
+    if stature_cm is None or stature_cm <= 0.0:
+        return 1.0
+    exponent = safe_float(os.environ.get("CROWD_STATURE_CORRECTION_EXPONENT"))
+    if exponent is None:
+        exponent = 1.0
+    return (float(stature_cm) / WAYMO_CALIBRATION_STATURE_CM) ** exponent
 
 
 def normalise_id(value: Any) -> str:
