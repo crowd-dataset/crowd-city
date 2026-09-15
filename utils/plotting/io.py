@@ -24,6 +24,15 @@ class IO:
             scale (int, optional): Scaling factor for the PNG image. Defaults to 3.
             save_final (bool, optional): whether to save the "good" final figure.
         """
+        # Raster export goes through kaleido, which launches a headless
+        # Chromium. That step is prone to hanging indefinitely on Windows,
+        # where it blocks the whole analysis on a figure rather than failing.
+        # Setting save_images to false keeps the interactive HTML, which
+        # carries the same data, and skips the PNG and EPS export.
+        if not common.get_configs("save_images"):
+            save_png = False
+            save_eps = False
+
         # Create directory if it doesn't exist
         output_final = os.path.join(common.root_dir, 'figures')
         os.makedirs(common.output_dir, exist_ok=True)

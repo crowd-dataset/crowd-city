@@ -1833,11 +1833,36 @@ CACHE_RESULTS_COUNT = 43
 CACHE_METADATA_VERSION = 1
 
 
+# Settings that only matter once the segmentation pass actually runs.
+SEGMENTATION_CACHE_KEYS: tuple[str, ...] = (
+    "segmentation_model",
+    "segmentation_coarse_hz",
+    "segmentation_refine_hz",
+    "segmentation_min_confidence",
+    "segmentation_is_primary",
+)
+
+
 def _current_cache_config() -> Dict[str, object]:
     # Return the configuration values that determine results.pickle reuse.
+    #
+    # When segmentation is switched off none of its settings affect a single
+    # reported value, so they are left out of the fingerprint entirely. Were
+    # they included, merely pulling a version that defines them would discard
+    # an existing results.pickle and force a full reanalysis for no change in
+    # output. use_segmentation itself always counts, because turning it on or
+    # off does change what is produced.
+    segmentation_enabled = bool(common.get_configs("use_segmentation"))
+    skipped = set(SEGMENTATION_CACHE_KEYS)
+    if not segmentation_enabled:
+        # A run with segmentation off produces exactly what a run from before
+        # the feature existed produced, so its fingerprint is the same one and
+        # an existing results.pickle stays valid.
+        skipped.add("use_segmentation")
     return {
         key: common.get_configs(key)
         for key in CACHE_CONFIG_KEYS
+        if segmentation_enabled or key not in skipped
     }
 
 
@@ -1970,9 +1995,10 @@ def _cache_config_differences(
     current_config: Dict[str, object],
 ) -> Dict[str, tuple[object, object]]:
     # Return changed settings as cached/current value pairs.
+    keys = sorted(set(cached_config) | set(current_config))
     return {
         key: (cached_config.get(key), current_config.get(key))
-        for key in CACHE_CONFIG_KEYS
+        for key in keys
         if cached_config.get(key) != current_config.get(key)
     }
 
@@ -2006,8 +2032,27 @@ def _primary_speed(
             baseline_all_locality,
             baseline_all_country,
         )
+    locality = segmentation.get("avg_speed_locality") or {}
+    if not locality:
+        # Substituting nothing would blank the crossing speed in every figure.
+        # This happens whenever the frozen Waymo model is absent, because the
+        # road-restricted speed is only defined when that model qualifies, so
+        # it must not be mistaken for a legitimate empty result.
+        logger.error(
+            "segmentation_is_primary is enabled but the segmentation pass "
+            "produced no crossing speeds, so the reported speed would be "
+            "empty. Keeping the baseline speed. Check that the frozen Waymo "
+            "model is present, since the road-restricted speed is only "
+            "defined when it qualifies."
+        )
+        return (
+            baseline_locality,
+            baseline_country,
+            baseline_all_locality,
+            baseline_all_country,
+        )
     return (
-        segmentation.get("avg_speed_locality") or {},
+        locality,
         segmentation.get("avg_speed_country") or {},
         segmentation.get("all_speed_locality") or {},
         segmentation.get("all_speed_country") or {},
@@ -2029,8 +2074,21 @@ def _primary_time(
             baseline_all_locality,
             baseline_all_country,
         )
+    locality = segmentation.get("avg_time_locality") or {}
+    if not locality:
+        logger.error(
+            "segmentation_is_primary is enabled but the segmentation pass "
+            "produced no hesitation times, so the reported initiation time "
+            "would be empty. Keeping the baseline times."
+        )
+        return (
+            baseline_locality,
+            baseline_country,
+            baseline_all_locality,
+            baseline_all_country,
+        )
     return (
-        segmentation.get("avg_time_locality") or {},
+        locality,
         segmentation.get("avg_time_country") or {},
         segmentation.get("all_time_locality") or {},
         segmentation.get("all_time_country") or {},

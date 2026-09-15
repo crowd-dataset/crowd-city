@@ -143,6 +143,7 @@ Configuration of the project needs to be defined in `config`. Please use the `de
 - **`font_family`**: Specifies the font family to be used in outputs.
 - **`font_size`**: Specifies the font size to be used in outputs.
 - **`plotly_template`**: Defines the template for Plotly figures.
+- **`save_images`**: Whether to export PNG and EPS alongside the interactive HTML. Raster export goes through kaleido, which launches a headless Chromium and is prone to hanging indefinitely on Windows. Set this to `false` to keep only the HTML, which carries the same data, when a run stalls on "Saving png file for ...".
 - **`logger_level`**: Level of console output. Can be: debug, info, warning, error.
 - **`sleep_sec`**: Amount of seconds of pause in the end of the loop in `main.py`.
 - **`git_pull`**: Pull changes from git repository in the end of the loop in `main.py`.

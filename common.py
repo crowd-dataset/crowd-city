@@ -62,6 +62,7 @@ _OPTIONAL_CONFIG_DEFAULTS = {
     "segmentation_input_height",
     "segmentation_min_confidence",
     "segmentation_is_primary",
+    "save_images",
 }
 
 
