@@ -51,6 +51,17 @@ _OPTIONAL_CONFIG_DEFAULTS = {
     "max_footage_hours_per_city",
     "processing_fps",
     "sync_parquet_on_start",
+    "seg_data",
+    "use_segmentation",
+    "segmentation_model",
+    "segmentation_device",
+    "segmentation_batch_size",
+    "segmentation_coarse_hz",
+    "segmentation_refine_hz",
+    "segmentation_input_width",
+    "segmentation_input_height",
+    "segmentation_min_confidence",
+    "segmentation_is_primary",
 }
 
 

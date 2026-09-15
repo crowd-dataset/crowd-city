@@ -32,6 +32,7 @@ from utils.analytics.mapping_enrichment import Mapping_Enrich
 from utils.analytics.metrics_cache import MetricsCache
 from utils.analytics.structure import analyse_structure
 from utils.analytics import speed_recompute
+from utils.segmentation import crossing_pass as segmentation_pass
 from utils.analytics.parquet_store import (
     DETECTION_FOLDER,
     configured_parquet_roots,
@@ -1819,6 +1820,14 @@ CACHE_CONFIG_KEYS: tuple[str, ...] = (
     "max_footage_hours_per_city",
     "processing_fps",
     "vehicles_analyse",
+    # Segmentation settings change the derived crossing metrics, so a cached
+    # run must not silently reuse values computed under different ones.
+    "use_segmentation",
+    "segmentation_model",
+    "segmentation_coarse_hz",
+    "segmentation_refine_hz",
+    "segmentation_min_confidence",
+    "segmentation_is_primary",
 )
 CACHE_RESULTS_COUNT = 43
 CACHE_METADATA_VERSION = 1
@@ -1832,16 +1841,36 @@ def _current_cache_config() -> Dict[str, object]:
     }
 
 
-def _build_cache_metadata(cache_config: Dict[str, object]) -> Dict[str, object]:
+def _build_cache_metadata(
+    cache_config: Dict[str, object],
+    segmentation: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
     # Build metadata appended to results.pickle after the 43 result values.
     # The speed unit records what the cached values actually are, so a later
     # cached run labels its figures from the data rather than from whichever
     # Waymo model happens to be installed at that moment.
-    return {
+    #
+    # The segmentation aggregates travel here rather than in the 43-value
+    # tuple so that pickles written before this feature existed still load.
+    metadata: Dict[str, object] = {
         "__results_cache_metadata__": CACHE_METADATA_VERSION,
         "config": dict(cache_config),
         "speed_unit": os.environ.get("CROWD_CROSSING_SPEED_UNIT", "relative"),
     }
+    if segmentation:
+        metadata["segmentation"] = segmentation
+    return metadata
+
+
+def _segmentation_from_payload(payload: object) -> Dict[str, object]:
+    # Return the cached segmentation aggregates, or an empty mapping.
+    if not isinstance(payload, (tuple, list)) or len(payload) <= CACHE_RESULTS_COUNT:
+        return {}
+    metadata_value = payload[CACHE_RESULTS_COUNT]
+    if not isinstance(metadata_value, dict):
+        return {}
+    segmentation = metadata_value.get("segmentation")
+    return dict(segmentation) if isinstance(segmentation, dict) else {}
 
 
 def _speed_unit_from_payload(payload: object) -> Optional[str]:
@@ -1901,8 +1930,14 @@ def _cache_config_from_payload(payload: object) -> Optional[Dict[str, object]]:
 
 def _load_results_cache(
     path: str,
-) -> tuple[Optional[tuple], Optional[Dict[str, object]], Optional[str]]:
-    # Load the 43 result values plus optional cache metadata and speed unit.
+) -> tuple[
+    Optional[tuple],
+    Optional[Dict[str, object]],
+    Optional[str],
+    Dict[str, object],
+]:
+    # Load the 43 result values plus optional cache metadata, speed unit and
+    # segmentation aggregates.
     try:
         with open(path, "rb") as file:
             payload = pickle.load(file)
@@ -1911,14 +1946,14 @@ def _load_results_cache(
             f"Could not read cached analysis results from {path}: {error}. "
             "The analysis will be recomputed."
         )
-        return None, None, None
+        return None, None, None, {}
 
     if not isinstance(payload, (tuple, list)) or len(payload) < CACHE_RESULTS_COUNT:
         logger.warning(
             f"Cached analysis results in {path} have an unexpected format. "
             "The analysis will be recomputed."
         )
-        return None, None, None
+        return None, None, None, {}
 
     results = tuple(payload[:CACHE_RESULTS_COUNT])
     cached_config = _cache_config_from_payload(payload)
@@ -1926,7 +1961,8 @@ def _load_results_cache(
     # cached values only, so it must not relabel a full reanalysis that is
     # about to recompute the speeds from scratch.
     cached_speed_unit = _speed_unit_from_payload(payload)
-    return results, cached_config, cached_speed_unit
+    cached_segmentation = _segmentation_from_payload(payload)
+    return results, cached_config, cached_speed_unit, cached_segmentation
 
 
 def _cache_config_differences(
@@ -1939,6 +1975,106 @@ def _cache_config_differences(
         for key in CACHE_CONFIG_KEYS
         if cached_config.get(key) != current_config.get(key)
     }
+
+
+def _segmentation_is_primary() -> bool:
+    """Return whether the figures should report the segmentation metrics."""
+    return bool(common.get_configs("segmentation_is_primary")) and bool(
+        common.get_configs("use_segmentation")
+    )
+
+
+def _primary_speed(
+    segmentation: Dict[str, object],
+    baseline_locality: dict,
+    baseline_country: dict,
+    baseline_all_locality: dict,
+    baseline_all_country: dict,
+) -> tuple:
+    """Substitute the road-restricted speed when it is the reported metric.
+
+    The reanalysis blocks further down re-derive the crossing averages from
+    the baseline per-track values, so the substitution cannot happen once and
+    be left alone: it has to be reapplied wherever the reported averages are
+    set, or a run with reanalyse_speed enabled would silently fall back to the
+    baseline after the switch had been honoured earlier.
+    """
+    if not _segmentation_is_primary() or not segmentation:
+        return (
+            baseline_locality,
+            baseline_country,
+            baseline_all_locality,
+            baseline_all_country,
+        )
+    return (
+        segmentation.get("avg_speed_locality") or {},
+        segmentation.get("avg_speed_country") or {},
+        segmentation.get("all_speed_locality") or {},
+        segmentation.get("all_speed_country") or {},
+    )
+
+
+def _primary_time(
+    segmentation: Dict[str, object],
+    baseline_locality: dict,
+    baseline_country: dict,
+    baseline_all_locality: dict,
+    baseline_all_country: dict,
+) -> tuple:
+    """Substitute the kerb-anchored hesitation time when it is the reported metric."""
+    if not _segmentation_is_primary() or not segmentation:
+        return (
+            baseline_locality,
+            baseline_country,
+            baseline_all_locality,
+            baseline_all_country,
+        )
+    return (
+        segmentation.get("avg_time_locality") or {},
+        segmentation.get("avg_time_country") or {},
+        segmentation.get("all_time_locality") or {},
+        segmentation.get("all_time_country") or {},
+    )
+
+
+def _apply_segmentation_columns(
+    df_mapping_source: "pl.DataFrame",
+    segmentation: Dict[str, object],
+    pedestrian_cross_locality_source: dict,
+    pedestrian_cross_country_source: dict,
+) -> "pl.DataFrame":
+    """Write the segmentation-derived metrics into their own columns.
+
+    The baseline ``speed_crossing_*`` and ``time_crossing_*`` columns are left
+    exactly as the motion-only calculation produced them. These columns carry
+    the same two quantities measured against the segmented carriageway, so the
+    two derivations can be compared city by city before either is preferred.
+    """
+    if not segmentation:
+        return df_mapping_source
+
+    updated = mapping_enrich.add_speed_and_time_to_mapping(
+        df_mapping=df_mapping_source,
+        avg_speed_locality=segmentation.get("avg_speed_locality") or {},
+        avg_speed_country=segmentation.get("avg_speed_country") or {},
+        avg_time_locality=segmentation.get("avg_time_locality") or {},
+        avg_time_country=segmentation.get("avg_time_country") or {},
+        pedestrian_cross_locality=pedestrian_cross_locality_source,
+        pedestrian_cross_country=pedestrian_cross_country_source,
+        speed_col_prefix="speed_crossing_seg",
+        time_col_prefix="time_crossing_seg",
+    )
+
+    populated = [
+        column
+        for column in updated.columns
+        if column.startswith(("speed_crossing_seg", "time_crossing_seg"))
+        and updated.select(pl.col(column).is_not_null().sum()).item() > 0
+    ]
+    logger.info(
+        f"Segmentation columns populated: {', '.join(sorted(populated)) or 'none'}."
+    )
+    return updated
 
 
 def _segment_duration_seconds(start_value: object, end_value: object) -> float:
@@ -2264,12 +2400,21 @@ if __name__ == "__main__":
     current_cache_config = _current_cache_config()
     cached_results: Optional[tuple] = None
     cached_config: Optional[Dict[str, object]] = None
+    cached_segmentation: Dict[str, object] = {}
     use_cached_results = False
 
+    # Populated by the segmentation pass, or restored from the cache, and
+    # written back into the pickle so a cached rerun still reports the
+    # segmentation-derived columns.
+    segmentation_results: Dict[str, object] = {}
+
     if os.path.exists(file_results) and not common.get_configs("always_analyse"):
-        cached_results, cached_config, cached_speed_unit = _load_results_cache(
-            file_results,
-        )
+        (
+            cached_results,
+            cached_config,
+            cached_speed_unit,
+            cached_segmentation,
+        ) = _load_results_cache(file_results)
 
         if cached_results is not None and cached_config == current_cache_config:
             use_cached_results = True
@@ -2353,6 +2498,12 @@ if __name__ == "__main__":
              ) = cached_results
 
         logger.info("Loaded analysis results from pickle file.")
+        segmentation_results = dict(cached_segmentation)
+        if segmentation_results:
+            logger.info(
+                "Reusing segmentation-derived crossing metrics stored with the "
+                "cached results."
+            )
         log_rollups(df_mapping)
     else:
         # Store the mapping file
@@ -3298,6 +3449,148 @@ if __name__ == "__main__":
             logger.error("No speed and time data to analyse.")
             exit()
 
+        # ------------------------------------------------------------------
+        # Road-surface segmentation pass
+        #
+        # The baseline metrics above infer both quantities from bounding-box
+        # motion alone and have no notion of where the kerb is. This pass
+        # segments the crossing windows with SegFormer Cityscapes, derives the
+        # interval each pedestrian actually spends on the carriageway, and
+        # recomputes both metrics against it. The results are written to
+        # separate columns: the baseline is left untouched so the two can be
+        # compared before anything is switched over.
+        # ------------------------------------------------------------------
+        segmentation_output = segmentation_pass.run_segmentation_pass(
+            df_mapping=df_mapping,
+            detection_tasks=csv_tasks,
+            crossing_ids=pedestrian_crossing_count,
+            crossing_parameters=waymo_crossing_parameters,
+        )
+
+        if segmentation_output.get("enabled"):
+            seg_speed = segmentation_output["seg_speed"]
+            seg_time = segmentation_output["seg_time"]
+
+            seg_speed_min = float(common.get_configs("min_speed_limit") or 0)
+            seg_speed_max = float(common.get_configs("max_speed_limit") or 1e20)
+            seg_time_min = float(common.get_configs("min_waiting_time") or 0)
+            seg_time_max = float(common.get_configs("max_waiting_time") or 1e20)
+
+            avg_seg_speed_locality, all_seg_speed_locality = (
+                segmentation_pass.average_by_locality(
+                    seg_speed, seg_speed_min, seg_speed_max,
+                )
+            )
+            avg_seg_speed_country, all_seg_speed_country = (
+                segmentation_pass.average_by_country(
+                    df_mapping, seg_speed, seg_speed_min, seg_speed_max,
+                )
+            )
+            avg_seg_time_locality, all_seg_time_locality = (
+                segmentation_pass.average_by_locality(
+                    seg_time, seg_time_min, seg_time_max,
+                )
+            )
+            avg_seg_time_country, all_seg_time_country = (
+                segmentation_pass.average_by_country(
+                    df_mapping, seg_time, seg_time_min, seg_time_max,
+                )
+            )
+
+            segmentation_results = {
+                "avg_speed_locality": avg_seg_speed_locality,
+                "avg_speed_country": avg_seg_speed_country,
+                "avg_time_locality": avg_seg_time_locality,
+                "avg_time_country": avg_seg_time_country,
+                "all_speed_locality": all_seg_speed_locality,
+                "all_speed_country": all_seg_speed_country,
+                "all_time_locality": all_seg_time_locality,
+                "all_time_country": all_seg_time_country,
+                "diagnostics": dict(segmentation_output["diagnostics"]),
+            }
+
+            logger.info(
+                f"Segmentation metrics cover {len(avg_seg_speed_locality)} "
+                f"locality-condition key(s) for speed and "
+                f"{len(avg_seg_time_locality)} for hesitation time, against "
+                f"{len(avg_speed_locality)} and {len(avg_time_locality)} "
+                "respectively for the baseline."
+            )
+
+            # Which derivation the figures actually show.
+            #
+            # Every plot reads the crossing metrics out of results.pickle by
+            # position, so making the segmentation values the reported ones is
+            # a matter of substituting them here, before the pickle is
+            # written. The baseline stays available in the speed_crossing_seg
+            # and time_crossing_seg columns either way, so the two can still
+            # be compared after the switch.
+            #
+            # This is off by default because the segmentation metrics do not
+            # cover every crossing the baseline covers: a track is dropped
+            # when it never reaches the carriageway, when the frozen speed
+            # model's reliability gates reject the shortened window, and, for
+            # the hesitation time, whenever the pedestrian was already on the
+            # road when first detected. A locality left with no qualifying
+            # track disappears from the figures entirely.
+            if _segmentation_is_primary():
+                lost_speed = sorted(
+                    set(avg_speed_locality) - set(avg_seg_speed_locality)
+                )
+                lost_time = sorted(
+                    set(avg_time_locality) - set(avg_seg_time_locality)
+                )
+                logger.warning(
+                    "segmentation_is_primary is enabled: the figures will "
+                    "report the road-restricted crossing speed and the "
+                    "kerb-anchored hesitation time. "
+                    f"{len(lost_speed)} locality-condition key(s) lose their "
+                    f"speed and {len(lost_time)} lose their hesitation time "
+                    "relative to the baseline."
+                )
+                if lost_speed:
+                    logger.warning(
+                        f"No segmentation speed for: {', '.join(lost_speed[:20])}"
+                        + (" ..." if len(lost_speed) > 20 else "")
+                    )
+                if lost_time:
+                    logger.warning(
+                        f"No segmentation hesitation time for: {', '.join(lost_time[:20])}"
+                        + (" ..." if len(lost_time) > 20 else "")
+                    )
+
+                (
+                    avg_speed_locality,
+                    avg_speed_country,
+                    all_speed_locality,
+                    all_speed_country,
+                ) = _primary_speed(
+                    segmentation_results,
+                    avg_speed_locality,
+                    avg_speed_country,
+                    all_speed_locality,
+                    all_speed_country,
+                )
+                (
+                    avg_time_locality,
+                    avg_time_country,
+                    all_time_locality,
+                    all_time_country,
+                ) = _primary_time(
+                    segmentation_results,
+                    avg_time_locality,
+                    avg_time_country,
+                    all_time_locality,
+                    all_time_country,
+                )
+            else:
+                logger.info(
+                    "segmentation_is_primary is disabled: the figures continue "
+                    "to report the baseline bounding-box metrics, and the "
+                    "segmentation values are written to the speed_crossing_seg "
+                    "and time_crossing_seg columns for comparison."
+                )
+
         logger.info("Calculating counts of detected traffic signs.")
         traffic_sign_locality = metrics_cache.calculate_traffic_signs(df_mapping)
 
@@ -4002,11 +4295,18 @@ if __name__ == "__main__":
                     df_mapping_raw,                               # 40
                     pedestrian_cross_locality_all,                    # 41
                     pedestrian_cross_country_all,                 # 42
-                ) + (_build_cache_metadata(current_cache_config),),
+                ) + (_build_cache_metadata(current_cache_config, segmentation_results),),
                 file,
             )
 
         logger.info("Analysis results saved to pickle file.")
+
+    df_mapping = _apply_segmentation_columns(
+        df_mapping,
+        segmentation_results,
+        pedestrian_cross_locality,
+        pedestrian_cross_country,
+    )
 
     # Set index as ID  (Polars has no index; keep semantics by ensuring `id` exists and is first)
     if "id" in df_mapping.columns:
@@ -4050,6 +4350,18 @@ if __name__ == "__main__":
         # if any still expects pandas, convert inside those functions (not here).
         avg_speed_country, all_speed_country = metrics.avg_speed_of_crossing_country(df_mapping, all_speed)
         avg_speed_locality, all_speed_locality = metrics.avg_speed_of_crossing_locality(df_mapping, all_speed)
+        (
+            avg_speed_locality,
+            avg_speed_country,
+            all_speed_locality,
+            all_speed_country,
+        ) = _primary_speed(
+            segmentation_results,
+            avg_speed_locality,
+            avg_speed_country,
+            all_speed_locality,
+            all_speed_country,
+        )
         # Re-deriving the per-track speeds replaces every average wholesale,
         # and the metric speed model rejects tracks that the relative index
         # accepted. A locality left without a single valid track is simply
@@ -4099,7 +4411,7 @@ if __name__ == "__main__":
         with open(file_results, "wb") as file:
             pickle.dump(
                 tuple(results_list[:CACHE_RESULTS_COUNT])
-                + (_build_cache_metadata(current_cache_config),),
+                + (_build_cache_metadata(current_cache_config, segmentation_results),),
                 file,
             )
         logger.info("Updated speed values in the pickle file.")
@@ -4108,6 +4420,18 @@ if __name__ == "__main__":
     if common.get_configs("reanalyse_waiting_time"):
         avg_time_country, all_time_country = metrics.avg_time_to_start_cross_country(df_mapping, all_time)
         avg_time_locality, all_time_locality = metrics.avg_time_to_start_cross_locality(df_mapping, all_time)
+        (
+            avg_time_locality,
+            avg_time_country,
+            all_time_locality,
+            all_time_country,
+        ) = _primary_time(
+            segmentation_results,
+            avg_time_locality,
+            avg_time_country,
+            all_time_locality,
+            all_time_country,
+        )
         df_mapping = mapping_enrich.add_speed_and_time_to_mapping(
             df_mapping=df_mapping,
             avg_time_locality=avg_time_locality,
@@ -4129,7 +4453,7 @@ if __name__ == "__main__":
         with open(file_results, "wb") as file:
             pickle.dump(
                 tuple(results_list[:CACHE_RESULTS_COUNT])
-                + (_build_cache_metadata(current_cache_config),),
+                + (_build_cache_metadata(current_cache_config, segmentation_results),),
                 file,
             )
         logger.info("Updated time values in the pickle file.")

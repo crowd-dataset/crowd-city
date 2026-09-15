@@ -12,11 +12,17 @@ class Mapping_Enrich:
 
     def add_speed_and_time_to_mapping(self, df_mapping, avg_speed_locality, avg_time_locality, avg_speed_country,
                                       avg_time_country, pedestrian_cross_locality, pedestrian_cross_country,
-                                      threshold=common.get_configs("min_crossing_detect")):
+                                      threshold=common.get_configs("min_crossing_detect"),
+                                      speed_col_prefix="speed_crossing",
+                                      time_col_prefix="time_crossing"):
         """
         Adds locality/country-level average speeds and/or times (day/night) to df_mapping DataFrame,
         depending on which dicts are provided. Missing columns are created and initialised with NaN.
         For country-level data, values are only added if pedestrian_cross_country[country_cond] < value.
+
+        The column prefixes are parameters so an alternative derivation of
+        the same two metrics can be written alongside the baseline columns
+        instead of overwriting them.
         """
         configs = []
         if avg_speed_locality is not None:
@@ -24,28 +30,28 @@ class Mapping_Enrich:
                 label="locality",
                 avg_dict=avg_speed_locality,
                 value_type="speed",
-                col_prefix="speed_crossing",
+                col_prefix=speed_col_prefix,
             ))
         if avg_time_locality is not None:
             configs.append(dict(
                 label="locality",
                 avg_dict=avg_time_locality,
                 value_type="time",
-                col_prefix="time_crossing",
+                col_prefix=time_col_prefix,
             ))
         if avg_speed_country is not None:
             configs.append(dict(
                 label="country",
                 avg_dict=avg_speed_country,
                 value_type="speed",
-                col_prefix="speed_crossing",
+                col_prefix=speed_col_prefix,
             ))
         if avg_time_country is not None:
             configs.append(dict(
                 label="country",
                 avg_dict=avg_time_country,
                 value_type="time",
-                col_prefix="time_crossing",
+                col_prefix=time_col_prefix,
             ))
 
         out = df_mapping
