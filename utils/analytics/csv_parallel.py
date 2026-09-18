@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import polars as pl
 
@@ -287,13 +287,29 @@ def _time_to_cross_from_track_index(
     track_index: TrackIndex,
     ids: list,
     fps: float,
+    id_bounds: Optional[Dict[Any, Tuple[int, int]]] = None,
 ) -> Dict[Any, float]:
-    """Match Metrics.time_to_cross without filtering and sorting per ID."""
+    """Match Metrics.time_to_cross without filtering and sorting per ID.
+
+    A tracker id can be reused for an unrelated object much later in the same
+    video, so ``track_index[track_id]`` may hold rows from more than one
+    appearance. When ``id_bounds`` gives the accepted crossing's own
+    ``(start_frame, end_frame)``, that span is the duration directly; the full
+    track is only used as a fallback when no bound is known for the id.
+    """
     if not ids or not math.isfinite(float(fps)) or float(fps) <= 0:
         return {}
 
     output: Dict[Any, float] = {}
     for track_id in ids:
+        bounds = (id_bounds or {}).get(track_id)
+        if bounds is not None:
+            start_frame, end_frame = bounds
+            duration = (float(end_frame) - float(start_frame)) / float(fps)
+            if duration > 0:
+                output[track_id] = float(duration)
+            continue
+
         track = _track(track_index, track_id)
         if track is None or track.height < 2 or "frame-count" not in track.columns:
             continue
@@ -323,8 +339,14 @@ def _time_to_start_from_track_index(
     track_ids: list,
     source_id: str,
     fps: float,
+    id_bounds: Optional[Dict[Any, Tuple[int, int]]] = None,
 ):
-    """Match waiting time calculation while reusing already sorted tracks."""
+    """Match waiting time calculation while reusing already sorted tracks.
+
+    Restricts each track to its accepted crossing's own frames when
+    ``id_bounds`` has them, so a tracker id reused later in the same video for
+    an unrelated object cannot be mistaken for more of the same wait.
+    """
     if not track_ids or not math.isfinite(float(fps)) or float(fps) <= 0:
         return None
 
@@ -344,6 +366,17 @@ def _time_to_start_from_track_index(
             continue
         if not {"x-center", "height"}.issubset(set(track.columns)):
             continue
+
+        bounds = (id_bounds or {}).get(track_id)
+        if bounds is not None and "frame-count" in track.columns:
+            start_frame, end_frame = bounds
+            track = track.filter(
+                pl.col("frame-count").cast(pl.Int64, strict=False).is_between(
+                    start_frame, end_frame,
+                )
+            )
+            if track.height <= step:
+                continue
 
         x_values = track.get_column("x-center").cast(
             pl.Float64,
@@ -598,6 +631,7 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
 
         ids = []
         all_ids = []
+        id_bounds: Dict[Any, Tuple[int, int]] = {}
         temp_data: Dict[Any, Any] = {}
         speed_value = None
         time_value = None
@@ -617,7 +651,7 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 )
             )
 
-            ids, all_ids = _DETECTION.pedestrian_crossing(
+            ids, all_ids, id_bounds = _DETECTION.pedestrian_crossing(
                 df,
                 filename_no_ext,
                 mapping,
@@ -633,12 +667,14 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 track_index,
                 ids,
                 fps,
+                id_bounds,
             )
 
             speed_value = _METRICS.calculate_speed_of_crossing(
                 mapping,
                 df,
                 {filename_no_ext: temp_data},
+                id_bounds=id_bounds,
             )
 
             time_value = _time_to_start_from_track_index(
@@ -647,6 +683,7 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 list(temp_data.keys()),
                 filename_no_ext,
                 fps,
+                id_bounds,
             )
 
         return {
@@ -657,6 +694,7 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "is_bbox_stream": is_bbox_stream,
             "ids": ids,
             "all_ids": all_ids,
+            "id_bounds": id_bounds,
             "temp_data": temp_data,
             "speed_value": speed_value,
             "time_value": time_value,

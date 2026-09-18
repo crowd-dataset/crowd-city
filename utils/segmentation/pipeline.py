@@ -37,6 +37,19 @@ WINDOW_MERGE_GAP_SECONDS = 2.0
 # Extra footage kept before and after a track so the approach to the kerb and
 # the arrival at the far side are both visible.
 WINDOW_PADDING_SECONDS = 2.0
+# A tracker id can be reused for an unrelated object much later in the same
+# video. A gap this large within one track's own frames is treated as such a
+# reuse rather than a continuous presence, so its span is not stretched across
+# the gap; splitting on it keeps a single stale id from producing an
+# hours-long decode window.
+TRACK_SPAN_GAP_SECONDS = 2.0
+# Hard ceiling on one ffmpeg window, applied after splitting and merging.
+# No real pedestrian crossing (plus its padded approach and departure) lasts
+# this long; a window still this large is a sign the id-reuse split above
+# missed a case, and decoding it would risk an ffmpeg timeout or, for a
+# window that does complete, materialising tens of gigabytes of raw frames in
+# memory at once.
+MAXIMUM_WINDOW_SECONDS = 120.0
 # Widen each refinement bracket slightly so the transition cannot sit exactly
 # on its edge and be missed by rounding.
 BRACKET_PADDING_SECONDS = 0.25
@@ -88,6 +101,7 @@ class SegmentationPipeline:
             "frames_refine": 0,
             "frames_segmented": 0,
             "videos_unresolved": 0,
+            "windows_too_long_dropped": 0,
         }
 
     # ------------------------------------------------------------------
@@ -373,12 +387,31 @@ class SegmentationPipeline:
         if fps <= 0:
             return []
 
+        gap_frames = max(1, int(round(TRACK_SPAN_GAP_SECONDS * fps)))
         spans: List[Tuple[float, float]] = []
         for frames, _ in boxes.values():
             if frames.size == 0:
                 continue
-            start = request.start_seconds + float(frames.min()) / fps
-            end = request.start_seconds + float(frames.max()) / fps
+            ordered = np.sort(frames)
+            run_start = ordered[0]
+            run_end = ordered[0]
+            for value in ordered[1:]:
+                if value - run_end > gap_frames:
+                    # A gap this large means the id was reused for something
+                    # else in between, so the run ends here rather than
+                    # stretching the span across the gap.
+                    start = request.start_seconds + float(run_start) / fps
+                    end = request.start_seconds + float(run_end) / fps
+                    spans.append(
+                        (
+                            max(0.0, start - WINDOW_PADDING_SECONDS),
+                            end + WINDOW_PADDING_SECONDS,
+                        )
+                    )
+                    run_start = value
+                run_end = value
+            start = request.start_seconds + float(run_start) / fps
+            end = request.start_seconds + float(run_end) / fps
             spans.append(
                 (
                     max(0.0, start - WINDOW_PADDING_SECONDS),
@@ -386,7 +419,20 @@ class SegmentationPipeline:
                 )
             )
 
-        return self._merge_spans(spans)
+        windows = self._merge_spans(spans)
+        kept: List[FrameWindow] = []
+        for window in windows:
+            if window.duration_seconds > MAXIMUM_WINDOW_SECONDS:
+                logger.warning(
+                    f"Dropping a {window.duration_seconds:.1f}s window for "
+                    f"{request.stem} at {window.start_seconds:.1f}s; longer "
+                    f"than the {MAXIMUM_WINDOW_SECONDS:.0f}s ceiling for a "
+                    "single crossing, likely a reused tracker id."
+                )
+                self.statistics["windows_too_long_dropped"] += 1
+                continue
+            kept.append(window)
+        return kept
 
     @staticmethod
     def _merge_spans(spans: List[Tuple[float, float]]) -> List[FrameWindow]:

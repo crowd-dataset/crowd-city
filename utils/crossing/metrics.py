@@ -172,8 +172,16 @@ class Metrics:
         df_mapping: pl.DataFrame,
         df: pl.DataFrame,
         data: dict,
+        id_bounds: Optional[Dict[Any, Tuple[int, int]]] = None,
     ):
-        """Return frozen metric speed when qualified, otherwise relative motion."""
+        """Return frozen metric speed when qualified, otherwise relative motion.
+
+        ``id_bounds`` gives each crossing id's own ``(start_frame, end_frame)``
+        from ``Detection.pedestrian_crossing``. A tracker id can be reused for
+        an unrelated object elsewhere in the same video, so without this every
+        row sharing that id would be treated as one track; the bound isolates
+        the frames the crossing was actually accepted from.
+        """
         if not data or not any(data.values()):
             return None
         source_id = next(iter(data))
@@ -194,10 +202,25 @@ class Metrics:
         aspect_ratio = safe_float(os.environ.get("CROWD_BBOX_ASPECT_RATIO"))
         if aspect_ratio is None or aspect_ratio <= 0.0:
             aspect_ratio = DEFAULT_ASPECT_RATIO
+
+        bounds_by_id = {
+            normalise_id(key): value
+            for key, value in (id_bounds or {}).items()
+            if normalise_id(key) in selected_ids
+        }
+
         if _SPEED_MODEL:
             person_tracks = group_tracks(
                 row for row in rows if row.class_id == PERSON_CLASS_ID
             )
+            if bounds_by_id:
+                for track_id, bounds in bounds_by_id.items():
+                    track_rows = person_tracks.get(track_id)
+                    if not track_rows:
+                        continue
+                    trimmed = trim_rows_to_frame_range(track_rows, *bounds)
+                    if trimmed:
+                        person_tracks[track_id] = trimmed
             scene_profile = build_scene_motion_profile(rows, float(fps))
             features_by_track = contextual_track_features(
                 person_tracks,
@@ -224,6 +247,9 @@ class Metrics:
                 mapping=df_mapping,
             )
 
+        # relative_rows and its cache measure the whole track, unbounded, since
+        # analyse_crowd_sources' diagnostic dump reads this cache expecting one
+        # row per full person track in the scene, not per accepted crossing.
         relative_rows, _ = predict_relative_bbox_rows(
             rows, float(fps), str(source_id), aspect_ratio
         )
@@ -241,6 +267,39 @@ class Metrics:
             and row.get("relative_motion_status") == "valid"
             and safe_float(row.get("relative_motion_index")) is not None
         }
+
+        if bounds_by_id:
+            # A second, bounded pass supplies the values actually reported for
+            # the ids with a known crossing segment, so the cache above stays
+            # whole-track for its own consumer while the reported speed is not
+            # diluted by a reused id's unrelated frames.
+            non_person_rows = [
+                row for row in rows if row.class_id != PERSON_CLASS_ID
+            ]
+            person_tracks = group_tracks(
+                row for row in rows if row.class_id == PERSON_CLASS_ID
+            )
+            bounded_rows = list(non_person_rows)
+            for track_id, track_rows in person_tracks.items():
+                bounds = bounds_by_id.get(track_id)
+                if bounds is not None:
+                    trimmed = trim_rows_to_frame_range(track_rows, *bounds)
+                    bounded_rows.extend(trimmed or track_rows)
+                else:
+                    bounded_rows.extend(track_rows)
+            bounded_relative_rows, _ = predict_relative_bbox_rows(
+                bounded_rows, float(fps), str(source_id), aspect_ratio
+            )
+            for row in bounded_relative_rows:
+                track_id = normalise_id(row.get("prediction_track_id"))
+                if track_id not in bounds_by_id:
+                    continue
+                index_value = safe_float(row.get("relative_motion_index"))
+                if row.get("relative_motion_status") != "valid" or index_value is None:
+                    values.pop(track_id, None)
+                    continue
+                values[track_id] = index_value
+
         if not values:
             return None
         return grouping_class.locality_country_wrapper(
@@ -800,6 +859,23 @@ def group_tracks(rows: Iterable[BBoxRow]) -> Dict[str, List[BBoxRow]]:
     for row in rows:
         grouped[row.track_id].append(row)
     return dict(grouped)
+
+
+def trim_rows_to_frame_range(
+    rows: Sequence[BBoxRow],
+    start_frame: int,
+    end_frame: int,
+) -> List[BBoxRow]:
+    """Keep only the rows of one track inside ``[start_frame, end_frame]``.
+
+    A tracker id can be reused for an unrelated object elsewhere in the same
+    video, so the rows sharing that id are not necessarily all one crossing.
+    Callers that know the specific segment's frame bounds (from
+    ``Detection.pedestrian_crossing`` or a road interval) use this to isolate
+    it before computing duration or speed features.
+    """
+    low, high = int(start_frame), int(end_frame)
+    return [row for row in rows if low <= row.frame <= high]
 
 
 def rolling_median(values: np.ndarray, window: int = 3) -> np.ndarray:

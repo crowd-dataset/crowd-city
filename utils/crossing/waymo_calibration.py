@@ -472,7 +472,7 @@ def _predicted_crossings(
         for key, value in parameters.items()
         if key not in {"boundary_left", "boundary_right"}
     }
-    ids, _ = detector.pedestrian_crossing(
+    ids, _, _ = detector.pedestrian_crossing(
         sequence.prediction_dataframe,
         sequence.source_id,
         pl.DataFrame(),

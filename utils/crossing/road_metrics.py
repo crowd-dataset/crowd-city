@@ -123,9 +123,9 @@ def hesitation_seconds(
 
 def _trim_track_rows(rows: List[Any], interval: RoadInterval) -> List[Any]:
     """Keep only the bbox rows inside the on-road interval."""
-    low = int(interval.entry_frame)
-    high = int(interval.exit_frame)
-    return [row for row in rows if low <= int(row.frame) <= high]
+    return crossing_metrics.trim_rows_to_frame_range(
+        rows, interval.entry_frame, interval.exit_frame,
+    )
 
 
 def road_restricted_speed(
@@ -136,22 +136,25 @@ def road_restricted_speed(
     intervals: Mapping[str, RoadInterval],
     aspect_ratio: Optional[float] = None,
 ) -> Tuple[Dict[str, float], Counter]:
-    """Return metric speed fitted over on-road frames only, plus reject reasons.
+    """Return crossing speed fitted over on-road frames only, plus reject reasons.
 
     The scene-motion reference is deliberately built from every detection in
     the segment, exactly as in the baseline. Only the measured pedestrian
     tracks are trimmed, so the camera-motion compensation the model relies on
     is unaffected by the restriction.
+
+    When the frozen Waymo model is qualified, the returned values are metres
+    per second, exactly like the baseline's qualified path. When it is not,
+    this falls back to the same within-video relative-motion index the
+    baseline itself falls back to (``predict_relative_bbox_rows``), computed
+    from the on-road-only frames instead of the whole track. The reference
+    tracks it is compared against are not similarly restricted (most carry no
+    road interval at all), so the index is a coarser, self-consistent-only
+    approximation, not a metric speed; treat it accordingly.
     """
     diagnostics: Counter = Counter()
 
     if not intervals:
-        return {}, diagnostics
-    if not crossing_metrics._SPEED_MODEL:
-        # Without a qualified model the baseline itself reports a relative
-        # index, and a road-restricted relative index would not be comparable
-        # to anything. Nothing is emitted rather than something mislabelled.
-        diagnostics["speed_model_not_qualified"] += len(intervals)
         return {}, diagnostics
     if fps is None or float(fps) <= 0:
         diagnostics["invalid_fps"] += len(intervals)
@@ -168,7 +171,6 @@ def road_restricted_speed(
     person_tracks = crossing_metrics.group_tracks(
         row for row in rows if row.class_id == crossing_metrics.PERSON_CLASS_ID
     )
-    scene_profile = crossing_metrics.build_scene_motion_profile(rows, float(fps))
 
     # group_tracks keys its output through normalise_id, which turns the
     # detection file's "171.0" into "171". The surface index is keyed by the
@@ -195,30 +197,72 @@ def road_restricted_speed(
         else:
             diagnostics["road_interval_empty"] += 1
 
-    features_by_track = crossing_metrics.contextual_track_features(
-        trimmed,
+    if crossing_metrics._SPEED_MODEL:
+        scene_profile = crossing_metrics.build_scene_motion_profile(rows, float(fps))
+        features_by_track = crossing_metrics.contextual_track_features(
+            trimmed,
+            float(fps),
+            str(source_id),
+            float(aspect_ratio),
+            scene_profile,
+        )
+        stature_scale = crossing_metrics.stature_scale_for_source(df_mapping, source_id)
+
+        values: Dict[str, float] = {}
+        for track_id in intervals_by_normalised_id:
+            features = features_by_track.get(str(track_id))
+            if features is None:
+                diagnostics["no_features"] += 1
+                continue
+            prediction = crossing_metrics._predict_metric_speed(
+                features,
+                crossing_metrics._SPEED_MODEL,
+            )
+            if prediction.get("speed_status") == "valid":
+                values[str(track_id)] = (
+                    float(prediction["estimated_speed_mps"]) * stature_scale
+                )
+            else:
+                diagnostics[str(prediction.get("reject_reason") or "rejected")] += 1
+
+        return values, diagnostics
+
+    # No qualified metric model: fall back to the CROWD relative-motion index,
+    # restricted to the on-road frames of the crossing tracks. Non-person rows
+    # carry the scene-motion reference and untouched person tracks act as the
+    # within-video comparison set, exactly as predict_relative_bbox_rows
+    # expects for the baseline's own unqualified path.
+    diagnostics["relative_index_fallback_used"] += 1
+    non_person_rows = [
+        row for row in rows if row.class_id != crossing_metrics.PERSON_CLASS_ID
+    ]
+    relative_input_rows = non_person_rows + [
+        row for track_rows in trimmed.values() for row in track_rows
+    ]
+    relative_predictions, _ = crossing_metrics.predict_relative_bbox_rows(
+        relative_input_rows,
         float(fps),
         str(source_id),
         float(aspect_ratio),
-        scene_profile,
     )
-    stature_scale = crossing_metrics.stature_scale_for_source(df_mapping, source_id)
+    relative_by_id = {
+        crossing_metrics.normalise_id(row.get("prediction_track_id")): row
+        for row in relative_predictions
+    }
 
-    values: Dict[str, float] = {}
+    values = {}
     for track_id in intervals_by_normalised_id:
-        features = features_by_track.get(str(track_id))
-        if features is None:
+        row = relative_by_id.get(str(track_id))
+        if row is None:
             diagnostics["no_features"] += 1
             continue
-        prediction = crossing_metrics._predict_metric_speed(
-            features,
-            crossing_metrics._SPEED_MODEL,
-        )
-        if prediction.get("speed_status") == "valid":
-            values[str(track_id)] = (
-                float(prediction["estimated_speed_mps"]) * stature_scale
-            )
-        else:
-            diagnostics[str(prediction.get("reject_reason") or "rejected")] += 1
+        if row.get("relative_motion_status") != "valid":
+            diagnostics[str(row.get("reject_reason") or "rejected")] += 1
+            continue
+        index_value = crossing_metrics.safe_float(row.get("relative_motion_index"))
+        if index_value is None:
+            diagnostics["relative_index_undefined"] += 1
+            continue
+        values[str(track_id)] = index_value
 
     return values, diagnostics

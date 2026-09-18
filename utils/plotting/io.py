@@ -1,7 +1,9 @@
 import os
+import shutil
+import subprocess
+
 import common
 import plotly as py
-import shutil
 from custom_logger import CustomLogger
 
 logger = CustomLogger(__name__)  # use custom logger
@@ -59,10 +61,42 @@ class IO:
             # Save as EPS
             if save_eps:
                 logger.info(f"Saving eps file for {filename}.")
-                fig.write_image(os.path.join(common.output_dir, filename + ".eps"), width=width, height=height)
+                self._write_eps(fig, os.path.join(common.output_dir, filename + ".eps"), width, height)
                 # also save the final figure
                 if save_final:
                     shutil.copy(os.path.join(common.output_dir, filename + ".eps"),
                                 os.path.join(output_final, filename + ".eps"))
         except ValueError as e:
             logger.error(f"Value error raised when attempted to save image {filename}: {e}")
+
+    def _write_eps(self, fig, eps_path, width, height):
+        """Write an EPS file, working around kaleido's PDF-to-EPS conversion.
+
+        Kaleido bundles its own PDF-to-EPS step, which raises "Transform
+        failed with error code 256: PDF to EPS conversion failed" on some
+        systems regardless of figure content, even though kaleido's own PDF
+        and PNG export both work fine there. Exporting to PDF and converting
+        with poppler's pdftops sidesteps that broken step; if pdftops is not
+        installed, this raises the same ValueError the caller already handles.
+        """
+        try:
+            fig.write_image(eps_path, width=width, height=height)
+            return
+        except ValueError as error:
+            logger.warning(
+                f"Kaleido's direct EPS export failed ({error}); "
+                "falling back to PDF + pdftops."
+            )
+
+        pdf_path = eps_path[:-len(".eps")] + ".pdf"
+        fig.write_image(pdf_path, width=width, height=height)
+        try:
+            subprocess.run(
+                ["pdftops", "-eps", pdf_path, eps_path],
+                check=True,
+                capture_output=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError) as error:
+            raise ValueError(f"pdftops fallback failed for {eps_path}: {error}") from error
+        finally:
+            os.remove(pdf_path)

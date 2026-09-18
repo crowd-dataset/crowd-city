@@ -3368,9 +3368,13 @@ if __name__ == "__main__":
                 filename_no_ext = result["filename_no_ext"]
                 ids = result["ids"]
                 all_ids = result["all_ids"]
+                id_bounds = result.get("id_bounds") or {}
                 temp_data = result["temp_data"]
 
-                pedestrian_crossing_count[filename_no_ext] = {"ids": ids}
+                pedestrian_crossing_count[filename_no_ext] = {
+                    "ids": ids,
+                    "id_bounds": id_bounds,
+                }
                 pedestrian_crossing_count_all[filename_no_ext] = {
                     "ids": all_ids
                 }

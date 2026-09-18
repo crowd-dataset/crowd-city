@@ -75,18 +75,41 @@ def _secret(name: str) -> Optional[str]:
     return text or None
 
 
-def _crossing_tracks(df: pl.DataFrame, track_ids: Sequence[Any]) -> Dict[str, pl.DataFrame]:
-    """Return the detection rows of each crossing track, keyed by track id."""
+def _crossing_tracks(
+    df: pl.DataFrame,
+    track_ids: Sequence[Any],
+    id_bounds: Optional[Mapping[Any, Tuple[int, int]]] = None,
+) -> Dict[str, pl.DataFrame]:
+    """Return the detection rows of each crossing track, keyed by track id.
+
+    A tracker id can be reused for an unrelated object elsewhere in the same
+    video, so ``id_bounds`` (the accepted segment's own frame range, from
+    ``Detection.pedestrian_crossing``) restricts each track to the frames it
+    actually crossed on when known, instead of every row sharing that id.
+    """
     if df.height == 0 or not track_ids:
         return {}
     wanted = {str(value) for value in track_ids}
+    bounds = {str(key): value for key, value in (id_bounds or {}).items()}
     tracks: Dict[str, pl.DataFrame] = {}
     for track in df.partition_by("unique-id", maintain_order=True):
         if track.height == 0:
             continue
         track_id = str(track.get_column("unique-id")[0])
-        if track_id in wanted:
-            tracks[track_id] = track.sort("frame-count")
+        if track_id not in wanted:
+            continue
+        track = track.sort("frame-count")
+        track_bounds = bounds.get(track_id)
+        if track_bounds is not None and "frame-count" in track.columns:
+            start_frame, end_frame = track_bounds
+            restricted = track.filter(
+                pl.col("frame-count").cast(pl.Int64, strict=False).is_between(
+                    start_frame, end_frame,
+                )
+            )
+            if restricted.height > 0:
+                track = restricted
+        tracks[track_id] = track
     return tracks
 
 
@@ -235,6 +258,7 @@ def run_segmentation_pass(
                     stem=stem,
                     track_ids=list(crossing_ids[stem]["ids"]),
                     checks_per_second=checks_per_second,
+                    id_bounds=crossing_ids[stem].get("id_bounds") or {},
                 )
             except Exception as error:
                 logger.warning(f"Segmentation failed for {stem}: {error}")
@@ -289,6 +313,7 @@ def _process_segment(
     stem: str,
     track_ids: List[Any],
     checks_per_second: float,
+    id_bounds: Optional[Mapping[Any, Tuple[int, int]]] = None,
 ) -> Optional[Tuple[Dict[str, float], Dict[str, float], Counter]]:
     """Segment one detection segment and derive both metrics from it."""
     diagnostics: Counter = Counter()
@@ -311,7 +336,7 @@ def _process_segment(
         diagnostics["empty_detection_file"] += 1
         return None
 
-    tracks = _crossing_tracks(detections, track_ids)
+    tracks = _crossing_tracks(detections, track_ids, id_bounds)
     if not tracks:
         diagnostics["crossing_tracks_missing"] += 1
         return None

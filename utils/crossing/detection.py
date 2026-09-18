@@ -2,7 +2,7 @@ import numpy as np
 import polars as pl
 from utils.core.metadata import MetaData
 from helper_script import Youtube_Helper
-from typing import Tuple, List, Any, Optional
+from typing import Tuple, List, Any, Optional, Dict
 
 metadata = MetaData()
 helper = Youtube_Helper()
@@ -153,7 +153,7 @@ class Detection:
                             jitter_road_frames: int = 40,
                             camera_min_road_frames: int = 5,
                             track_index: Optional[dict[Any, pl.DataFrame]] = None
-                            ) -> Tuple[List[Any], List[Any]]:
+                            ) -> Tuple[List[Any], List[Any], Dict[Any, Tuple[int, int]]]:
         """
         Identifies pedestrian tracks that satisfy a road-crossing criterion and filters false positives.
 
@@ -163,6 +163,16 @@ class Detection:
         - Relaxed long-road rejection so slow true crossings are not removed.
         - Applies rider filtering on the segment window, not on the whole video, to avoid ID-reuse artefacts.
         - Scales all frame-count thresholds by fps/base_fps so 30 fps behaviour stays unchanged.
+
+        Returns a ``(pedestrian_ids, crossed_ids, pedestrian_bounds)`` tuple. A
+        tracker id can be reused for an unrelated object much later in the same
+        video, so ``pedestrian_ids`` alone is not enough to recover the frames
+        that actually crossed: a caller that filters the source dataframe by id
+        would pick up that unrelated reappearance too. ``pedestrian_bounds``
+        maps each accepted id to the ``(start_frame, end_frame)`` of the
+        specific segment that qualified, so callers that need the crossing's
+        own frames (crossing duration, waiting time, speed features) can
+        restrict to that range instead of everything sharing the id.
         """
         fps_value = Detection._resolve_fps(fps, df_mapping, video_id, default=float(base_fps))
         base_fps_value = max(float(base_fps), 1e-9)
@@ -220,7 +230,7 @@ class Detection:
         else:
             crossed_df = dataframe.filter(pl.col("yolo-id") == 0)
             if crossed_df.height == 0:
-                return [], []
+                return [], [], {}
 
             crossed_df = Detection._dedup_per_frame(crossed_df)
 
@@ -237,7 +247,7 @@ class Detection:
                 .sort(["unique-id", "frame-count"])
             )
             if tracks.height == 0:
-                return [], []
+                return [], [], {}
 
             track_partitions = tracks.partition_by(
                 "unique-id",
@@ -245,7 +255,7 @@ class Detection:
             )
 
         if not track_partitions:
-            return [], []
+            return [], [], {}
 
         left_hard = float(min_x) - float(tol)
         left_soft = float(min_x) + float(tol)
@@ -393,6 +403,7 @@ class Detection:
 
         pedestrian_ids: List[Any] = []
         pedestrian_ids_seen = set()
+        pedestrian_bounds: Dict[Any, Tuple[int, int]] = {}
 
         # Sort once by frame. Each candidate window is then located with two
         # binary searches and extracted with slice(), avoiding a full DataFrame
@@ -536,8 +547,9 @@ class Detection:
             if uid not in pedestrian_ids_seen:
                 pedestrian_ids.append(uid)
                 pedestrian_ids_seen.add(uid)
+                pedestrian_bounds[uid] = (int(start_frame), int(end_frame))
 
-        return pedestrian_ids, crossed_ids
+        return pedestrian_ids, crossed_ids, pedestrian_bounds
 
     @staticmethod
     def _dedup_per_frame(df: pl.DataFrame) -> pl.DataFrame:

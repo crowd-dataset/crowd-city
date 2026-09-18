@@ -775,7 +775,7 @@ def compute_automatic_events(
         candidate_events: all state-machine crossing candidates
         rejected_events: candidates removed by filters
     """
-    valid_ids, candidate_ids = detection.pedestrian_crossing(
+    valid_ids, candidate_ids, _ = detection.pedestrian_crossing(
         df,
         video_id_full,
         df_mapping,
