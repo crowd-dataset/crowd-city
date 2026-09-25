@@ -327,6 +327,13 @@ def _process_segment(
         float(task.get("time_video", 0.0) or 0.0),
         float(task["fps"]),
     )
+    # Resampling renumbers frames relative to the first retained frame, so
+    # that origin is needed to put the renumbered frames back on video time.
+    first_source_frame = (
+        detections.get_column("frame-count").cast(pl.Float64, strict=False).min()
+        if detections.height and "frame-count" in detections.columns
+        else None
+    )
     detections, effective_fps = _resample_detection_fps(
         detections,
         float(task["fps"]),
@@ -348,6 +355,8 @@ def _process_segment(
             start_seconds=float(task["start_index"]),
             detection_fps=float(effective_fps),
             tracks=tracks,
+            source_fps=float(task["fps"]),
+            first_source_frame=int(first_source_frame or 0),
         )
     )
     if not timelines:

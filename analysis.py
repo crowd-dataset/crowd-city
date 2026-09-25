@@ -33,6 +33,7 @@ from utils.analytics.metrics_cache import MetricsCache
 from utils.analytics.structure import analyse_structure
 from utils.analytics import speed_recompute
 from utils.segmentation import crossing_pass as segmentation_pass
+from utils.segmentation.store import INDEX_SCHEMA as SEGMENTATION_INDEX_SCHEMA
 from utils.analytics.parquet_store import (
     DETECTION_FOLDER,
     configured_parquet_roots,
@@ -1859,11 +1860,17 @@ def _current_cache_config() -> Dict[str, object]:
         # the feature existed produced, so its fingerprint is the same one and
         # an existing results.pickle stays valid.
         skipped.add("use_segmentation")
-    return {
+    config = {
         key: common.get_configs(key)
         for key in CACHE_CONFIG_KEYS
         if segmentation_enabled or key not in skipped
     }
+    if segmentation_enabled:
+        # The surface-label schema changes whenever stored labels stop being
+        # valid (for example the move to the probed video frame rate), so a
+        # cached run must not keep segmentation metrics derived from old ones.
+        config["segmentation_index_schema"] = SEGMENTATION_INDEX_SCHEMA
+    return config
 
 
 def _build_cache_metadata(

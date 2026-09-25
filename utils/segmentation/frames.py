@@ -9,6 +9,7 @@ intermediate image files are written.
 from __future__ import annotations
 
 import base64
+import json
 import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -29,6 +30,7 @@ logger = CustomLogger(__name__)
 # answer "Unknown folder alias".
 SERVER_ALIASES = ("tue4", "tue5")
 FFMPEG_BINARY = "ffmpeg"
+FFPROBE_BINARY = "ffprobe"
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,56 @@ class FrameWindow:
 
     start_seconds: float
     duration_seconds: float
+
+
+@dataclass(frozen=True)
+class FrameClock:
+    """Map one detection segment's analysis frame numbers onto video time.
+
+    The raw frame-count advances once per decoded frame, so it runs at the
+    video's real rate, which the detection file name only carries rounded to
+    an integer (29.97 is stored as 30). When processing_fps downsampled the
+    detections, frames were also renumbered onto a coarser grid anchored at
+    the first retained source frame; this undoes that as well.
+    """
+
+    start_seconds: float
+    video_fps: float
+    origin_frame: float = 0.0
+    source_frames_per_frame: float = 1.0
+
+    @classmethod
+    def for_segment(
+        cls,
+        start_seconds: float,
+        video_fps: float,
+        source_fps: float,
+        detection_fps: float,
+        first_source_frame: float = 0.0,
+    ) -> "FrameClock":
+        # Mirrors _resample_detection_fps, which only renumbers when the
+        # processing rate is below the (nominal) source rate.
+        if 0 < detection_fps < source_fps - 1e-6:
+            return cls(
+                start_seconds=float(start_seconds),
+                video_fps=float(video_fps),
+                origin_frame=float(first_source_frame),
+                source_frames_per_frame=float(source_fps) / float(detection_fps),
+            )
+        return cls(start_seconds=float(start_seconds), video_fps=float(video_fps))
+
+    @property
+    def frames_per_second(self) -> float:
+        """Analysis frames per second of real video time."""
+        return self.video_fps / self.source_frames_per_frame
+
+    def seconds(self, frame: float) -> float:
+        source_frame = self.origin_frame + float(frame) * self.source_frames_per_frame
+        return self.start_seconds + source_frame / self.video_fps
+
+    def frame(self, seconds: float) -> float:
+        source_frame = (float(seconds) - self.start_seconds) * self.video_fps
+        return (source_frame - self.origin_frame) / self.source_frames_per_frame
 
 
 @dataclass
@@ -136,6 +188,71 @@ def _authorisation_header(credentials: RemoteCredentials) -> Optional[str]:
         return None
     raw = f"{credentials.username}:{credentials.password}".encode("utf-8")
     return "Authorization: Basic " + base64.b64encode(raw).decode("ascii") + "\r\n"
+
+
+def _parse_frame_rate(text: object) -> Optional[float]:
+    # ffprobe reports rates as fractions such as "30000/1001"; "0/0" means unknown.
+    value = str(text or "").strip()
+    if not value:
+        return None
+    try:
+        if "/" in value:
+            numerator, denominator = value.split("/", 1)
+            rate = float(numerator) / float(denominator)
+        else:
+            rate = float(value)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return rate if np.isfinite(rate) and rate > 0 else None
+
+
+def probe_video_fps(
+    source: str,
+    credentials: Optional[RemoteCredentials] = None,
+    timeout: int = 60,
+) -> Optional[float]:
+    """Return the true frame rate of ``source`` as reported by ffprobe, or None.
+
+    The detection filenames carry the frame rate rounded to an integer, so a
+    29.97 fps video is labelled 30. Mapping detection frames to video time with
+    the rounded value drifts by one frame every ~33 s, which is enough to put
+    boxes visibly off their pedestrian late in a segment.
+    """
+    command: List[str] = [FFPROBE_BINARY, "-v", "error"]
+    if str(source).startswith(("http://", "https://")) and credentials is not None:
+        header = _authorisation_header(credentials)
+        if header:
+            command += ["-headers", header]
+    command += [
+        "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+        "-of", "json",
+        str(source),
+    ]
+
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, timeout=timeout, check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as error:
+        logger.warning(f"ffprobe could not read the frame rate of {source}: {error}")
+        return None
+    if completed.returncode != 0:
+        message = completed.stderr.decode("utf-8", errors="replace").strip()
+        logger.warning(f"ffprobe failed for {source}: {message}")
+        return None
+
+    try:
+        streams = json.loads(completed.stdout.decode("utf-8")).get("streams") or []
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not streams:
+        return None
+    # The average rate is what frame index to time conversion needs; the
+    # nominal r_frame_rate is only a fallback when the container omits it.
+    return _parse_frame_rate(streams[0].get("avg_frame_rate")) or _parse_frame_rate(
+        streams[0].get("r_frame_rate")
+    )
 
 
 def extract_window_frames(

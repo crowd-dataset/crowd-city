@@ -35,9 +35,11 @@ from utils.crossing.metrics import ensure_waymo_processed, tuned_crossing_parame
 from utils.crossing.road_metrics import road_intervals_for_tracks
 from utils.segmentation.constants import SURFACE_FOOTPATH, SURFACE_ROAD
 from utils.segmentation.frames import (
+    FrameClock,
     FrameWindow,
     RemoteCredentials,
     extract_window_frames,
+    probe_video_fps,
     resolve_video_url,
 )
 from utils.segmentation.segformer import (
@@ -49,6 +51,7 @@ from utils.segmentation.segformer import (
     segmentation_is_available,
 )
 from utils.segmentation.store import (
+    INDEX_SCHEMA,
     SurfaceStore,
     configured_segmentation_root,
     crossing_fingerprint,
@@ -75,7 +78,15 @@ class Sample:
     stem: str
     video_id: str
     start_seconds: float
+    # Frame rate of the frame-count clock the store's intervals are on. It is
+    # the source rate unless processing_fps downsampled the detections.
     detection_fps: float
+    # Source frame rate as written in the stem, rounded to an integer.
+    source_fps: float
+    # Real frame rate the pipeline probed from the video, if recorded.
+    video_fps: Optional[float]
+    # Source frame the processing_fps resampling grid is anchored to.
+    first_source_frame: int
     intervals: Dict[str, RoadInterval]
 
 
@@ -157,6 +168,10 @@ def _discover_samples(store: SurfaceStore, limit: Optional[int]) -> List[Sample]
         manifest = store.read_manifest(stem)
         if not manifest:
             continue
+        # Older schemas mapped frames to time with the rounded file-name rate,
+        # so their intervals were derived from misplaced boxes.
+        if manifest.get("schema") != INDEX_SCHEMA:
+            continue
         stored_fingerprint = (manifest.get("settings") or {}).get("crossing_fingerprint")
         if stored_fingerprint != current_fingerprint:
             continue
@@ -180,12 +195,17 @@ def _discover_samples(store: SurfaceStore, limit: Optional[int]) -> List[Sample]
             continue
 
         try:
+            detection_fps = float(manifest["detection_fps"])
+            video_fps = manifest.get("video_fps")
             samples.append(
                 Sample(
                     stem=stem,
                     video_id=str(manifest["video_id"]),
                     start_seconds=float(manifest["start_seconds"]),
-                    detection_fps=float(manifest["detection_fps"]),
+                    detection_fps=detection_fps,
+                    source_fps=float(manifest.get("source_fps") or _stem_fps(stem, detection_fps)),
+                    video_fps=float(video_fps) if video_fps else None,
+                    first_source_frame=int(manifest.get("first_source_frame") or 0),
                     intervals=intervals,
                 )
             )
@@ -197,6 +217,15 @@ def _discover_samples(store: SurfaceStore, limit: Optional[int]) -> List[Sample]
         samples.sort(key=lambda sample: len(sample.intervals))
         return samples[:limit]
     return samples
+
+
+def _stem_fps(stem: str, fallback: float) -> float:
+    # Stems are VIDEOID_START_FPS; the video id itself may contain underscores.
+    try:
+        fps = float(stem.rsplit("_", 2)[2])
+    except (IndexError, ValueError):
+        return fallback
+    return fps if fps > 0 else fallback
 
 
 def _find_detection_file(stem: str) -> Optional[Path]:
@@ -321,10 +350,38 @@ def render_sample(
         logger.warning(f"{sample.stem}: could not resolve {sample.video_id} on the file server.")
         return None
 
+    # Use the rate the pipeline probed when it wrote these labels, so boxes are
+    # placed on the same clock the surface was sampled on. The integer rate in
+    # the stem is only a last resort (29.97 is stored there as 30).
+    video_fps = sample.video_fps or probe_video_fps(source, credentials)
+    if video_fps is None:
+        video_fps = sample.source_fps
+        logger.warning(
+            f"{sample.stem}: could not probe the video frame rate; "
+            f"falling back to {video_fps:g} fps from the file name."
+        )
+    elif abs(video_fps - sample.source_fps) > 1e-3:
+        logger.info(
+            f"{sample.stem}: video runs at {video_fps:.3f} fps, "
+            f"file name says {sample.source_fps:g}; using the video rate."
+        )
+
+    # The store's intervals are on the analysis clock, which differs from the
+    # raw detection frame-count only when processing_fps downsampled it.
+    analysis_clock = FrameClock.for_segment(
+        start_seconds=sample.start_seconds,
+        video_fps=video_fps,
+        source_fps=sample.source_fps,
+        detection_fps=sample.detection_fps,
+        first_source_frame=sample.first_source_frame,
+    )
+    # The boxes are read straight from the detection file, on raw frames.
+    raw_clock = FrameClock(start_seconds=sample.start_seconds, video_fps=video_fps)
+
     entry = min(interval.entry_frame for interval in sample.intervals.values())
     exit_ = max(interval.exit_frame for interval in sample.intervals.values())
-    window_start = sample.start_seconds + entry / sample.detection_fps - WINDOW_PADDING_SECONDS
-    window_end = sample.start_seconds + exit_ / sample.detection_fps + WINDOW_PADDING_SECONDS
+    window_start = analysis_clock.seconds(entry) - WINDOW_PADDING_SECONDS
+    window_end = analysis_clock.seconds(exit_) + WINDOW_PADDING_SECONDS
     duration = min(max(window_end - window_start, 1.0), MAXIMUM_CLIP_SECONDS)
     window = FrameWindow(start_seconds=max(0.0, window_start), duration_seconds=duration)
 
@@ -345,12 +402,12 @@ def render_sample(
     else:
         logger.warning(f"{sample.stem}: detection file not found; rendering without boxes.")
 
-    tolerance = sample.detection_fps / (2.0 * cadence_hz)
+    tolerance = video_fps / (2.0 * cadence_hz)
     output_path = output_dir / f"{sample.stem}.mp4"
     with imageio.get_writer(output_path, fps=cadence_hz, codec="libx264", quality=8) as writer:
         for offset in range(len(frames)):
             video_time = window.start_seconds + offset / cadence_hz
-            detection_frame = (video_time - sample.start_seconds) * sample.detection_fps
+            detection_frame = raw_clock.frame(video_time)
 
             rendered = _draw_overlay(frames[offset], labels[offset], surface_for_train_id)
             boxes_here = []

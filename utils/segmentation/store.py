@@ -26,7 +26,11 @@ from custom_logger import CustomLogger
 
 logger = CustomLogger(__name__)
 
-INDEX_SCHEMA = "crowd_surface_index_v1"
+# v2: detection frames are mapped to video time with the video's probed frame
+# rate instead of the integer rate in the file name. v1 labels were read under
+# boxes that drift by one frame every ~33 s on 29.97 fps footage, so they are
+# re-segmented rather than reused.
+INDEX_SCHEMA = "crowd_surface_index_v2"
 INDEX_FOLDER = "index"
 MANIFEST_FOLDER = "manifest"
 URL_CACHE_FILE = "video_urls.json"

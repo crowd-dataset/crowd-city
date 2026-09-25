@@ -11,9 +11,11 @@ import requests
 
 from custom_logger import CustomLogger
 from utils.segmentation.frames import (
+    FrameClock,
     FrameWindow,
     RemoteCredentials,
     extract_window_frames,
+    probe_video_fps,
     resolve_video_url,
 )
 from utils.segmentation.segformer import SurfaceSegmenter
@@ -62,8 +64,13 @@ class SegmentRequest:
     stem: str
     video_id: str
     start_seconds: float
+    # Rate of the frame-count clock the tracks are on (after processing_fps).
     detection_fps: float
     tracks: Dict[str, pl.DataFrame]
+    # Source rate as written in the file name, rounded to an integer.
+    source_fps: float = 0.0
+    # Source frame the processing_fps resampling grid is anchored to.
+    first_source_frame: int = 0
 
 
 class SegmentationPipeline:
@@ -93,6 +100,7 @@ class SegmentationPipeline:
         self._session: Optional[requests.Session] = None
         self._last_frame_count = 0
         self._unresolved: set[str] = set()
+        self._video_fps: Dict[str, Optional[float]] = {}
         self.statistics: Dict[str, int] = {
             "segments_reused": 0,
             "segments_segmented": 0,
@@ -101,6 +109,8 @@ class SegmentationPipeline:
             "frames_refine": 0,
             "frames_segmented": 0,
             "videos_unresolved": 0,
+            "videos_fps_unprobed": 0,
+            "videos_fps_fractional": 0,
             "windows_too_long_dropped": 0,
         }
 
@@ -140,6 +150,34 @@ class SegmentationPipeline:
         self.store.store_url(video_id, url)
         return url
 
+    def _clock(self, request: SegmentRequest, source: str) -> Optional[FrameClock]:
+        """Return the frame clock of ``request``, probing the video's real rate once."""
+        source_fps = float(request.source_fps or request.detection_fps)
+        if source_fps <= 0 or request.detection_fps <= 0:
+            return None
+        if request.video_id not in self._video_fps:
+            probed = probe_video_fps(source, self.credentials)
+            if probed is None:
+                self.statistics["videos_fps_unprobed"] += 1
+                logger.warning(
+                    f"Could not probe the frame rate of {request.video_id}; "
+                    f"using {source_fps:g} fps from the file name."
+                )
+            elif abs(probed - source_fps) > 1e-3:
+                self.statistics["videos_fps_fractional"] += 1
+                logger.debug(
+                    f"{request.video_id} runs at {probed:.3f} fps; file name says {source_fps:g}."
+                )
+            self._video_fps[request.video_id] = probed
+        video_fps = self._video_fps[request.video_id] or source_fps
+        return FrameClock.for_segment(
+            start_seconds=request.start_seconds,
+            video_fps=video_fps,
+            source_fps=source_fps,
+            detection_fps=float(request.detection_fps),
+            first_source_frame=request.first_source_frame,
+        )
+
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
@@ -155,10 +193,11 @@ class SegmentationPipeline:
                 self.statistics["segments_reused"] += 1
                 return self._timelines_from_index(stored, track_ids)
 
-        samples = self._segment_request(request)
-        if samples is None:
+        segmented = self._segment_request(request)
+        if segmented is None:
             self.statistics["segments_failed"] += 1
             return None
+        samples, clock = segmented
 
         self.store.write_index(request.stem, [sample.as_row() for sample in samples])
         self.store.write_manifest(
@@ -169,6 +208,9 @@ class SegmentationPipeline:
                 "video_id": request.video_id,
                 "start_seconds": float(request.start_seconds),
                 "detection_fps": float(request.detection_fps),
+                "source_fps": float(request.source_fps or request.detection_fps),
+                "video_fps": float(clock.video_fps),
+                "first_source_frame": int(request.first_source_frame),
                 "sample_count": len(samples),
             },
         )
@@ -200,7 +242,10 @@ class SegmentationPipeline:
     # ------------------------------------------------------------------
     # Segmentation
     # ------------------------------------------------------------------
-    def _segment_request(self, request: SegmentRequest) -> Optional[List[SurfaceSample]]:
+    def _segment_request(
+        self,
+        request: SegmentRequest,
+    ) -> Optional[Tuple[List[SurfaceSample], FrameClock]]:
         """Locate each track's road entry and exit, segmenting as little as possible.
 
         Nothing downstream needs a surface label for every frame. The crossing
@@ -217,40 +262,40 @@ class SegmentationPipeline:
         if not boxes:
             return None
 
-        coarse_windows = self._merged_windows(request, boxes)
+        clock = self._clock(request, source)
+        if clock is None:
+            return None
+
+        coarse_windows = self._merged_windows(request, boxes, clock)
         if not coarse_windows:
             return None
 
         samples = self._sample_windows(
-            source, coarse_windows, self.coarse_hz, boxes, request,
+            source, coarse_windows, self.coarse_hz, boxes, clock,
         )
         self.statistics["frames_coarse"] += self._last_frame_count
 
-        refine_windows = self._refinement_windows(samples, request)
+        refine_windows = self._refinement_windows(samples, clock)
         if refine_windows:
             samples.extend(
                 self._sample_windows(
-                    source, refine_windows, self.refine_hz, boxes, request,
+                    source, refine_windows, self.refine_hz, boxes, clock,
                 )
             )
             self.statistics["frames_refine"] += self._last_frame_count
 
-        return samples
+        return samples, clock
 
     def _refinement_windows(
         self,
         samples: List[SurfaceSample],
-        request: SegmentRequest,
+        clock: FrameClock,
     ) -> List[FrameWindow]:
         """Return the short spans that must be looked at more closely.
 
         One span per transition per track, merged across tracks so that
         pedestrians crossing at the same moment share the same decoded frames.
         """
-        fps = float(request.detection_fps)
-        if fps <= 0:
-            return []
-
         spans: List[Tuple[float, float]] = []
         for track_samples in surface_timeline(samples).values():
             entry, exit_bracket = transition_brackets(
@@ -261,8 +306,8 @@ class SegmentationPipeline:
                 if bracket is None:
                     continue
                 low, high = bracket
-                start = request.start_seconds + float(low) / fps
-                end = request.start_seconds + float(high) / fps
+                start = clock.seconds(low)
+                end = clock.seconds(high)
                 spans.append(
                     (
                         max(0.0, start - BRACKET_PADDING_SECONDS),
@@ -278,11 +323,12 @@ class SegmentationPipeline:
         windows: Sequence[FrameWindow],
         cadence_hz: float,
         boxes: Dict[str, Tuple[np.ndarray, Dict[int, Tuple[float, float, float, float]]]],
-        request: SegmentRequest,
+        clock: FrameClock,
     ) -> List[SurfaceSample]:
         """Decode, segment and read the footpoint surface over ``windows``."""
         samples: List[SurfaceSample] = []
         frame_total = 0
+        tolerance = clock.frames_per_second / (2.0 * cadence_hz)
 
         for window in windows:
             frames = extract_window_frames(
@@ -302,14 +348,12 @@ class SegmentationPipeline:
 
             for offset in range(len(frames)):
                 video_time = window.start_seconds + offset / cadence_hz
-                detection_frame = (
-                    (video_time - request.start_seconds) * request.detection_fps
-                )
+                detection_frame = clock.frame(video_time)
                 for track_id, (track_frames, geometry) in boxes.items():
                     matched = self._nearest_frame(
                         track_frames,
                         detection_frame,
-                        tolerance=request.detection_fps / (2.0 * cadence_hz),
+                        tolerance=tolerance,
                     )
                     if matched is None:
                         continue
@@ -381,13 +425,10 @@ class SegmentationPipeline:
         self,
         request: SegmentRequest,
         boxes: Dict[str, Tuple[np.ndarray, Dict[int, Tuple[float, float, float, float]]]],
+        clock: FrameClock,
     ) -> List[FrameWindow]:
         """Collapse the tracks' time spans into as few ffmpeg calls as possible."""
-        fps = float(request.detection_fps)
-        if fps <= 0:
-            return []
-
-        gap_frames = max(1, int(round(TRACK_SPAN_GAP_SECONDS * fps)))
+        gap_frames = max(1, int(round(TRACK_SPAN_GAP_SECONDS * clock.frames_per_second)))
         spans: List[Tuple[float, float]] = []
         for frames, _ in boxes.values():
             if frames.size == 0:
@@ -400,8 +441,8 @@ class SegmentationPipeline:
                     # A gap this large means the id was reused for something
                     # else in between, so the run ends here rather than
                     # stretching the span across the gap.
-                    start = request.start_seconds + float(run_start) / fps
-                    end = request.start_seconds + float(run_end) / fps
+                    start = clock.seconds(run_start)
+                    end = clock.seconds(run_end)
                     spans.append(
                         (
                             max(0.0, start - WINDOW_PADDING_SECONDS),
@@ -410,8 +451,8 @@ class SegmentationPipeline:
                     )
                     run_start = value
                 run_end = value
-            start = request.start_seconds + float(run_start) / fps
-            end = request.start_seconds + float(run_end) / fps
+            start = clock.seconds(run_start)
+            end = clock.seconds(run_end)
             spans.append(
                 (
                     max(0.0, start - WINDOW_PADDING_SECONDS),
