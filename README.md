@@ -8,7 +8,7 @@ If you use this work for academic work please cite the following paper:
 The code is open-source and free to use. It is aimed for, but not limited to, academic research. We welcome forking of this repository, pull requests, and any contributions in the spirit of open science and open-source code. For inquiries about collaboration, you may contact Md Shadab Alam (md_shadab_alam@outlook.com) or Pavlo Bazilinskyy (pavlo.bazilinskyy@gmail.com).
 
 ## Getting started
-[![Python Version](https://img.shields.io/badge/python-3.10.18-blue.svg)](https://www.python.org/downloads/release/python-3919/)
+[![Python Version](https://img.shields.io/badge/python-3.10.18-blue.svg)](https://www.python.org/downloads/release/python-31018/)
 [![Package Manager: uv](https://img.shields.io/badge/package%20manager-uv-green)](https://docs.astral.sh/uv/)
 
 Tested with **Python 3.10.18** and the [`uv`](https://docs.astral.sh/uv/) package manager.
@@ -73,7 +73,7 @@ cd crowd-city
 ```command line
 uv python install 3.10.18
 ```
-The repo should contain a .python-version file so `uv` will automatically use this version.
+`pyproject.toml` pins `requires-python = "==3.10.18"`, so `uv` uses this version.
 
 **Step 6:** Create and sync the virtual environment. This will create **.venv** in the project folder and install dependencies exactly as locked in **uv.lock**:
 ```command line
@@ -97,7 +97,7 @@ source .venv/bin/activate
 .\.venv\Scripts\activate.bat
 ```
 
-**Step 8:** Ensure that dataset are present. Place required datasets (including **mapping.csv**) into the **data/** directory:
+**Step 8:** Make sure the datasets are available: `mapping.csv` in the project root (or wherever `mapping` points), and the detection data in the directories set by `data` and `parquet_data` in `config`.
 
 
 **Step 9:** Run the code:
@@ -106,50 +106,50 @@ python3 analysis.py
 ```
 
 ### Configuration of project
-Configuration of the project needs to be defined in `config`. Please use the `default.config` file for the required structure of the file. If no custom config file is provided, `default.config` is used. The config file has the following parameters:
-- **`data`**: Directory containing data (CSV output from YOLO).
+Configuration of the project is defined in `config`. Use `default.config` for the required structure: any setting missing from `config` that is marked optional in `common.py` falls back to its value in `default.config`. The config file has the following parameters (the segmentation settings are described in the next section):
+- **`data`**: List of directories holding the YOLO detection output; the detection CSV files are read from their `bbox/` subfolder.
+- **`parquet_data`**: List of directories holding the Parquet copy of the detections, one per entry in `data` and in the same order. The analysis reads detections only from here (`<root>/bbox/*.parquet`).
+- **`sync_parquet_on_start`**: When `true`, new or changed CSV files under `data` are converted into the Parquet store before the analysis starts.
 - **`videos`**: Directories containing the videos used to generate the data.
-- **`mapping`**: CSV file that contains mapping data for the cities referenced in the data.
-- **`prediction_mode`**: Configures YOLO for object detection.
-- **`always_analyse`**: Always conduct analysis even when pickle files are present (good for testing).
-- **`display_frame_tracking`**: Displays the frame tracking during analysis.
-- **`save_annotated_img`**: Saves the annotated frames produced by YOLO.
-- **`delete_labels`**: Deletes label files from YOLO output.
-- **`delete_frames`**: Deletes frames from YOLO output.
-- **`compress_youtube_video`**: Compresses YouTube videos (using the H.255 codec by default).
-- **`check_missing_mapping`**: Identifies all the missing csv files.
-- **`min_max_videos`**: Gives snippets of the fastest and slowest crossing pedestrian.
-- **`analysis_level`**: Specifies the analysis level; supported versions include `city` and `country`.
-- **`client`**: Specifies the client type for downloading YouTube videos; accepted values are `"WEB"`, `"ANDROID"` or `"ios"`.
-- **`model`**: Specifies the YOLO model to use; supported/tested versions include `v8x` and `v11x`.
-- **`boundary_left`**: Specifies the x-coordinate of one edge of the crossing area used to detect road crossings (normalised between 0 and 1).
-- **`boundary_right`**: Specifies the x-coordinate of the opposite edge of the crossing area used to detect road crossings (normalised between 0 and 1).
-- **`use_geometry_correction`**: Specifies the distance threshold for applying geometry correction. If set to 0, geometry correction is skipped.
-- **`population_threshold`**: Specifies the minimum population a city must have to be included in the analysis.
-- **`footage_threshold`**: Specifies the minimum amount of footage required for a city to be included in the analysis.
+- **`mapping`**: CSV file with the city metadata and the list of videos and segments for each city.
+- **`always_analyse`**: Always recompute the analysis, even when a matching `results.pickle` exists (useful for testing).
+- **`waymo_dataset_path`**: Location of the raw Waymo Open Dataset used to calibrate the crossing detector and the metric speed model.
+- **`process_waymo_if_missing`**: When `true`, the processed Waymo data is generated from `waymo_dataset_path` if it does not exist yet.
+- **`min_max_videos`**: Number of fastest and slowest crossings for which video snippets are produced; `0` disables this.
+- **`bbox_tracker`**: Tracker configuration file for YOLO tracking, used by `helper_script.py`.
+- **`cpu_worker`**: Number of worker processes used to analyse detection files in parallel (also overridable with the `CROWD_CSV_WORKERS` environment variable).
+- **`reanalyse_waiting_time`**: Recompute the crossing initiation time aggregates from the cached per-track values, for example after changing `min_waiting_time` or `max_waiting_time`.
+- **`min_waiting_time`**: Minimum crossing initiation time, in seconds, for a crossing to be included.
+- **`max_waiting_time`**: Maximum crossing initiation time, in seconds, for a crossing to be included.
+- **`min_locality_population_percentage`**: A city is also kept when its population is at least this fraction of its country's population, even if it is below `population_threshold`.
+- **`check_per_sec_time`**: Number of position checks per second used when measuring how long a pedestrian stands still before crossing.
+- **`analysis_level`**: Level at which results are reported: `city` or `country`.
+- **`boundary_left`**: x-coordinate of one edge of the crossing area used to detect road crossings (normalised between 0 and 1).
+- **`boundary_right`**: x-coordinate of the opposite edge of the crossing area used to detect road crossings (normalised between 0 and 1).
+- **`population_threshold`**: Minimum city population for a city to be included in the analysis.
+- **`footage_threshold`**: Minimum total footage, in seconds, for a city to be included in the analysis.
+- **`min_crossing_detect`**: Minimum number of detected crossings for a country or city to be kept in the output; `0` disables this filter.
+- **`reanalyse_speed`**: Recompute the crossing speeds from the cached per-track values, for example after changing `min_speed_limit` or `max_speed_limit`, or when the installed speed model reports a different unit from the cached results.
+- **`min_speed_limit`**: Minimum crossing speed for a crossing to be included.
+- **`max_speed_limit`**: Maximum crossing speed for a crossing to be included.
+- **`countries_analyse`**: ISO3 codes of the countries to analyse; an empty list analyses all countries.
+- **`n_cities`**: Number of cities to analyse, chosen by total footage: a positive value keeps the cities with the most footage, a negative value those with the least, and `null` keeps all cities.
 - **`max_footage_hours_per_city`**: Caps the footage analysed per city, in hours; `null` analyses everything. Segments are drawn in a random order per city rather than in mapping order, so the budget is spread across that city's videos. Segments with no detection file in the Parquet store, or with a vehicle type outside `vehicles_analyse`, are skipped and the next segment is drawn in their place, so the whole budget goes to footage that is actually analysed. The last segment drawn is trimmed to fit the cap.
 - **`footage_sampling_seed`**: Seed for that random draw (default `42`). The same seed always selects the same segments, so runs are reproducible; change it to analyse a different sample.
-- **`min_speed`**: Specifies the minimum speed limit for pedestrian crossings to be included in the analysis.
-- **`max_speed`**: Specifies the maximum speed limit for pedestrian crossings to be included in the analysis.
-- **`countries_analyse`**: Lists the countries to be analysed.
-- **`confidence`**: Sets the confidence threshold parameter for YOLO.
-- **`update_ISO_code`**: Updates the ISO code of the country in the mapping file during analysis.
-- **`update_pytubefix`**: Updates the `pytubefix` library each time analysis starts.
-- **`font_family`**: Specifies the font family to be used in outputs.
-- **`font_size`**: Specifies the font size to be used in outputs.
-- **`plotly_template`**: Defines the template for Plotly figures.
+- **`processing_fps`**: Frame rate the detections are resampled to before analysis; `null` keeps each video's own frame rate.
+- **`vehicles_analyse`**: Vehicle types (the codes in the mapping's `vehicle_type` column) to analyse; an empty list analyses footage from all vehicle types.
+- **`min_confidence`**: Minimum YOLO detection confidence for a detection to be used.
+- **`font_family`**: Font family used in the figures.
+- **`font_size`**: Font size used in the figures.
+- **`plotly_template`**: Plotly template used for the figures.
+- **`logger_level`**: Level of console output: `debug`, `info`, `warning` or `error`.
+- **`ftp_base_url`**: Base URL of the file server that hosts the videos. Used by the segmentation pass, the segmentation sample renderer and the crossing validation tool.
+- **`display_frame_tracking`**: Read by `helper_script.py` but currently has no effect.
+- **`save_annoted_img`**: Read by `helper_script.py` but currently has no effect.
+- **`save_tracked_img`**: Read by `helper_script.py` but currently has no effect.
+- **`delete_labels`**: Read by `helper_script.py` but currently has no effect.
+- **`delete_frames`**: Read by `helper_script.py` but currently has no effect.
 - **`save_images`**: Whether to export PNG and EPS alongside the interactive HTML. Raster export goes through kaleido, which launches a headless Chromium and is prone to hanging indefinitely on Windows. Set this to `false` to keep only the HTML, which carries the same data, when a run stalls on "Saving png file for ...".
-- **`logger_level`**: Level of console output. Can be: debug, info, warning, error.
-- **`sleep_sec`**: Amount of seconds of pause in the end of the loop in `main.py`.
-- **`git_pull`**: Pull changes from git repository in the end of the loop in `main.py`.
-- **`email_send`**: Send email about completion of the job in the end of the loop in `main.py`. See the following paragraph for the additional parameters in the `secret` file.
-- **`email_sender`**: Email address of the the "sender" of the email.
-- **`email_recipients`**: List of emails for sending the message.
-- **`max_workers`**: Specifies the maximum number of segment-processing worker threads (i.e., how many segments can be analysed in parallel). Increasing this increases concurrent segment processing, subject to GPU/CPU and I/O limits.
-- **`download_workers`**: Specifies the maximum number of concurrent video download/prepare workers. Increasing this allows multiple videos to be downloaded/prepared in parallel (useful when network/FTP is the bottleneck).
-- **`max_active_segments_per_video`**: Specifies the maximum number of segments from the *same video* that are allowed to be processed concurrently.
-  - If set to **1**, the scheduler tends to distribute workers across **different videos** (e.g., with `max_workers=3`, it will try to process 3 different videos at once).
-  - If set to **2+**, multiple workers may process segments from the **same video** simultaneously, which can improve throughput when one video has many segments but reduces “video diversity” across workers.
 
 ### Road-surface segmentation
 Crossing speed and crossing initiation time can additionally be measured against the road surface rather than from bounding-box motion alone. When enabled, the analysis segments only the video windows that contain an already-detected crossing with SegFormer finetuned on Cityscapes, reads the surface under each pedestrian's feet, and derives the interval that pedestrian actually spends on the carriageway. The initiation time then becomes the stationary interval immediately before stepping onto the road, and the speed is fitted over the on-road frames only.
@@ -173,9 +173,7 @@ Video is never downloaded in full: ffmpeg seeks over HTTP range requests and dec
 
 The file server credentials (`ftp_username`, `ftp_password`, `ftp_token`) in `secret` are required for this pass, because the crossing windows are read from the server.
 
-
-
-For working with external APIs of [VideoFiles](https://files.mobility-squad.com/), [GeoNames](https://www.geonames.org), [BEA](https://apps.bea.gov/api/signup), [TomTom](https://developer.tomtom.com/user/register), [Trafikab](https://www.trafiklab.se/api/trafiklab-apis), and [Numbeo](https://www.numbeo.com/common/api.jsp) (paid), the API keys need to be placed in file `secret` (no extension) in the root of the project. The file needs to be formatted as `default.secret`. The email SMTP server, account and password need to be also set here. This is optional for just running the analysis on the dataset. For running the the `main.py` script at least an empty `secret` file directly copies from the template is required.
+For working with external APIs of [VideoFiles](https://files.mobility-squad.com/), [GeoNames](https://www.geonames.org), [BEA](https://apps.bea.gov/api/signup), [TomTom](https://developer.tomtom.com/user/register), [Trafikab](https://www.trafiklab.se/api/trafiklab-apis), and [Numbeo](https://www.numbeo.com/common/api.jsp) (paid), the API keys need to be placed in file `secret` (no extension) in the root of the project. The file needs to be formatted as `default.secret`. These keys are optional for just running the analysis on the dataset, except for the file server credentials needed by the segmentation pass.
 
 
 ## Contact
