@@ -18,7 +18,6 @@ class IO:
     def __init__(self) -> None:
         pass
 
-
     @staticmethod
     def parquet_detection_files(folder_path: str) -> List[str]:
         """Return visible Parquet detection files from one mirror folder."""

@@ -17,7 +17,7 @@ import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import polars as pl
@@ -172,7 +172,7 @@ def _resolve_index_path(index_path: Path, value: Any) -> Path:
             reversed(candidate_parts)
         ).index(split_name)
         relocated = index_path.parent.joinpath(
-            *candidate_parts[split_position + 1 :]
+            *candidate_parts[split_position + 1:]
         )
         if relocated.exists() or relocated.parent.exists():
             return relocated

@@ -70,7 +70,8 @@ jobs:
           #
           # Super-linter rules:
           # - If you set ANY VALIDATE_* to true, all others default to false.
-          #   (So you avoid BIOME/CHECKOV/Zizmor/etc unless you explicitly enable them.)
+          #   (So you avoid BIOME/CHECKOV/Zizmor/etc unless you
+          #   explicitly enable them.)
           ############################################################
           VALIDATE_GITHUB_ACTIONS: true
           VALIDATE_YAML: true
@@ -85,5 +86,6 @@ jobs:
           # VALIDATE_PYTHON_MYPY: true
           # VALIDATE_PYTHON_PYLINT: true
 
-          # Optional: run duplicate-code checks (note: JSCPD always scans the whole workspace)
+          # Optional: run duplicate-code checks
+          # (note: JSCPD always scans the whole workspace)
           VALIDATE_JSCPD: true

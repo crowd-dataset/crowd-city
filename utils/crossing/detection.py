@@ -53,8 +53,8 @@ class Detection:
 
         text = str(value)
         for ch in "[](){}'\"":
-            text = text.replace(ch, " " )
-        text = text.replace(",", " " )
+            text = text.replace(ch, " ")
+        text = text.replace(",", " ")
         for token in text.split():
             try:
                 found = float(token)
@@ -177,26 +177,29 @@ class Detection:
         fps_value = Detection._resolve_fps(fps, df_mapping, video_id, default=float(base_fps))
         base_fps_value = max(float(base_fps), 1e-9)
 
-        min_track_frames_s = Detection._scale_frames(min_track_frames, fps_value, base_fps_value, minimum=1)
-        min_road_frames_s = Detection._scale_frames(min_road_frames, fps_value, base_fps_value, minimum=1)
-        max_track_gap_frames_s = Detection._scale_frames(max_track_gap_frames, fps_value, base_fps_value, minimum=0)
-        low_x_min_road_frames_s = Detection._scale_frames(low_x_min_road_frames, fps_value, base_fps_value, minimum=1)
-        tiny_long_track_road_frames_s = Detection._scale_frames(tiny_long_track_road_frames, fps_value, base_fps_value, minimum=1)
-        slender_track_min_road_frames_s = Detection._scale_frames(slender_track_min_road_frames, fps_value, base_fps_value, minimum=1)
-        slender_track_max_road_frames_s = Detection._scale_frames(slender_track_max_road_frames, fps_value, base_fps_value, minimum=1)
-        no_static_slender_max_road_frames_s = Detection._scale_frames(no_static_slender_max_road_frames, fps_value, base_fps_value, minimum=1)
-        tiny_no_static_min_road_frames_s = Detection._scale_frames(tiny_no_static_min_road_frames, fps_value, base_fps_value, minimum=1)
-        no_static_tiny_min_road_frames_s = Detection._scale_frames(no_static_tiny_min_road_frames, fps_value, base_fps_value, minimum=1)
-        min_static_shared_frames_s = Detection._scale_frames(min_static_shared_frames, fps_value, base_fps_value, minimum=1)
-        long_weak_road_frames_s = Detection._scale_frames(long_weak_road_frames, fps_value, base_fps_value, minimum=1)
-        jitter_road_frames_s = Detection._scale_frames(jitter_road_frames, fps_value, base_fps_value, minimum=1)
-        camera_min_road_frames_s = Detection._scale_frames(camera_min_road_frames, fps_value, base_fps_value, minimum=1)
+        def scaled(frames: int, minimum: int) -> int:
+            return Detection._scale_frames(frames, fps_value, base_fps_value, minimum=minimum)
 
-        rider_min_shared_frames_s = Detection._scale_frames(4, fps_value, base_fps_value, minimum=1)
-        rider_min_continuous_shared_frames_s = Detection._scale_frames(12, fps_value, base_fps_value, minimum=1)
-        rider_shared_run_gap_allow_s = Detection._scale_frames(2, fps_value, base_fps_value, minimum=0)
-        rider_min_motion_steps_s = Detection._scale_frames(3, fps_value, base_fps_value, minimum=1)
-        rider_short_shared_frames_s = Detection._scale_frames(8, fps_value, base_fps_value, minimum=1)
+        min_track_frames_s = scaled(min_track_frames, minimum=1)
+        min_road_frames_s = scaled(min_road_frames, minimum=1)
+        max_track_gap_frames_s = scaled(max_track_gap_frames, minimum=0)
+        low_x_min_road_frames_s = scaled(low_x_min_road_frames, minimum=1)
+        tiny_long_track_road_frames_s = scaled(tiny_long_track_road_frames, minimum=1)
+        slender_track_min_road_frames_s = scaled(slender_track_min_road_frames, minimum=1)
+        slender_track_max_road_frames_s = scaled(slender_track_max_road_frames, minimum=1)
+        no_static_slender_max_road_frames_s = scaled(no_static_slender_max_road_frames, minimum=1)
+        tiny_no_static_min_road_frames_s = scaled(tiny_no_static_min_road_frames, minimum=1)
+        no_static_tiny_min_road_frames_s = scaled(no_static_tiny_min_road_frames, minimum=1)
+        min_static_shared_frames_s = scaled(min_static_shared_frames, minimum=1)
+        long_weak_road_frames_s = scaled(long_weak_road_frames, minimum=1)
+        jitter_road_frames_s = scaled(jitter_road_frames, minimum=1)
+        camera_min_road_frames_s = scaled(camera_min_road_frames, minimum=1)
+
+        rider_min_shared_frames_s = scaled(4, minimum=1)
+        rider_min_continuous_shared_frames_s = scaled(12, minimum=1)
+        rider_shared_run_gap_allow_s = scaled(2, minimum=0)
+        rider_min_motion_steps_s = scaled(3, minimum=1)
+        rider_short_shared_frames_s = scaled(8, minimum=1)
 
         track_partitions: List[pl.DataFrame] = []
 
@@ -390,7 +393,10 @@ class Detection:
                     y_gross_motion = 0.0
 
                 candidate_segments.append(
-                    (uid, start_frame, end_frame, x_range, x_speed, road_frames, median_height, median_width, y_gross_motion)
+                    (
+                        uid, start_frame, end_frame, x_range, x_speed, road_frames,
+                        median_height, median_width, y_gross_motion,
+                    )
                 )
                 if uid not in crossed_ids_seen:
                     crossed_ids.append(uid)
@@ -420,7 +426,10 @@ class Detection:
             .to_numpy()
         )
 
-        for uid, start_frame, end_frame, x_range, x_speed, road_frames, median_height, median_width, y_gross_motion in candidate_segments:
+        for (
+            uid, start_frame, end_frame, x_range, x_speed, road_frames,
+            median_height, median_width, y_gross_motion,
+        ) in candidate_segments:
             left_idx = int(np.searchsorted(frame_values, int(start_frame), side="left"))
             right_idx = int(np.searchsorted(frame_values, int(end_frame), side="right"))
             segment_df = frame_sorted_df.slice(
@@ -489,7 +498,10 @@ class Detection:
                 continue
 
             if static_sx_range >= float(camera_static_sx) and static_ratio >= float(camera_static_ratio):
-                if float(median_height) <= float(camera_tiny_height) and int(road_frames) >= int(camera_min_road_frames_s):
+                if (
+                    float(median_height) <= float(camera_tiny_height)
+                    and int(road_frames) >= int(camera_min_road_frames_s)
+                ):
                     continue
                 if (
                     static_relx_range <= float(camera_static_tiny_relx)

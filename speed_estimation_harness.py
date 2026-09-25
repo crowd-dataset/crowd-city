@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Pedestrian crossing speed calibration and evaluation harness.
 
 The CROWD detector and tracker CSV remains the only per-pedestrian input:
@@ -33,6 +31,8 @@ both source grouped validation and untouched external testing.
 The command line deliberately uses ``sys.argv`` rather than a parser so this
 file remains compatible with the original project style.
 """
+
+from __future__ import annotations
 
 import csv
 import hashlib
@@ -2659,7 +2659,7 @@ def resolve_index_path(index_csv: str, value: str) -> str:
             reversed(candidate_parts)
         ).index(split_name)
         relocated = index_directory.joinpath(
-            *candidate_parts[split_position + 1 :]
+            *candidate_parts[split_position + 1:]
         )
         if relocated.exists() or relocated.parent.exists():
             return str(relocated.resolve())
@@ -2701,7 +2701,8 @@ def load_manifest_feature_rows(manifest_path: str) -> List[Dict[str, Any]]:
         "ground_truth_speed_mps",
         "calibration_target",
     ]
-    missing = [name for name in required if canonical_header(name) not in {canonical_header(key) for key in manifest_rows[0]}]
+    present = {canonical_header(key) for key in manifest_rows[0]}
+    missing = [name for name in required if canonical_header(name) not in present]
     if missing:
         fail("Manifest is missing columns: " + ", ".join(missing))
     incompatible_targets = sorted(
@@ -3024,7 +3025,7 @@ def fit_monotonic_spline_components(
     robust_weights = np.ones(len(rows), dtype=float)
     lower = np.full(parameter_count, -np.inf, dtype=float)
     upper = np.full(parameter_count, np.inf, dtype=float)
-    lower[1 : 1 + increment_count] = 0.0
+    lower[1:1 + increment_count] = 0.0
     coefficients = np.zeros(parameter_count, dtype=float)
     coefficients[0] = source_balanced_constant(rows)
     for _ in range(20):
@@ -4991,7 +4992,10 @@ def prediction_from_model(features: TrackFeatures, model: Dict[str, Any]) -> Dic
 def metric_summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     total = len(rows)
     all_numeric = [row for row in rows if safe_float(row.get("model_speed_before_reliability_gate_mps")) is not None]
-    valid = [row for row in rows if row.get("speed_status") == "valid" and safe_float(row.get("estimated_speed_mps")) is not None]
+    valid = [
+        row for row in rows
+        if row.get("speed_status") == "valid" and safe_float(row.get("estimated_speed_mps")) is not None
+    ]
 
     def calculate(selected: Sequence[Dict[str, Any]], prediction_key: str) -> Dict[str, Any]:
         if not selected:

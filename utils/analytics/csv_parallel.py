@@ -443,7 +443,6 @@ def _object_counts(df: pl.DataFrame) -> Dict[str, int]:
     }
 
 
-
 def _normalise_detection_schema(df: pl.DataFrame) -> pl.DataFrame:
     # Normalise detection column types across CSV and Parquet sources.
     if df.height == 0:

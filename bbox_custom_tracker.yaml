@@ -1,3 +1,4 @@
+---
 appearance_thresh: 0.25
 fuse_score: true
 gmc_method: sparseOptFlow
