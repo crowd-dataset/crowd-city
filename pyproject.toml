@@ -34,5 +34,16 @@ dependencies = [
     "yt-dlp>=2025.0.0",
 ]
 
+[tool.uv]
+override-dependencies = [
+    # nuscenes-devkit depends on opencv-python-headless, which ships the same
+    # cv2/ package as ultralytics' opencv-python. Whichever installs last wins
+    # the shared files, and headless winning silently strips GUI support
+    # (cv2.namedWindow/imshow), breaking the interactive review tools. The
+    # never-true marker keeps opencv-python-headless out of the resolved set
+    # entirely so the GUI-capable opencv-python always wins.
+    "opencv-python-headless ; sys_platform == 'never'",
+]
+
 [tool.uv.sources]
 pytubefix = { git = "https://github.com/felipeucelli/pytubefix.git", rev = "sig-nsig" }

@@ -45,6 +45,7 @@ from custom_logger import CustomLogger
 from logmod import logs
 from utils.core.metadata import MetaData
 from utils.crossing.detection import Detection
+from utils.segmentation.frames import SERVER_ALIASES
 
 
 logs(show_level=common.get_configs("logger_level"), show_color=True)
@@ -142,8 +143,13 @@ def find_csv_for_video(video_id_value: str, data_dir="data/bbox") -> str:
                 continue
             folder_path = str(folder_path)
             search_dirs.append(folder_path)
+            search_dirs.append(os.path.join(folder_path, "bbox"))
 
-            for subfolder in common.get_configs("sub_domain"):
+            try:
+                sub_domains = common.get_configs("sub_domain") or []
+            except KeyError:
+                sub_domains = []
+            for subfolder in sub_domains:
                 search_dirs.append(os.path.join(folder_path, str(subfolder)))
     else:
         search_dirs.append(str(data_dir))
@@ -498,7 +504,11 @@ def download_videos_from_ftp(
 
     filename_with_ext = filename if filename.lower().endswith(".mp4") else f"{filename}.mp4"
     filename_lower = filename_with_ext.lower()
-    aliases = ["tue1", "tue2", "tue3", "tue4"]
+    # Reuse the segmentation pass's alias list rather than a second, independently
+    # maintained one: tue1-tue3 no longer exist on the file server (they answer
+    # "Unknown folder alias"), and a stale local copy previously missed tue5
+    # entirely, which is where roughly half the corpus actually lives.
+    aliases = list(SERVER_ALIASES)
     req_params = {"token": token} if token else None
 
     logger.info(f"Starting download for '{filename_with_ext}'")
