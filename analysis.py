@@ -1831,6 +1831,8 @@ CACHE_CONFIG_KEYS: tuple[str, ...] = (
     "segmentation_is_primary",
 )
 CACHE_RESULTS_COUNT = 43
+# Identifies how max_footage_hours_per_city picks segments; bump when it changes.
+FOOTAGE_SELECTION_RULE = "seeded_random_available_v1"
 CACHE_METADATA_VERSION = 1
 
 
@@ -1870,6 +1872,19 @@ def _current_cache_config() -> Dict[str, object]:
         # valid (for example the move to the probed video frame rate), so a
         # cached run must not keep segmentation metrics derived from old ones.
         config["segmentation_index_schema"] = SEGMENTATION_INDEX_SCHEMA
+    if MetaData._normalise_max_footage_seconds(
+        common.get_configs("max_footage_hours_per_city")
+    ) is not None:
+        # With a cap the seed decides which segments fill each city's budget,
+        # and the selection rule itself changed from mapping order to a seeded
+        # random draw over segments that have a detection file. Both belong
+        # in the fingerprint, so neither a new seed nor a pickle from the old
+        # rule is mistaken for a match. Uncapped runs index every segment and
+        # keep their existing fingerprint.
+        config["footage_sampling_seed"] = MetaData._normalise_sampling_seed(
+            common.get_configs("footage_sampling_seed")
+        )
+        config["footage_selection"] = FOOTAGE_SELECTION_RULE
     return config
 
 

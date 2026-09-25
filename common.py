@@ -49,6 +49,7 @@ _CONFIG_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
 # existing local config file. These keys fall back to default.config when absent.
 _OPTIONAL_CONFIG_DEFAULTS = {
     "max_footage_hours_per_city",
+    "footage_sampling_seed",
     "processing_fps",
     "sync_parquet_on_start",
     "seg_data",

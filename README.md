@@ -131,6 +131,8 @@ Configuration of the project needs to be defined in `config`. Please use the `de
 - **`use_geometry_correction`**: Specifies the distance threshold for applying geometry correction. If set to 0, geometry correction is skipped.
 - **`population_threshold`**: Specifies the minimum population a city must have to be included in the analysis.
 - **`footage_threshold`**: Specifies the minimum amount of footage required for a city to be included in the analysis.
+- **`max_footage_hours_per_city`**: Caps the footage analysed per city, in hours; `null` analyses everything. Segments are drawn in a random order per city rather than in mapping order, so the budget is spread across that city's videos. Segments with no detection file in the Parquet store, or with a vehicle type outside `vehicles_analyse`, are skipped and the next segment is drawn in their place, so the whole budget goes to footage that is actually analysed. The last segment drawn is trimmed to fit the cap.
+- **`footage_sampling_seed`**: Seed for that random draw (default `42`). The same seed always selects the same segments, so runs are reproducible; change it to analyse a different sample.
 - **`min_city_population_percentage`**: Specifies the minimum proportion of a country’s population that a city must have to be included in the analysis.
 - **`min_speed`**: Specifies the minimum speed limit for pedestrian crossings to be included in the analysis.
 - **`max_speed`**: Specifies the maximum speed limit for pedestrian crossings to be included in the analysis.

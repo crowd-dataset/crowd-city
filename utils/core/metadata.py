@@ -1,5 +1,7 @@
 import ast
 import math
+import os
+import random
 from collections import OrderedDict
 from typing import Any, ClassVar
 
@@ -19,6 +21,9 @@ class MetaData:
     # Python cannot reuse the object id while the cache entry is alive.
     _video_index_cache: ClassVar[OrderedDict] = OrderedDict()
     _max_cached_dataframes: ClassVar[int] = 8
+    # (video, start) of every detection file in the Parquet store; see
+    # _available_detection_segments.
+    _available_segments_cache: ClassVar[set | None] = None
 
     def __init__(self) -> None:
         pass
@@ -119,6 +124,58 @@ class MetaData:
     def clear_video_index_cache(cls) -> None:
         """Clear all cached mapping indexes."""
         cls._video_index_cache.clear()
+        cls._available_segments_cache = None
+
+    @staticmethod
+    def _normalise_sampling_seed(value: object) -> int:
+        """Return the seed that fixes the random per-city segment order."""
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return 42
+        if isinstance(value, bool):
+            raise ValueError("footage_sampling_seed must be an integer or null")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError("footage_sampling_seed must be an integer or null") from error
+        if not math.isfinite(numeric) or not numeric.is_integer():
+            raise ValueError("footage_sampling_seed must be an integer or null")
+        return int(numeric)
+
+    @classmethod
+    def _available_detection_segments(cls) -> set[tuple[str, int]]:
+        """Return ``(video, start)`` for every detection file the analysis can read.
+
+        The analysis only ever reads the Parquet store, so a segment whose file
+        is missing there contributes nothing and must not consume a city's
+        footage budget. The listing is cached per process: every worker and the
+        parent must reach the same selection, and the store does not change
+        during a run.
+        """
+        if cls._available_segments_cache is not None:
+            return cls._available_segments_cache
+
+        from utils.analytics.parquet_store import DETECTION_FOLDER, configured_parquet_roots
+
+        available: set[tuple[str, int]] = set()
+        for root in configured_parquet_roots():
+            folder = os.path.join(root, DETECTION_FOLDER)
+            try:
+                names = os.listdir(folder)
+            except OSError as error:
+                logger.warning(f"Could not list detection files in {folder}: {error}")
+                continue
+            for name in names:
+                stem, extension = os.path.splitext(name)
+                if name.startswith(".") or extension.lower() != ".parquet":
+                    continue
+                try:
+                    video, start_text, _fps = stem.rsplit("_", 2)
+                    available.add((video, int(start_text)))
+                except ValueError:
+                    continue
+
+        cls._available_segments_cache = available
+        return available
 
     @classmethod
     def _build_indexes(
@@ -135,10 +192,15 @@ class MetaData:
         footage. ``max_footage_hours_per_city`` is applied only afterwards to
         the already selected cities.
 
-        Segments are consumed in their existing mapping order. If the final
-        segment would cross the configured cap, its effective duration is
-        shortened to the remaining budget. The worker then trims detection
-        frames to the same duration.
+        Without a cap every segment is indexed in mapping order. With a cap,
+        each city's segments are drawn in a random order fixed by
+        ``footage_sampling_seed``, so the budget is not always spent on the
+        first videos listed. Segments that cannot be analysed (no detection
+        file in the Parquet store, or a vehicle type outside
+        ``vehicles_analyse``) are skipped rather than counted, so the next
+        segment is drawn in their place. If the final segment would cross the
+        cap, its effective duration is shortened to the remaining budget. The
+        worker then trims detection frames to the same duration.
         """
         metadata_index: dict[tuple[str, int], tuple[Any, ...]] = {}
         segment_index: dict[tuple[str, int], tuple[Any, float]] = {}
@@ -154,6 +216,10 @@ class MetaData:
             tuple[str, str, str, str],
             float,
         ] = {}
+        # Every segment in mapping order, grouped by city:
+        # (segment_key, start_value, end_value, duration, row id, metadata).
+        segments_by_city: dict[tuple[str, str, str, str], list[tuple[Any, ...]]] = {}
+        seen_keys: set[tuple[str, int]] = set()
 
         for row in df.iter_rows(named=True):
             video_ids = cls._parse_videos_cell(row.get("videos"))
@@ -236,39 +302,17 @@ class MetaData:
                         + full_duration_seconds
                     )
 
-                    duration_seconds = full_duration_seconds
-                    effective_end_val = end_val
+                    segment_key = (str(video), start_key)
+                    # The old row scan returned the first match, so the first
+                    # occurrence of a duplicated key is the one kept.
+                    if segment_key in seen_keys:
+                        continue
+                    seen_keys.add(segment_key)
 
-                    if max_footage_seconds is not None:
-                        already_selected = selected_seconds_by_city.get(
-                            city_key,
-                            0.0,
-                        )
-                        remaining_seconds = (
-                            max_footage_seconds - already_selected
-                        )
-
-                        if remaining_seconds <= 0:
-                            continue
-
-                        if duration_seconds > remaining_seconds:
-                            duration_seconds = remaining_seconds
-                            clipped_end = float(start_value) + duration_seconds
-                            effective_end_val = (
-                                int(clipped_end)
-                                if clipped_end.is_integer()
-                                else clipped_end
-                            )
-
-                    selected_seconds_by_city[city_key] = (
-                        selected_seconds_by_city.get(city_key, 0.0)
-                        + duration_seconds
-                    )
-
-                    metadata_without_fps = (
+                    metadata_without_end = (
                         video,                 # 0
                         start_value,           # 1
-                        effective_end_val,     # 2
+                        None,                  # 2, effective end, set below
                         tod_val,               # 3
                         locality,              # 4
                         state,                 # 5
@@ -285,20 +329,64 @@ class MetaData:
                         iso3,                  # 16
                         vtype_list,            # 17, returned at position 18
                     )
-
-                    segment_key = (str(video), start_key)
-
-                    # The old row scan returned the first match. setdefault
-                    # preserves exactly that behaviour for duplicate keys.
-                    metadata_index.setdefault(
-                        segment_key,
-                        metadata_without_fps,
+                    segments_by_city.setdefault(city_key, []).append(
+                        (
+                            segment_key,
+                            start_value,
+                            end_val,
+                            full_duration_seconds,
+                            row.get("id"),
+                            metadata_without_end,
+                        )
                     )
 
-                    segment_index.setdefault(
-                        segment_key,
-                        (row.get("id"), float(duration_seconds)),
+        skipped_missing = 0
+        skipped_vehicle = 0
+        if max_footage_seconds is not None:
+            seed = cls._normalise_sampling_seed(common.get_configs("footage_sampling_seed"))
+            available_files = cls._available_detection_segments()
+            vehicle_list = common.get_configs("vehicles_analyse")
+
+        for city_key, segments in segments_by_city.items():
+            if max_footage_seconds is not None:
+                # Seeded per city, so one city's draw never depends on which
+                # other cities happen to be in the mapping.
+                segments = list(segments)
+                random.Random(f"{seed}|{'|'.join(city_key)}").shuffle(segments)
+
+            for segment_key, start_value, end_val, full_duration, row_id, metadata in segments:
+                duration_seconds = full_duration
+                effective_end_val = end_val
+
+                if max_footage_seconds is not None:
+                    remaining_seconds = (
+                        max_footage_seconds - selected_seconds_by_city.get(city_key, 0.0)
                     )
+                    if remaining_seconds <= 0:
+                        break
+                    if segment_key not in available_files:
+                        skipped_missing += 1
+                        continue
+                    if vehicle_list and metadata[17] not in vehicle_list:
+                        skipped_vehicle += 1
+                        continue
+                    if duration_seconds > remaining_seconds:
+                        duration_seconds = remaining_seconds
+                        clipped_end = float(start_value) + duration_seconds
+                        effective_end_val = (
+                            int(clipped_end)
+                            if clipped_end.is_integer()
+                            else clipped_end
+                        )
+
+                selected_seconds_by_city[city_key] = (
+                    selected_seconds_by_city.get(city_key, 0.0)
+                    + duration_seconds
+                )
+                metadata_index[segment_key] = (
+                    metadata[:2] + (effective_end_val,) + metadata[3:]
+                )
+                segment_index[segment_key] = (row_id, float(duration_seconds))
 
         if max_footage_seconds is not None:
             capped_city_count = sum(
@@ -306,16 +394,28 @@ class MetaData:
                 for available_seconds in available_seconds_by_city.values()
                 if available_seconds > max_footage_seconds + 1e-9
             )
+            short_city_count = sum(
+                1
+                for city_key in segments_by_city
+                if selected_seconds_by_city.get(city_key, 0.0) < max_footage_seconds - 1e-9
+            )
             selected_total_seconds = sum(selected_seconds_by_city.values())
 
             logger.info(
-                "Applied max_footage_hours_per_city={:.2f}: "
-                "{} of {} indexed cities had more footage than the cap; "
-                "{:.2f} total footage hours were selected.",
+                "Applied max_footage_hours_per_city={:.2f} with random segment "
+                "order (footage_sampling_seed={}): {} of {} indexed cities had "
+                "more footage than the cap; {:.2f} total footage hours were "
+                "selected. Skipped {} segment(s) with no detection file and {} "
+                "outside vehicles_analyse; {} cities have less analysable "
+                "footage than the cap.",
                 max_footage_seconds / 3600.0,
+                seed,
                 capped_city_count,
                 len(available_seconds_by_city),
                 selected_total_seconds / 3600.0,
+                skipped_missing,
+                skipped_vehicle,
+                short_city_count,
             )
 
         return metadata_index, segment_index
