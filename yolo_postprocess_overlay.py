@@ -7,6 +7,7 @@ import numpy as np
 import polars as pl
 import common
 from utils.core.metadata import MetaData
+from utils.crossing.detection import Detection
 from custom_logger import CustomLogger
 from logmod import logs
 
@@ -412,6 +413,31 @@ def classify_rider_type(
 
         if best is None or cand["score"] > best["score"]:
             best = cand
+
+    if best is None:
+        # Same fallback as Detection.classify_rider_type, so the overlay agrees
+        # with the analysis: the rider's body hides the two-wheeler, which YOLO
+        # then detects only intermittently and under several tracker ids.
+        # Uses the analysis thresholds rather than this function's looser
+        # alpha_x/beta_y, since those are what the pooled test was checked on.
+        best = Detection._pooled_two_wheeler_association(
+            p1,
+            vehicles.filter(pl.col("yolo-id").is_in([bicycle_class, motorcycle_class])),
+            min_shared_frames=min_shared_frames,
+            min_continuous_shared_frames=12,
+            min_vehicle_width_ratio=0.50,
+            dist_rel_thresh=dist_rel_thresh,
+            alpha_x=0.75,
+            beta_y=0.08,
+            gamma_y=gamma_y,
+            min_coverage=0.40,
+            min_person_motion=0.30,
+            max_motion_mismatch=0.50,
+            max_offset_std=0.25,
+            min_seated_share=0.35,
+            bicycle_class=bicycle_class,
+            eps=eps,
+        )
 
     if best is None:
         return {
