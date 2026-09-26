@@ -71,6 +71,9 @@ class SegmentRequest:
     source_fps: float = 0.0
     # Source frame the processing_fps resampling grid is anchored to.
     first_source_frame: int = 0
+    # A local video file to read instead of resolving video_id on the file
+    # server, e.g. the exported Waymo camera videos used for calibration.
+    video_path: Optional[str] = None
 
 
 class SegmentationPipeline:
@@ -254,7 +257,7 @@ class SegmentationPipeline:
         So a coarse pass establishes the shape of each track, and a second
         pass looks only inside the brackets where a transition must lie.
         """
-        source = self._video_source(request.video_id)
+        source = request.video_path or self._video_source(request.video_id)
         if source is None:
             return None
 
