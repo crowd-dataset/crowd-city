@@ -48,22 +48,18 @@ from utils.crossing.waymo_calibration import (
     _write_csv,
     _write_json,
 )
-from utils.segmentation.constants import SURFACE_FOOTPATH
-from utils.segmentation.pipeline import SegmentationPipeline, SegmentRequest
-from utils.segmentation.segformer import SurfaceSegmenter
-from utils.segmentation.store import SegmentationSettings, SurfaceStore, crossing_fingerprint
-from utils.segmentation.surface import (
-    DEFAULT_FOOTPOINT_BAND_FRACTION,
-    DEFAULT_FOOTPOINT_WIDTH_FRACTION,
+from utils.crossing.road_crossing import (
+    road_crossing_flags,
+    waymo_person_tracks,
+    waymo_segmentation_pipeline,
+    waymo_surface_timelines,
 )
+from utils.segmentation.constants import SURFACE_FOOTPATH
+from utils.segmentation.pipeline import SegmentationPipeline
 
 CALIBRATION_FOLDER = "calibration_v32"
 OUTPUT_FOLDER = "segmentation_evaluation"
-STORE_FOLDER = "segmentation_store"
-VIDEO_NAME = "waymo_front.mp4"
-# Shortest pedestrian track worth segmenting: half a second at Waymo's 10 fps.
-MINIMUM_TRACK_ROWS = 5
-RULES = ("detector", "road_lateral", "road_edge", "road_full")
+RULES = ("detector", "detector_on_road", "road_lateral", "road_crossing", "road_edge", "road_full")
 
 
 def _load_speed_model(calibration_root: Path) -> bool:
@@ -80,48 +76,6 @@ def _load_speed_model(calibration_root: Path) -> bool:
     return False
 
 
-def _pipeline(store_root: Path, crossing_parameters: Mapping[str, Any]) -> SegmentationPipeline:
-    """Build the segmentation pipeline from config, as the CROWD pass does."""
-    coarse_hz = float(common.get_configs("segmentation_coarse_hz"))
-    refine_hz = float(common.get_configs("segmentation_refine_hz"))
-    minimum_confidence = float(common.get_configs("segmentation_min_confidence"))
-    segmenter = SurfaceSegmenter(
-        model_name=str(common.get_configs("segmentation_model")),
-        device=str(common.get_configs("segmentation_device")),
-        batch_size=int(common.get_configs("segmentation_batch_size")),
-        input_width=int(common.get_configs("segmentation_input_width")),
-        input_height=int(common.get_configs("segmentation_input_height")),
-    )
-    settings = SegmentationSettings(
-        model_identifier=segmenter.model_identifier,
-        coarse_hz=coarse_hz,
-        refine_hz=refine_hz,
-        footpoint_band_fraction=DEFAULT_FOOTPOINT_BAND_FRACTION,
-        footpoint_width_fraction=DEFAULT_FOOTPOINT_WIDTH_FRACTION,
-        minimum_confidence=minimum_confidence,
-        crossing_fingerprint=crossing_fingerprint(
-            {
-                "waymo_tracks": "all_person_tracks",
-                "minimum_track_rows": MINIMUM_TRACK_ROWS,
-                "min_confidence": common.get_configs("min_confidence"),
-                "tracking": crossing_metrics._current_tracking_settings(),
-                "crossing_parameters": dict(crossing_parameters),
-            }
-        ),
-    )
-    store = SurfaceStore(str(store_root))
-    store.ensure_directories()
-    return SegmentationPipeline(
-        store=store,
-        segmenter=segmenter,
-        settings=settings,
-        credentials=None,
-        coarse_hz=coarse_hz,
-        refine_hz=refine_hz,
-        minimum_confidence=minimum_confidence,
-    )
-
-
 def _evaluate_sequence(
     sequence: Any,
     split: str,
@@ -131,27 +85,10 @@ def _evaluate_sequence(
 ) -> List[Dict[str, Any]]:
     fps = float(sequence.fps)
     detections = sequence.prediction_dataframe
-    persons = detections.filter(pl.col("yolo-id") == crossing_metrics.PERSON_CLASS_ID)
-    tracks = {
-        crossing_metrics.normalise_id(track.get_column("unique-id")[0]): track.sort("frame-count")
-        for track in persons.partition_by("unique-id", maintain_order=True)
-        if track.height >= MINIMUM_TRACK_ROWS
-    }
-    tracks = {track_id: track for track_id, track in tracks.items() if track_id}
+    tracks = waymo_person_tracks(sequence)
     if not tracks:
         return []
-
-    timelines = pipeline.timelines(
-        SegmentRequest(
-            stem=f"waymo_{split}_{sequence.source_id}",
-            video_id=sequence.source_id,
-            start_seconds=0.0,
-            detection_fps=fps,
-            tracks=tracks,
-            source_fps=fps,
-            video_path=str(sequence.prediction_path.parent / VIDEO_NAME),
-        )
-    ) or {}
+    timelines = waymo_surface_timelines(sequence, split, pipeline, tracks)
     intervals = road_intervals_for_tracks(timelines)
     road_speeds, _ = road_restricted_speed(
         pl.DataFrame(), detections, sequence.source_id, fps, intervals, float(sequence.aspect_ratio),
@@ -212,6 +149,7 @@ def _evaluate_sequence(
             if prediction.get("speed_status") == "valid":
                 bbox_speed = float(prediction["estimated_speed_mps"])
 
+        flags = road_crossing_flags(track, interval, features_by_track.get(track_id), minimum_x_range)
         rows.append(
             {
                 "split": split,
@@ -222,6 +160,11 @@ def _evaluate_sequence(
                 "matched": int(association is not None),
                 "real_crossing": int(ground_truth_id in sequence.crossing_tracks),
                 "detector": int(track_id in picks),
+                "detector_on_road": int(track_id in picks and interval is not None),
+                "road_crossing": flags["road_crossing"],
+                "box_size_change_rate": (
+                    flags["box_size_change_rate"] if flags["box_size_change_rate"] is not None else ""
+                ),
                 "road_lateral": int(road_lateral),
                 "road_edge": int(road_edge),
                 "road_full": int(road_full),
@@ -303,7 +246,7 @@ def evaluate(splits: Sequence[str] = ("training", "validation")) -> Dict[str, An
 
     qualified = _load_speed_model(calibration_root)
     crossing_parameters = crossing_metrics.tuned_crossing_parameters()
-    pipeline = _pipeline(processed_root / STORE_FOLDER, crossing_parameters)
+    pipeline = waymo_segmentation_pipeline(processed_root, crossing_parameters)
     detector = Detection()
     minimum_confidence = float(common.get_configs("min_confidence"))
 

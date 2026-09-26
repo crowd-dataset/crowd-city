@@ -25,7 +25,9 @@ import polars as pl
 from utils.crossing.detection import Detection
 
 
-CALIBRATION_BUILD_ID = "crowd_algorithm_selected_waymo_speed_v32_20260825"
+# Part of the record that decides whether a calibration is reused: bump it
+# whenever the calibration code changes what it fits.
+CALIBRATION_BUILD_ID = "crowd_road_surface_selected_waymo_speed_v33_20260926"
 PIPELINE_MODEL_SCHEMA = "crowd_waymo_pipeline_model_v32"
 DIAGNOSTIC_FIGURE_BUILD_ID = (
     "waymo_train_test_validation_speed_error_v2_20260825"
@@ -1537,6 +1539,89 @@ def refresh_waymo_diagnostic_figures(
     return figures
 
 
+def _road_selections(
+    sequences: Sequence[SequenceData],
+    detected_by_source: Mapping[str, set[str]],
+    split_name: str,
+    pipeline: Any,
+    parameters: Mapping[str, Any],
+) -> Tuple[Dict[str, set[str]], Dict[str, set[str]]]:
+    """Return rule B (detector picks on the road) and rule D (road crossings).
+
+    See utils/crossing/road_crossing.py. Surface labels come from the shared
+    Waymo segmentation cache, so this is cheap once they have been computed.
+    """
+    import utils.crossing.metrics as crossing_metrics
+    from utils.crossing.road_crossing import (
+        road_crossing_flags,
+        waymo_person_tracks,
+        waymo_road_intervals,
+        waymo_surface_timelines,
+    )
+
+    on_road_detected: Dict[str, set[str]] = {}
+    road_crossings: Dict[str, set[str]] = {}
+    minimum_x_range = float(parameters["min_crossing_x_range"])
+    for number, sequence in enumerate(sequences, start=1):
+        tracks = waymo_person_tracks(sequence)
+        intervals = waymo_road_intervals(waymo_surface_timelines(sequence, split_name, pipeline, tracks))
+        boxes = crossing_metrics.bbox_rows_from_polars(sequence.prediction_dataframe)
+        features = crossing_metrics.contextual_track_features(
+            crossing_metrics.group_tracks(row for row in boxes if row.class_id == PERSON_CLASS_ID),
+            sequence.fps,
+            sequence.source_id,
+            sequence.aspect_ratio,
+            crossing_metrics.build_scene_motion_profile(boxes, sequence.fps),
+        )
+        on_road_detected[sequence.source_id] = {
+            prediction_id
+            for prediction_id in detected_by_source.get(sequence.source_id, set())
+            if crossing_metrics.normalise_id(prediction_id) in intervals
+        }
+        road_crossings[sequence.source_id] = {
+            track_id
+            for track_id, track in tracks.items()
+            if road_crossing_flags(track, intervals.get(track_id), features.get(track_id), minimum_x_range)[
+                "road_crossing"
+            ]
+        }
+        if number % 100 == 0:
+            print(f"Road surface selection {split_name}: {number}/{len(sequences)} recordings")
+    return on_road_detected, road_crossings
+
+
+def _crossing_rule_metrics(
+    sequences: Sequence[SequenceData],
+    selected_by_source: Mapping[str, set[str]],
+) -> Dict[str, Any]:
+    """Score one crossing rule against the Waymo crosswalk-crossing label.
+
+    The Waymo label covers marked crosswalks only, so crossings elsewhere count
+    as wrong here; precision is a lower bound.
+    """
+    real = sum(len(sequence.crossing_tracks) for sequence in sequences)
+    picks = correct = 0
+    found: set[Tuple[str, str]] = set()
+    for sequence in sequences:
+        for prediction_id in selected_by_source.get(sequence.source_id, set()):
+            picks += 1
+            association = sequence.associations.get(prediction_id) or sequence.associations.get(
+                _normalise_id(prediction_id)
+            )
+            ground_truth_id = str(association["ground_truth_id"]) if association else ""
+            if ground_truth_id and ground_truth_id in sequence.crossing_tracks:
+                correct += 1
+                found.add((sequence.source_id, ground_truth_id))
+    return {
+        "picks": picks,
+        "correct_waymo_crosswalk_crossings": correct,
+        "precision_lower_bound": correct / picks if picks else None,
+        "waymo_crosswalk_crossers": real,
+        "waymo_crosswalk_crossers_found": len(found),
+        "recall": len(found) / real if real else None,
+    }
+
+
 def calibrate_waymo_pipeline(
     training_index_csv: str,
     validation_index_csv: str,
@@ -1583,6 +1668,46 @@ def calibrate_waymo_pipeline(
         detector,
         parameters,
     )
+
+    # The speed model trains on rule B, the detector picks whose feet are on
+    # the road: it removes footpath mistakes without losing a real crossing.
+    # Rule D is reported beside it as the rule used to count crossings.
+    from utils.crossing.road_crossing import MAXIMUM_BOX_SIZE_CHANGE_RATE, waymo_segmentation_pipeline
+
+    print("Reading the road surface under every pedestrian (segmentation)")
+    segmentation = waymo_segmentation_pipeline(output_root.parent, parameters)
+    try:
+        training_on_road, training_road_crossings = _road_selections(
+            training, training_detected, Path(training_index_csv).expanduser().resolve().parent.name,
+            segmentation, parameters,
+        )
+        validation_on_road, validation_road_crossings = _road_selections(
+            validation, validation_detected, Path(validation_index_csv).expanduser().resolve().parent.name,
+            segmentation, parameters,
+        )
+    finally:
+        segmentation.close()
+    crossing_rules = {
+        split: {
+            "detector": _crossing_rule_metrics(sequences, detected),
+            "detector_on_road": _crossing_rule_metrics(sequences, on_road),
+            "road_crossing": _crossing_rule_metrics(sequences, road),
+        }
+        for split, sequences, detected, on_road, road in (
+            ("training", training, training_detected, training_on_road, training_road_crossings),
+            ("validation", validation, validation_detected, validation_on_road, validation_road_crossings),
+        )
+    }
+    for split, rules in crossing_rules.items():
+        for rule, metrics in rules.items():
+            print(
+                f"Crossing rule [{split} {rule}]: picks={metrics['picks']}, "
+                f"Waymo crosswalk crossers found={metrics['waymo_crosswalk_crossers_found']}"
+                f"/{metrics['waymo_crosswalk_crossers']}, "
+                f"precision (lower bound)={metrics['precision_lower_bound'] or 0:.2f}"
+            )
+    training_detected = training_on_road
+    validation_detected = validation_on_road
 
     training_manifest_rows = _speed_manifest_rows(
         training,
@@ -1647,7 +1772,8 @@ def calibrate_waymo_pipeline(
         "diagnostic_figure_build_id": DIAGNOSTIC_FIGURE_BUILD_ID,
         "pipeline_model_schema": PIPELINE_MODEL_SCHEMA,
         "protocol": {
-            "crossing_selection": "fixed original CROWD algorithm",
+            "crossing_selection": "fixed original CROWD algorithm, feet on the road (rule B)",
+            "crossing_counting_rule": "road_crossing (rule D), see utils/crossing/road_crossing.py",
             "waymo_crossing_label_used_for_speed_selection": False,
             "speed_model_selection": "Waymo training only",
             "final_evaluation": "Waymo validation only after the speed model was frozen",
@@ -1660,6 +1786,7 @@ def calibrate_waymo_pipeline(
         "crossing_parameters": parameters,
         "training_speed_selection": training_selection,
         "validation_speed_selection": validation_selection,
+        "crossing_rules": crossing_rules,
         "speed_manifest_rows": len(manifest_rows),
         "speed_fit_error": speed_fit_error,
         "speed_candidate_model_path": (
@@ -1687,6 +1814,13 @@ def calibrate_waymo_pipeline(
         "calibration_build_id": CALIBRATION_BUILD_ID,
         "crossing_parameters": parameters,
         "crossing_parameters_source": "fixed_original_CROWD_algorithm",
+        "speed_training_selection": "detector_on_road",
+        "crossing_counting_rule": {
+            "name": "road_crossing",
+            "minimum_on_road_x_range": parameters["min_crossing_x_range"],
+            "maximum_box_size_change_rate": MAXIMUM_BOX_SIZE_CHANGE_RATE,
+        },
+        "crossing_rules": crossing_rules,
         "waymo_crossing_label_used_for_speed_selection": False,
         "training_speed_selection": training_selection,
         "validation_speed_selection": validation_selection,

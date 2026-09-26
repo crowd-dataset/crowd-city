@@ -2425,12 +2425,17 @@ def ensure_waymo_processed(
     # fitted on tracks from other settings is neither loaded nor reused.
     calibration_settings_path = calibration_root / "tracking_settings.json"
 
+    def calibration_record() -> Dict[str, Any]:
+        from utils.crossing.waymo_calibration import CALIBRATION_BUILD_ID
+
+        return {"tracking": _current_tracking_settings(), "calibration_build_id": CALIBRATION_BUILD_ID}
+
     def calibration_matches_tracking() -> bool:
         try:
             recorded = json.loads(calibration_settings_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return False
-        return recorded == _current_tracking_settings()
+        return recorded == calibration_record()
 
     def log_speed_statistics() -> None:
         summary_path = (
@@ -2581,8 +2586,8 @@ def ensure_waymo_processed(
 
     if pipeline_model_path.is_file() and not calibration_matches_tracking():
         logger(
-            "The frozen Waymo calibration was fitted on tracks from other tracking "
-            f"settings than {_current_tracking_settings()}; it will be rebuilt."
+            "The frozen Waymo calibration was built from other tracking settings or "
+            f"calibration code than {calibration_record()}; it will be rebuilt."
         )
     elif pipeline_model_path.is_file():
         load_tuned_pipeline_model(pipeline_model_path)
@@ -2737,7 +2742,7 @@ def ensure_waymo_processed(
                 "status": "complete",
                 "model": str(pipeline_model_path),
             }
-            write_json(calibration_settings_path, _current_tracking_settings())
+            write_json(calibration_settings_path, calibration_record())
             load_tuned_pipeline_model(pipeline_model_path)
             log_speed_statistics()
         except (OSError, subprocess.CalledProcessError, ValueError) as error:
