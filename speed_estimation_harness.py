@@ -331,6 +331,38 @@ WAYMO_CROSSING_SETTINGS: Dict[str, float] = {
 # Exact settings used by the CROWD paper/code.  track_buffer is filled from FPS.
 CROWD_YOLO_MODEL = "yolo11x.pt"
 CROWD_YOLO_CONFIDENCE = 0.0
+# Written beside every tracking CSV so a CSV produced with other settings (for
+# example the former 640 px input) is re-tracked instead of silently reused.
+TRACKING_SETTINGS_SUFFIX = ".tracking.json"
+
+
+def current_tracking_settings() -> Dict[str, Any]:
+    """Return the YOLO settings that determine a tracking CSV, from config."""
+    import common
+
+    return {
+        "yolo_model": CROWD_YOLO_MODEL,
+        "yolo_confidence": CROWD_YOLO_CONFIDENCE,
+        "yolo_imgsz": int(common.get_configs("yolo_imgsz")),
+    }
+
+
+def tracking_settings_path(bbox_csv: str | Path) -> Path:
+    return Path(str(bbox_csv) + TRACKING_SETTINGS_SUFFIX)
+
+
+def tracking_is_current(bbox_csv: str | Path) -> bool:
+    """Return whether bbox_csv exists and was produced with the current settings."""
+    csv_path = Path(bbox_csv).expanduser()
+    if not csv_path.is_file():
+        return False
+    try:
+        recorded = json.loads(tracking_settings_path(csv_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return recorded == current_tracking_settings()
+
+
 CROWD_TRACK_BUFFER_SECONDS = 2.0
 CROWD_BOTSORT_SETTINGS: Dict[str, Any] = {
     "tracker_type": "botsort",
@@ -6408,6 +6440,8 @@ def mode_track_video(video_path: str, output_bbox_csv: str, device: str, tracker
     log(f"track_buffer: {settings['track_buffer']} frames ({CROWD_TRACK_BUFFER_SECONDS:.2f} seconds)")
     log(f"YOLO model: {CROWD_YOLO_MODEL}")
     log(f"Tracker: {tracker_path}")
+    tracking_settings = current_tracking_settings()
+    log(f"YOLO input size: {tracking_settings['yolo_imgsz']} px")
     model = YOLO(CROWD_YOLO_MODEL)
     output_rows: List[Dict[str, Any]] = []
     frame_index = 0
@@ -6419,6 +6453,7 @@ def mode_track_video(video_path: str, output_bbox_csv: str, device: str, tracker
             "source": frame,
             "persist": True,
             "conf": CROWD_YOLO_CONFIDENCE,
+            "imgsz": tracking_settings["yolo_imgsz"],
             "tracker": str(tracker_path),
             "verbose": False,
         }
@@ -6460,10 +6495,13 @@ def mode_track_video(video_path: str, output_bbox_csv: str, device: str, tracker
             "tracked_rows": len(output_rows),
             "model": CROWD_YOLO_MODEL,
             "confidence": CROWD_YOLO_CONFIDENCE,
+            "imgsz": tracking_settings["yolo_imgsz"],
             "tracker_settings": settings,
             "ultralytics_version": package_version("ultralytics"),
         },
     )
+    # Written last, so an interrupted run never looks current.
+    write_json(str(tracking_settings_path(output_path)), tracking_settings)
     log(f"Tracked rows: {len(output_rows)}")
     log(f"Output: {output_path}")
 
@@ -6502,7 +6540,7 @@ def mode_track_index(
             log(f"WARNING: index row {index} has no video_path or prediction_bbox_csv; skipping")
             skipped += 1
             continue
-        if Path(bbox_path).expanduser().is_file() and not overwrite:
+        if tracking_is_current(bbox_path) and not overwrite:
             log(f"Skipping existing prediction {index}/{len(rows)}: {bbox_path}")
             skipped += 1
             continue

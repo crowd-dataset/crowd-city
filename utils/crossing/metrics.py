@@ -2164,11 +2164,20 @@ def _waymo_export_is_ready(
     return bool(index_rows)
 
 
+def _current_tracking_settings() -> Dict[str, Any]:
+    """Return the tracking settings from the harness, which reads config."""
+    import speed_estimation_harness
+
+    return speed_estimation_harness.current_tracking_settings()
+
+
 def _waymo_tracking_is_ready(
     repository_root: Path,
     processed_split_root: Path,
 ) -> bool:
-    """Every exported video must have a prediction CSV, even if header only."""
+    """Every exported video needs a prediction CSV made with the current settings."""
+    import speed_estimation_harness
+
     index_path = processed_split_root / "waymo_sequence_index.csv"
     if not index_path.is_file():
         return False
@@ -2182,7 +2191,7 @@ def _waymo_tracking_is_ready(
             index_path,
             row.get("prediction_bbox_csv"),
         )
-        if prediction is None or not prediction.is_file():
+        if prediction is None or not speed_estimation_harness.tracking_is_current(prediction):
             return False
     return bool(index_rows)
 
@@ -2412,6 +2421,16 @@ def ensure_waymo_processed(
     }
     calibration_root = processed_root / "calibration_v32"
     pipeline_model_path = calibration_root / "crowd_waymo_pipeline_model.json"
+    # Records the tracking settings the calibration was fitted on. A model
+    # fitted on tracks from other settings is neither loaded nor reused.
+    calibration_settings_path = calibration_root / "tracking_settings.json"
+
+    def calibration_matches_tracking() -> bool:
+        try:
+            recorded = json.loads(calibration_settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return recorded == _current_tracking_settings()
 
     def log_speed_statistics() -> None:
         summary_path = (
@@ -2560,7 +2579,12 @@ def ensure_waymo_processed(
             except (TypeError, ValueError):
                 pass
 
-    if pipeline_model_path.is_file():
+    if pipeline_model_path.is_file() and not calibration_matches_tracking():
+        logger(
+            "The frozen Waymo calibration was fitted on tracks from other tracking "
+            f"settings than {_current_tracking_settings()}; it will be rebuilt."
+        )
+    elif pipeline_model_path.is_file():
         load_tuned_pipeline_model(pipeline_model_path)
         try:
             from utils.crossing.waymo_calibration import (
@@ -2713,6 +2737,7 @@ def ensure_waymo_processed(
                 "status": "complete",
                 "model": str(pipeline_model_path),
             }
+            write_json(calibration_settings_path, _current_tracking_settings())
             load_tuned_pipeline_model(pipeline_model_path)
             log_speed_statistics()
         except (OSError, subprocess.CalledProcessError, ValueError) as error:
