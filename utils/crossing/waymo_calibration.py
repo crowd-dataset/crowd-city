@@ -27,7 +27,7 @@ from utils.crossing.detection import Detection
 
 # Part of the record that decides whether a calibration is reused: bump it
 # whenever the calibration code changes what it fits.
-CALIBRATION_BUILD_ID = "crowd_road_surface_selected_waymo_speed_v33_20260926"
+CALIBRATION_BUILD_ID = "crowd_road_surface_selected_waymo_speed_v34_20260926"
 PIPELINE_MODEL_SCHEMA = "crowd_waymo_pipeline_model_v32"
 DIAGNOSTIC_FIGURE_BUILD_ID = (
     "waymo_train_test_validation_speed_error_v2_20260825"
