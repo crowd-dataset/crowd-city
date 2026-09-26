@@ -100,12 +100,9 @@ class Metrics:
         pass
 
     @staticmethod
-    def _get_config(key: str, default=None):
-        try:
-            value = common.get_configs(key)
-        except Exception:
-            return default
-        return default if value is None else value
+    def _get_config(key: str):
+        # Always the value in config: no hard-coded fallback.
+        return common.get_configs(key)
 
     @staticmethod
     def _as_float(value, default=None):
@@ -316,8 +313,8 @@ class Metrics:
         del df_mapping
         averages: dict = {}
         complete: dict = {}
-        minimum = self._as_float(self._get_config("min_speed_limit", 0), 0)
-        maximum = self._as_float(self._get_config("max_speed_limit", 1e20), 1e20)
+        minimum = float(self._get_config("min_speed_limit"))
+        maximum = float(self._get_config("max_speed_limit"))
         for locality, videos in (all_speed or {}).items():
             values = [
                 float(value)
@@ -337,8 +334,8 @@ class Metrics:
     ):
         """Average the dimensionless crossing speed index by country."""
         grouped: dict[str, list[float]] = {}
-        minimum = self._as_float(self._get_config("min_speed_limit", 0), 0)
-        maximum = self._as_float(self._get_config("max_speed_limit", 1e20), 1e20)
+        minimum = float(self._get_config("min_speed_limit"))
+        maximum = float(self._get_config("max_speed_limit"))
         for videos in (all_speed or {}).values():
             for video_id, tracks in videos.items():
                 result = metadata_class.find_values_with_video_id(df_mapping, video_id)
@@ -375,10 +372,7 @@ class Metrics:
         if fps is None:
             return None
 
-        checks_per_second = self._as_float(
-            self._get_config("check_per_sec_time", 3),
-            3,
-        )
+        checks_per_second = float(self._get_config("check_per_sec_time"))
         if checks_per_second is None or checks_per_second <= 0:
             return None
         step = max(1, int(round(fps / checks_per_second)))
@@ -427,9 +421,9 @@ class Metrics:
         del df_mapping
         averages: dict = {}
         complete: dict = {}
-        checks = self._as_float(self._get_config("check_per_sec_time", 3), 3)
-        minimum = self._as_float(self._get_config("min_waiting_time", 0), 0)
-        maximum = self._as_float(self._get_config("max_waiting_time", 1e20), 1e20)
+        checks = float(self._get_config("check_per_sec_time"))
+        minimum = float(self._get_config("min_waiting_time"))
+        maximum = float(self._get_config("max_waiting_time"))
         for locality, videos in (all_time or {}).items():
             values = [
                 float(value) / checks
@@ -450,9 +444,9 @@ class Metrics:
     ):
         """Average crossing initiation time by country."""
         grouped: dict[str, list[float]] = {}
-        checks = self._as_float(self._get_config("check_per_sec_time", 3), 3)
-        minimum = self._as_float(self._get_config("min_waiting_time", 0), 0)
-        maximum = self._as_float(self._get_config("max_waiting_time", 1e20), 1e20)
+        checks = float(self._get_config("check_per_sec_time"))
+        minimum = float(self._get_config("min_waiting_time"))
+        maximum = float(self._get_config("max_waiting_time"))
         for videos in (all_time or {}).values():
             for video_id, times in videos.items():
                 if not times:

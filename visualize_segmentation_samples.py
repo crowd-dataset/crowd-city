@@ -43,10 +43,6 @@ from utils.segmentation.frames import (
     resolve_video_url,
 )
 from utils.segmentation.segformer import (
-    DEFAULT_BATCH_SIZE,
-    DEFAULT_INPUT_HEIGHT,
-    DEFAULT_INPUT_WIDTH,
-    DEFAULT_MODEL_NAME,
     SurfaceSegmenter,
     segmentation_is_available,
 )
@@ -100,7 +96,7 @@ def _load_credentials() -> RemoteCredentials:
         return text or None
 
     return RemoteCredentials(
-        base_url=str(common.get_configs("ftp_base_url") or ""),
+        base_url=str(common.get_configs("ftp_base_url")),
         username=secret("ftp_username"),
         password=secret("ftp_password"),
         token=secret("ftp_token"),
@@ -134,9 +130,9 @@ def _current_crossing_fingerprint() -> str:
     return crossing_fingerprint(
         {
             "crossing_parameters": dict(tuned_crossing_parameters() or {}),
-            "min_confidence": common.get_configs("min_confidence") or 0.7,
-            "boundary_left": common.get_configs("boundary_left") or 0.45,
-            "boundary_right": common.get_configs("boundary_right") or 0.55,
+            "min_confidence": common.get_configs("min_confidence"),
+            "boundary_left": common.get_configs("boundary_left"),
+            "boundary_right": common.get_configs("boundary_right"),
             "processing_fps": common.get_configs("processing_fps"),
         }
     )
@@ -477,11 +473,11 @@ def main() -> None:
     logger.info(f"Rendering {len(samples)} sample clip(s).")
 
     segmenter = SurfaceSegmenter(
-        model_name=str(common.get_configs("segmentation_model") or DEFAULT_MODEL_NAME),
-        device=str(common.get_configs("segmentation_device") or "auto"),
-        batch_size=int(common.get_configs("segmentation_batch_size") or DEFAULT_BATCH_SIZE),
-        input_width=int(common.get_configs("segmentation_input_width") or DEFAULT_INPUT_WIDTH),
-        input_height=int(common.get_configs("segmentation_input_height") or DEFAULT_INPUT_HEIGHT),
+        model_name=str(common.get_configs("segmentation_model")),
+        device=str(common.get_configs("segmentation_device")),
+        batch_size=int(common.get_configs("segmentation_batch_size")),
+        input_width=int(common.get_configs("segmentation_input_width")),
+        input_height=int(common.get_configs("segmentation_input_height")),
     )
     credentials = _load_credentials()
     args.output_dir.mkdir(parents=True, exist_ok=True)

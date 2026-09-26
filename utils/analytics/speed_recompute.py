@@ -121,9 +121,9 @@ def resolve_worker_count(requested: Optional[int], task_count: int) -> int:
             try:
                 workers = max(1, int(worker_env))
             except ValueError:
-                workers = int(common.get_configs("cpu_worker") or 1)
+                workers = int(common.get_configs("cpu_worker"))
         else:
-            workers = int(common.get_configs("cpu_worker") or 1)
+            workers = int(common.get_configs("cpu_worker"))
     workers = min(workers, max(1, os.cpu_count() or 1))
     return max(1, min(workers, task_count or 1))
 

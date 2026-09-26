@@ -34,10 +34,6 @@ from utils.crossing.road_metrics import (
 from utils.segmentation.frames import RemoteCredentials
 from utils.segmentation.pipeline import SegmentationPipeline, SegmentRequest
 from utils.segmentation.segformer import (
-    DEFAULT_BATCH_SIZE,
-    DEFAULT_INPUT_HEIGHT,
-    DEFAULT_INPUT_WIDTH,
-    DEFAULT_MODEL_NAME,
     SurfaceSegmenter,
     segmentation_is_available,
 )
@@ -50,7 +46,6 @@ from utils.segmentation.store import (
 from utils.segmentation.surface import (
     DEFAULT_FOOTPOINT_BAND_FRACTION,
     DEFAULT_FOOTPOINT_WIDTH_FRACTION,
-    DEFAULT_MINIMUM_CONFIDENCE,
 )
 
 
@@ -58,12 +53,9 @@ logger = CustomLogger(__name__)
 grouping = Grouping()
 
 
-def _config(name: str, default: Any) -> Any:
-    try:
-        value = common.get_configs(name)
-    except Exception:
-        return default
-    return default if value is None else value
+def _config(name: str) -> Any:
+    # Always the value in config: no hard-coded fallback.
+    return common.get_configs(name)
 
 
 def _secret(name: str) -> Optional[str]:
@@ -133,7 +125,7 @@ def run_segmentation_pass(
         "enabled": False,
     }
 
-    if not bool(_config("use_segmentation", False)):
+    if not bool(_config("use_segmentation")):
         logger.info("Segmentation-based crossing metrics are disabled in the configuration.")
         return empty
 
@@ -157,18 +149,18 @@ def run_segmentation_pass(
         logger.error(f"Segmentation store {root} could not be opened; skipping the pass.")
         return empty
 
-    coarse_hz = float(_config("segmentation_coarse_hz", 1.0))
-    refine_hz = float(_config("segmentation_refine_hz", 4.0))
+    coarse_hz = float(_config("segmentation_coarse_hz"))
+    refine_hz = float(_config("segmentation_refine_hz"))
     segmenter = SurfaceSegmenter(
-        model_name=str(_config("segmentation_model", DEFAULT_MODEL_NAME)),
-        device=str(_config("segmentation_device", "auto")),
-        batch_size=int(_config("segmentation_batch_size", DEFAULT_BATCH_SIZE)),
-        input_width=int(_config("segmentation_input_width", DEFAULT_INPUT_WIDTH)),
-        input_height=int(_config("segmentation_input_height", DEFAULT_INPUT_HEIGHT)),
+        model_name=str(_config("segmentation_model")),
+        device=str(_config("segmentation_device")),
+        batch_size=int(_config("segmentation_batch_size")),
+        input_width=int(_config("segmentation_input_width")),
+        input_height=int(_config("segmentation_input_height")),
     )
 
     minimum_confidence = float(
-        _config("segmentation_min_confidence", DEFAULT_MINIMUM_CONFIDENCE)
+        _config("segmentation_min_confidence")
     )
     settings = SegmentationSettings(
         model_identifier=segmenter.model_identifier,
@@ -180,10 +172,10 @@ def run_segmentation_pass(
         crossing_fingerprint=crossing_fingerprint(
             {
                 "crossing_parameters": dict(crossing_parameters or {}),
-                "min_confidence": _config("min_confidence", 0.7),
-                "boundary_left": _config("boundary_left", 0.45),
-                "boundary_right": _config("boundary_right", 0.55),
-                "processing_fps": _config("processing_fps", None),
+                "min_confidence": _config("min_confidence"),
+                "boundary_left": _config("boundary_left"),
+                "boundary_right": _config("boundary_right"),
+                "processing_fps": _config("processing_fps"),
             }
         ),
     )
@@ -197,15 +189,15 @@ def run_segmentation_pass(
     initialise_csv_worker(
         df_mapping,
         dict(crossing_parameters or {}),
-        float(_config("min_confidence", 0.7)),
-        float(_config("boundary_left", 0.45)),
-        float(_config("boundary_right", 0.55)),
+        float(_config("min_confidence")),
+        float(_config("boundary_left")),
+        float(_config("boundary_right")),
         dict(getattr(crossing_metrics, "_PIPELINE_MODEL", {}) or {}),
         dict(getattr(crossing_metrics, "_SPEED_MODEL", {}) or {}),
     )
 
     credentials = RemoteCredentials(
-        base_url=str(_config("ftp_base_url", "")),
+        base_url=str(_config("ftp_base_url")),
         username=_secret("ftp_username"),
         password=_secret("ftp_password"),
         token=_secret("ftp_token"),
@@ -242,7 +234,7 @@ def run_segmentation_pass(
         f"Model {segmenter.model_identifier} on {segmenter.device}."
     )
 
-    checks_per_second = float(_config("check_per_sec_time", 3))
+    checks_per_second = float(_config("check_per_sec_time"))
     raw_speed: Dict[str, Dict[str, float]] = {}
     raw_time: Dict[str, Dict[str, float]] = {}
     diagnostics: Counter = Counter()

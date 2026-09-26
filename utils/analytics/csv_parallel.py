@@ -350,10 +350,7 @@ def _time_to_start_from_track_index(
     if not track_ids or not math.isfinite(float(fps)) or float(fps) <= 0:
         return None
 
-    checks_per_second = _METRICS._as_float(
-        _METRICS._get_config("check_per_sec_time", 3),
-        3,
-    )
+    checks_per_second = float(_METRICS._get_config("check_per_sec_time"))
     if checks_per_second is None or checks_per_second <= 0:
         return None
 

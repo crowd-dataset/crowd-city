@@ -12,6 +12,8 @@ import ast
 import math
 import os
 import pickle
+import shutil
+import sys
 import warnings
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
@@ -2426,18 +2428,26 @@ def _run_integrated_speed_reporting(
 
 
 def _prepare_waymo_tuned_parameters() -> Dict[str, object]:
-    """Prepare or load the frozen Waymo model before CROWD CSV analysis."""
-    global waymo_processed_roots
-    try:
-        from utils.crossing.metrics import (
-            ensure_waymo_processed,
-            metric_speed_is_qualified,
-            tuned_crossing_parameters,
-        )
+    """Prepare or load the frozen Waymo model before CROWD CSV analysis.
 
+    Crossing speeds are always reported in metres per second, which needs the
+    Waymo-calibrated speed model to be present and qualified. The model is
+    built from the raw Waymo data when process_waymo_if_missing is enabled.
+    If it still cannot be loaded, the analysis stops here rather than falling
+    back to the dimensionless relative-motion index.
+    """
+    global waymo_processed_roots
+    from utils.crossing.metrics import (
+        ensure_waymo_processed,
+        metric_speed_is_qualified,
+        tuned_crossing_parameters,
+    )
+
+    raw_dataset_path = common.get_configs("waymo_dataset_path")
+    try:
         waymo_processed_roots = list(
             ensure_waymo_processed(
-                raw_dataset_path=common.get_configs("waymo_dataset_path"),
+                raw_dataset_path=raw_dataset_path,
                 repository_root=common.root_dir,
                 output_root=common.output_dir,
                 process_if_missing=bool(
@@ -2446,19 +2456,43 @@ def _prepare_waymo_tuned_parameters() -> Dict[str, object]:
                 log=lambda message: logger.info(message),
             )
         )
-        parameters = tuned_crossing_parameters()
-        if parameters:
-            logger.info(
-                "Using the fixed CROWD crossing algorithm with the Waymo calibrated speed model; "
-                f"qualified metric speed={metric_speed_is_qualified()}."
+    except Exception as error:
+        logger.error(f"Waymo preparation failed: {error}")
+        waymo_processed_roots = []
+
+    if not metric_speed_is_qualified():
+        if not raw_dataset_path or not os.path.isdir(os.path.expanduser(str(raw_dataset_path))):
+            reason = (
+                f"waymo_dataset_path in config ({raw_dataset_path!r}) is not an existing "
+                "directory, so the Waymo data could not be processed"
+            )
+        elif common.get_configs("process_waymo_if_missing") and shutil.which("docker") is None:
+            reason = (
+                "the Waymo data has not been processed yet and Docker, which the raw "
+                "TFRecord export runs in, is not installed"
+            )
+        elif not common.get_configs("process_waymo_if_missing"):
+            reason = (
+                "no processed Waymo model exists and process_waymo_if_missing is "
+                "false in config"
             )
         else:
-            logger.info("No frozen Waymo model found; using original CROWD parameters.")
-        return parameters
-    except Exception as error:
-        waymo_processed_roots = []
-        logger.error(f"Waymo preparation failed; using original CROWD parameters: {error}")
-        return {}
+            reason = (
+                "Waymo processing or calibration did not produce a qualified speed "
+                "model; see the Waymo messages above"
+            )
+        logger.error(
+            "Crossing speeds must be in m/s, but the Waymo speed model is not "
+            f"available: {reason}. Stopping instead of reporting the relative index."
+        )
+        sys.exit(1)
+
+    os.environ["CROWD_CROSSING_SPEED_UNIT"] = "m/s"
+    logger.info(
+        "Using the fixed CROWD crossing algorithm with the qualified Waymo speed "
+        "model; crossing speeds are in m/s."
+    )
+    return tuned_crossing_parameters()
 
 
 # Execute analysis
@@ -2496,7 +2530,14 @@ if __name__ == "__main__":
             cached_segmentation,
         ) = _load_results_cache(file_results)
 
-        if cached_results is not None and cached_config == current_cache_config:
+        if cached_results is not None and cached_speed_unit != "m/s":
+            logger.info(
+                "Cached analysis results in {} hold crossing speeds in {!r}, not m/s; "
+                "reanalysing.",
+                file_results,
+                cached_speed_unit or "relative",
+            )
+        elif cached_results is not None and cached_config == current_cache_config:
             use_cached_results = True
             # Only now that the cached values will actually be reused does
             # their recorded unit describe the data the figures will show.
@@ -3555,10 +3596,10 @@ if __name__ == "__main__":
             seg_speed = segmentation_output["seg_speed"]
             seg_time = segmentation_output["seg_time"]
 
-            seg_speed_min = float(common.get_configs("min_speed_limit") or 0)
-            seg_speed_max = float(common.get_configs("max_speed_limit") or 1e20)
-            seg_time_min = float(common.get_configs("min_waiting_time") or 0)
-            seg_time_max = float(common.get_configs("max_waiting_time") or 1e20)
+            seg_speed_min = float(common.get_configs("min_speed_limit"))
+            seg_speed_max = float(common.get_configs("max_speed_limit"))
+            seg_time_min = float(common.get_configs("min_waiting_time"))
+            seg_time_max = float(common.get_configs("max_waiting_time"))
 
             avg_seg_speed_locality, all_seg_speed_locality = (
                 segmentation_pass.average_by_locality(
@@ -4885,9 +4926,7 @@ if __name__ == "__main__":
                 all_time=all_time,
                 all_speed_locality=all_speed_locality,
                 all_time_locality=all_time_locality,
-                checks_per_second=float(
-                    common.get_configs("check_per_sec_time") or 3
-                ),
+                checks_per_second=float(common.get_configs("check_per_sec_time")),
             )
             if structure_result.get("status") == "complete":
                 structure_result["city_table"].write_csv(
