@@ -106,7 +106,7 @@ python3 analysis.py
 ```
 
 ### Configuration of project
-Configuration of the project is defined in `config`. Use `default.config` for the required structure: any setting missing from `config` that is marked optional in `common.py` falls back to its value in `default.config`. The config file has the following parameters (the segmentation settings are described in the next section):
+Configuration of the project is defined in `config`. Every value is read from `config`; `default.config` is only a template listing the settings that must exist. Its values are never used, so if `config` is missing any setting the run stops and names it. The config file has the following parameters (the segmentation settings are described in the next section):
 - **`data`**: List of directories holding the YOLO detection output; the detection CSV files are read from their `bbox/` subfolder.
 - **`parquet_data`**: List of directories holding the Parquet copy of the detections, one per entry in `data` and in the same order. The analysis reads detections only from here (`<root>/bbox/*.parquet`).
 - **`sync_parquet_on_start`**: When `true`, new or changed CSV files under `data` are converted into the Parquet store before the analysis starts.

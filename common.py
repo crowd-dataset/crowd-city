@@ -45,27 +45,6 @@ logger = CustomLogger(__name__)  # use custom logger
 # load their own configuration once when they start.
 _CONFIG_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
-# New configuration options can be introduced without immediately breaking an
-# existing local config file. These keys fall back to default.config when absent.
-_OPTIONAL_CONFIG_DEFAULTS = {
-    "max_footage_hours_per_city",
-    "footage_sampling_seed",
-    "processing_fps",
-    "sync_parquet_on_start",
-    "seg_data",
-    "use_segmentation",
-    "segmentation_model",
-    "segmentation_device",
-    "segmentation_batch_size",
-    "segmentation_coarse_hz",
-    "segmentation_refine_hz",
-    "segmentation_input_width",
-    "segmentation_input_height",
-    "segmentation_min_confidence",
-    "segmentation_is_primary",
-    "save_images",
-}
-
 
 def _load_config_once(
     config_file_name: str = 'config',
@@ -107,23 +86,17 @@ def _load_config_once(
         )
         return None
 
-    missing_keys = [
-        key
-        for key in default
-        if key not in config and key not in _OPTIONAL_CONFIG_DEFAULTS
-    ]
+    # Every value is taken from config. default.config only defines which
+    # settings must exist; its values are never used, so a setting missing
+    # from config stops the run instead of silently falling back.
+    missing_keys = [key for key in default if key not in config]
     if missing_keys:
         logger.error(
             f"Config file is missing {len(missing_keys)} variable(s): "
-            f"{', '.join(missing_keys)}. Please update based on default.config."
+            f"{', '.join(missing_keys)}. Add them to {config_file_name}, "
+            f"using {config_default_file_name} for the structure."
         )
         return None
-
-    # Backwards compatibility for existing local config files. New analysis
-    # controls are optional and fall back to their values in default.config.
-    for key in _OPTIONAL_CONFIG_DEFAULTS:
-        if key not in config and key in default:
-            config[key] = default[key]
 
     _CONFIG_CACHE[cache_key] = config
     return config
@@ -157,8 +130,9 @@ def get_configs(
     """
     Return a configuration value from the process-local cached configuration.
 
-    The first lookup reads and validates config and default.config. Subsequent
-    lookups use the in-memory dictionary and perform no configuration file I/O.
+    The first lookup reads config and checks it against default.config, which
+    only lists the settings that must exist. Every value comes from config.
+    Subsequent lookups use the in-memory dictionary and perform no file I/O.
 
     Args:
         entry_name (str): Configuration key.
