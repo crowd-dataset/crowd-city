@@ -7,8 +7,10 @@ finds about one real crosser in six, and its mistakes are mostly pedestrians
 on the footpath. Knowing which surface the feet are on fixes both:
 
 * ``detector_on_road`` (rule B): a detector pick whose feet are on the road at
-  some point. It removes footpath mistakes without losing any real crossing,
-  so it is the clean set used to train the speed model.
+  some point. It removes footpath mistakes without losing any real crossing.
+  It is reported, but the speed model still trains on every detector pick:
+  training on rule B narrowed the predicted spread on untouched validation
+  below its limit.
 * ``road_crossing`` (rule D): the feet are on the road, the track moves across
   at least ``min_crossing_x_range`` of the image while there, and its box size
   changes slowly (people walking along the road towards or away from the

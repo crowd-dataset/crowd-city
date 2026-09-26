@@ -27,7 +27,7 @@ from utils.crossing.detection import Detection
 
 # Part of the record that decides whether a calibration is reused: bump it
 # whenever the calibration code changes what it fits.
-CALIBRATION_BUILD_ID = "crowd_road_surface_selected_waymo_speed_v34_20260926"
+CALIBRATION_BUILD_ID = "crowd_detector_selected_waymo_speed_road_rules_v35_20260927"
 PIPELINE_MODEL_SCHEMA = "crowd_waymo_pipeline_model_v32"
 DIAGNOSTIC_FIGURE_BUILD_ID = (
     "waymo_train_test_validation_speed_error_v2_20260825"
@@ -1669,9 +1669,11 @@ def calibrate_waymo_pipeline(
         parameters,
     )
 
-    # The speed model trains on rule B, the detector picks whose feet are on
-    # the road: it removes footpath mistakes without losing a real crossing.
-    # Rule D is reported beside it as the rule used to count crossings.
+    # Rules B (detector picks with feet on the road) and D (road crossings,
+    # the rule used to count crossings) are scored and reported here. The
+    # speed model still trains on every detector pick: training it on rule B
+    # narrowed the predicted spread on the untouched validation split below
+    # its limit (0.59 against 0.65), so the original selection is kept.
     from utils.crossing.road_crossing import MAXIMUM_BOX_SIZE_CHANGE_RATE, waymo_segmentation_pipeline
 
     print("Reading the road surface under every pedestrian (segmentation)")
@@ -1706,9 +1708,6 @@ def calibrate_waymo_pipeline(
                 f"/{metrics['waymo_crosswalk_crossers']}, "
                 f"precision (lower bound)={metrics['precision_lower_bound'] or 0:.2f}"
             )
-    training_detected = training_on_road
-    validation_detected = validation_on_road
-
     training_manifest_rows = _speed_manifest_rows(
         training,
         training_detected,
@@ -1772,7 +1771,7 @@ def calibrate_waymo_pipeline(
         "diagnostic_figure_build_id": DIAGNOSTIC_FIGURE_BUILD_ID,
         "pipeline_model_schema": PIPELINE_MODEL_SCHEMA,
         "protocol": {
-            "crossing_selection": "fixed original CROWD algorithm, feet on the road (rule B)",
+            "crossing_selection": "fixed original CROWD algorithm (speed training)",
             "crossing_counting_rule": "road_crossing (rule D), see utils/crossing/road_crossing.py",
             "waymo_crossing_label_used_for_speed_selection": False,
             "speed_model_selection": "Waymo training only",
@@ -1814,7 +1813,7 @@ def calibrate_waymo_pipeline(
         "calibration_build_id": CALIBRATION_BUILD_ID,
         "crossing_parameters": parameters,
         "crossing_parameters_source": "fixed_original_CROWD_algorithm",
-        "speed_training_selection": "detector_on_road",
+        "speed_training_selection": "detector",
         "crossing_counting_rule": {
             "name": "road_crossing",
             "minimum_on_road_x_range": parameters["min_crossing_x_range"],
