@@ -1546,15 +1546,10 @@ def calibrate_waymo_pipeline(
     """Fit speed on algorithm selected training crossings and test validation."""
     output_root = Path(output_directory).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    minimum_confidence = 0.70
-    try:
-        import common
+    import common
 
-        configured_confidence = _safe_float(common.get_configs("min_confidence"))
-        if configured_confidence is not None:
-            minimum_confidence = configured_confidence
-    except Exception:
-        pass
+    # Always the value in config: no hard-coded fallback.
+    minimum_confidence = float(common.get_configs("min_confidence"))
     print("Loading Waymo training sequences and strict BoT SORT associations")
     training = _load_sequences(training_index_csv, harness, minimum_confidence)
     if not training:
