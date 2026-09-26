@@ -12,6 +12,7 @@ import os
 import pickle
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -2258,6 +2259,129 @@ def _docker_waymo_export(
     _run_checked(command, repository_root)
 
 
+# Packages the raw TFRecord export needs, pinned to exactly what the Docker
+# route installs into tensorflow/tensorflow:2.12.0, so both routes produce the
+# same export. The Waymo package is installed without its dependencies, as in
+# the container, because its own pins conflict with TensorFlow 2.12.
+WAYMO_EXPORT_PYTHON = "3.10"
+WAYMO_EXPORT_PACKAGES = ("tensorflow==2.12.0", "opencv-python-headless==4.8.1.78")
+WAYMO_EXPORT_NO_DEPS_PACKAGES = ("waymo-open-dataset-tf-2-12-0==1.6.4",)
+WAYMO_EXPORT_ENV_DIR = ".waymo_export_venv"
+
+
+def _native_waymo_export_python(repository_root: Path, log: Callable[[str], None]) -> Path:
+    """Return the interpreter of a local environment able to run the export.
+
+    The environment is created once with uv and reused afterwards. It lives in
+    the repository rather than beside the Waymo data because that data often
+    sits on an exFAT drive, which cannot hold a virtualenv's symlinks.
+    """
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError(
+            "Neither Docker nor uv is available, so the raw Waymo TFRecords "
+            "cannot be exported. Install uv (https://docs.astral.sh/uv/) or Docker."
+        )
+    env_root = repository_root / WAYMO_EXPORT_ENV_DIR
+    python = env_root / "bin" / "python"
+    marker = env_root / "crowd_export_packages.json"
+    wanted = {
+        "python": WAYMO_EXPORT_PYTHON,
+        "packages": list(WAYMO_EXPORT_PACKAGES),
+        "no_deps_packages": list(WAYMO_EXPORT_NO_DEPS_PACKAGES),
+    }
+    try:
+        if python.is_file() and json.loads(marker.read_text(encoding="utf-8")) == wanted:
+            return python
+    except (OSError, ValueError):
+        pass
+
+    log(
+        f"Creating the Waymo export environment in {env_root} "
+        f"(Python {WAYMO_EXPORT_PYTHON}, {', '.join(WAYMO_EXPORT_PACKAGES + WAYMO_EXPORT_NO_DEPS_PACKAGES)})"
+    )
+    # --no-config keeps the repository's own uv settings out of this separate
+    # environment: pyproject.toml deliberately blocks opencv-python-headless,
+    # which the export needs here.
+    _run_checked(
+        [uv, "venv", "--no-config", "--clear", "--python", WAYMO_EXPORT_PYTHON, str(env_root)],
+        repository_root,
+    )
+    _run_checked(
+        [uv, "pip", "install", "--no-config", "--python", str(python), *WAYMO_EXPORT_PACKAGES],
+        repository_root,
+    )
+    _run_checked(
+        [
+            uv, "pip", "install", "--no-config", "--python", str(python),
+            "--no-deps", *WAYMO_EXPORT_NO_DEPS_PACKAGES,
+        ],
+        repository_root,
+    )
+    # Only mark the environment ready once the export's imports really work.
+    _run_checked(
+        [
+            str(python), "-c",
+            "import cv2, tensorflow; from waymo_open_dataset import dataset_pb2, label_pb2",
+        ],
+        repository_root,
+    )
+    write_json(marker, wanted)
+    return python
+
+
+def _native_waymo_export(
+    repository_root: Path,
+    raw_dataset_root: Path,
+    processed_split_root: Path,
+    split_name: str,
+    log: Callable[[str], None],
+) -> None:
+    """Export Waymo without Docker, using a local TensorFlow 2.12 environment."""
+    python = _native_waymo_export_python(repository_root, log)
+    log(f"Exporting raw Waymo {split_name} TFRecords without Docker")
+    _run_checked(
+        [
+            str(python),
+            str(repository_root / "speed_estimation_harness.py"),
+            "waymo_export",
+            str(raw_dataset_root / split_name),
+            str(processed_split_root),
+            "FRONT",
+            "10",
+            "0",
+            "false",
+        ],
+        repository_root,
+    )
+
+
+def _docker_is_usable() -> bool:
+    """Return whether the Docker CLI exists and its daemon answers."""
+    docker = shutil.which("docker")
+    if docker is None:
+        return False
+    try:
+        subprocess.run([docker, "info"], capture_output=True, check=True, timeout=30)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+    return True
+
+
+def _waymo_export(
+    repository_root: Path,
+    raw_dataset_root: Path,
+    processed_split_root: Path,
+    split_name: str,
+    log: Callable[[str], None],
+) -> None:
+    """Export one Waymo split with Docker when it works, otherwise natively."""
+    if _docker_is_usable():
+        _docker_waymo_export(repository_root, raw_dataset_root, processed_split_root, split_name, log)
+    else:
+        _native_waymo_export(repository_root, raw_dataset_root, processed_split_root, split_name, log)
+
+
 def ensure_waymo_processed(
     raw_dataset_path: os.PathLike[str] | str,
     repository_root: os.PathLike[str] | str,
@@ -2510,7 +2634,7 @@ def ensure_waymo_processed(
                 processed_split,
             )
             if not export_ready:
-                _docker_waymo_export(
+                _waymo_export(
                     repository,
                     raw_root,
                     processed_split,

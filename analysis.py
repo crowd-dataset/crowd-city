@@ -2466,10 +2466,14 @@ def _prepare_waymo_tuned_parameters() -> Dict[str, object]:
                 f"waymo_dataset_path in config ({raw_dataset_path!r}) is not an existing "
                 "directory, so the Waymo data could not be processed"
             )
-        elif common.get_configs("process_waymo_if_missing") and shutil.which("docker") is None:
+        elif (
+            common.get_configs("process_waymo_if_missing")
+            and shutil.which("docker") is None
+            and shutil.which("uv") is None
+        ):
             reason = (
-                "the Waymo data has not been processed yet and Docker, which the raw "
-                "TFRecord export runs in, is not installed"
+                "the Waymo data has not been processed yet and neither Docker nor uv, "
+                "one of which the raw TFRecord export needs, is installed"
             )
         elif not common.get_configs("process_waymo_if_missing"):
             reason = (

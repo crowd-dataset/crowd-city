@@ -29,6 +29,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 .venv
+.waymo_export_venv/
 .wb_cache
 
 # macOS specific files
