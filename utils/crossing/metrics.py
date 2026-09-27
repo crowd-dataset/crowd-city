@@ -5,6 +5,7 @@ Metric values are exposed only when the frozen bbox model passes untouched
 Waymo validation; otherwise the output remains an explicitly relative index.
 """
 
+import bisect
 import csv
 import json
 import math
@@ -486,6 +487,61 @@ SCENE_MOTION_SETTINGS: Dict[str, float] = {
     "outlier_mad_multiplier": 4.0,
 }
 
+# Feature windows in seconds rather than frames, so every feature describes
+# the same span of time at any frame rate while still using every frame. At
+# the 10 fps Waymo calibration rate each window equals the frame count it
+# replaced (3, 5, 1, 2 and 3 frames), so calibrated features are unchanged.
+FEATURE_TIME_WINDOWS_SECONDS: Dict[str, float] = {
+    "smoothing": 0.3,
+    "cleaning": 0.5,
+    "rate_span": 0.1,
+    "scene_pair_gap": 0.2,
+    "scene_radius": 0.3,
+}
+FEATURE_REFERENCE_FPS = 10.0
+
+
+def window_frames(seconds: float, fps: float, odd: bool = False) -> int:
+    """Return the number of frames spanning ``seconds`` at ``fps`` (at least one)."""
+    frames = max(1, int(round(float(seconds) * float(fps))))
+    if odd and frames % 2 == 0:
+        frames += 1
+    return frames
+
+
+def lagged_rates(time_values: np.ndarray, values: np.ndarray, lag: int) -> np.ndarray:
+    """Return rates of change over ``lag`` frames, starting at every frame."""
+    if len(values) <= lag:
+        return np.zeros(0, dtype=float)
+    delta_time = time_values[lag:] - time_values[:-lag]
+    delta_value = values[lag:] - values[:-lag]
+    valid = delta_time > 0.0
+    return delta_value[valid] / delta_time[valid]
+
+
+def reversal_fraction(x_values: np.ndarray, lag: int = 1) -> float:
+    """Share of consecutive movement steps whose direction reverses.
+
+    Each step spans ``lag`` frames. Every frame starts one sequence of
+    back-to-back steps, and the sequences are pooled, so no frame is dropped.
+    With ``lag`` 1 this is the original frame-to-frame measure.
+    """
+    changes = 0
+    comparisons = 0
+    for offset in range(max(1, int(lag))):
+        series = x_values[offset::max(1, int(lag))]
+        if len(series) < 4:
+            continue
+        delta = np.diff(series)
+        noise = max(robust_scale(delta) * 0.25, 0.0005)
+        signs = np.sign(delta[np.abs(delta) > noise])
+        if len(signs) < 2:
+            continue
+        changes += int(np.sum(signs[1:] != signs[:-1]))
+        comparisons += len(signs) - 1
+    return float(changes / comparisons) if comparisons else 0.0
+
+
 SOURCE_CONTEXT_SETTINGS: Dict[str, float] = {
     "minimum_reference_tracks": 3,
     "minimum_proxy_mps": 0.001,
@@ -542,9 +598,12 @@ class BBoxRow:
 @dataclass
 class SceneMotionProfile:
     samples_by_frame: Dict[int, List[Tuple[float, str]]]
+    # window_radius_frames at the reference rate; build_scene_motion_profile
+    # sets it from FEATURE_TIME_WINDOWS_SECONDS for the video's frame rate.
+    radius_frames: int = 3
 
     def rate_at(self, frame: float) -> Tuple[float, int]:
-        radius = int(SCENE_MOTION_SETTINGS["window_radius_frames"])
+        radius = int(self.radius_frames)
         centre_frame = int(round(frame))
         samples: List[Tuple[float, str]] = []
         for candidate in range(centre_frame - radius, centre_frame + radius + 1):
@@ -928,7 +987,10 @@ def robust_line(time_values: np.ndarray, values: np.ndarray) -> Tuple[float, flo
     )
 
 
-def clean_track(rows: Sequence[BBoxRow]) -> List[BBoxRow]:
+def clean_track(
+    rows: Sequence[BBoxRow],
+    fps: float = FEATURE_REFERENCE_FPS,
+) -> List[BBoxRow]:
     best_by_frame: Dict[int, BBoxRow] = {}
     for row in rows:
         if not (-0.25 <= row.x <= 1.25 and -0.25 <= row.y <= 1.25):
@@ -944,8 +1006,9 @@ def clean_track(rows: Sequence[BBoxRow]) -> List[BBoxRow]:
     values = np.asarray(
         [[row.x, row.y, row.width, row.height] for row in ordered], dtype=float
     )
+    cleaning_window = window_frames(FEATURE_TIME_WINDOWS_SECONDS["cleaning"], fps, odd=True)
     baseline = np.column_stack(
-        [rolling_median(values[:, column], 5) for column in range(4)]
+        [rolling_median(values[:, column], cleaning_window) for column in range(4)]
     )
     residual = values - baseline
     keep = np.ones(len(ordered), dtype=bool)
@@ -958,38 +1021,43 @@ def clean_track(rows: Sequence[BBoxRow]) -> List[BBoxRow]:
     return [row for index, row in enumerate(ordered) if bool(keep[index])]
 
 
+def _scene_motion_pairs(rows: Sequence[BBoxRow], rate_span: int, maximum_gap: int):
+    """Pair each reference detection with the first one ``rate_span`` or more frames later.
+
+    Every detection starts a pair, so no frame is dropped; pairs further apart
+    than ``maximum_gap`` frames are skipped. With a span of one frame this is
+    the original consecutive-detection pairing.
+    """
+    frames = [row.frame for row in rows]
+    for index, first in enumerate(rows):
+        later = bisect.bisect_left(frames, first.frame + int(rate_span), index + 1)
+        if later < len(rows) and rows[later].frame - first.frame <= int(maximum_gap):
+            yield first, rows[later]
+
+
 def build_scene_motion_profile(rows: Sequence[BBoxRow], fps: float) -> SceneMotionProfile:
     samples_by_frame: Dict[int, List[Tuple[float, str]]] = defaultdict(list)
     grouped: Dict[Tuple[int, str], List[BBoxRow]] = defaultdict(list)
     for row in rows:
         if row.class_id != PERSON_CLASS_ID:
             grouped[(row.class_id, row.track_id)].append(row)
-    maximum_gap = int(SCENE_MOTION_SETTINGS["maximum_pair_gap_frames"])
+    maximum_gap = window_frames(FEATURE_TIME_WINDOWS_SECONDS["scene_pair_gap"], fps)
+    rate_span = window_frames(FEATURE_TIME_WINDOWS_SECONDS["rate_span"], fps)
     maximum_rate = float(SCENE_MOTION_SETTINGS["maximum_absolute_x_rate_per_second"])
     for (class_id, track_id), track_rows in grouped.items():
         reference_id = f"{class_id}:{track_id}"
-        cleaned = clean_track(track_rows)
-        for first, second in zip(cleaned, cleaned[1:]):
+        cleaned = clean_track(track_rows, fps)
+        for first, second in _scene_motion_pairs(cleaned, rate_span, maximum_gap):
             frame_gap = second.frame - first.frame
-            if frame_gap < 1 or frame_gap > maximum_gap:
-                continue
             rate = (second.x - first.x) / (frame_gap / fps)
             if not math.isfinite(rate) or abs(rate) > maximum_rate:
                 continue
             midpoint = int(round((first.frame + second.frame) / 2.0))
             samples_by_frame[midpoint].append((float(rate), reference_id))
-    return SceneMotionProfile(dict(samples_by_frame))
-
-
-def reversal_fraction(x_values: np.ndarray) -> float:
-    if len(x_values) < 4:
-        return 0.0
-    delta = np.diff(x_values)
-    noise = max(robust_scale(delta) * 0.25, 0.0005)
-    signs = np.sign(delta[np.abs(delta) > noise])
-    if len(signs) < 2:
-        return 0.0
-    return float(np.mean(signs[1:] != signs[:-1]))
+    return SceneMotionProfile(
+        dict(samples_by_frame),
+        radius_frames=window_frames(FEATURE_TIME_WINDOWS_SECONDS["scene_radius"], fps),
+    )
 
 
 def track_features(
@@ -999,7 +1067,7 @@ def track_features(
     aspect_ratio: float,
     scene_motion_profile: SceneMotionProfile,
 ) -> Optional[TrackFeatures]:
-    cleaned = clean_track(rows)
+    cleaned = clean_track(rows, fps)
     if len(cleaned) < 2:
         return None
     frames = np.asarray([row.frame for row in cleaned], dtype=float)
@@ -1008,10 +1076,12 @@ def track_features(
     width_raw = np.asarray([row.width for row in cleaned], dtype=float)
     height_raw = np.asarray([row.height for row in cleaned], dtype=float)
     confidence = np.asarray([row.confidence for row in cleaned], dtype=float)
-    x = rolling_median(x_raw, 3)
-    y = rolling_median(y_raw, 3)
-    width = rolling_median(width_raw, 3)
-    height = np.maximum(rolling_median(height_raw, 3), 0.001)
+    smoothing = window_frames(FEATURE_TIME_WINDOWS_SECONDS["smoothing"], fps, odd=True)
+    rate_span = window_frames(FEATURE_TIME_WINDOWS_SECONDS["rate_span"], fps)
+    x = rolling_median(x_raw, smoothing)
+    y = rolling_median(y_raw, smoothing)
+    width = rolling_median(width_raw, smoothing)
+    height = np.maximum(rolling_median(height_raw, smoothing), 0.001)
     times = (frames - frames[0]) / fps
     duration = float(times[-1])
     if duration <= 0.0:
@@ -1028,12 +1098,8 @@ def track_features(
 
     delta_time = np.diff(times)
     delta_x = np.diff(x)
-    valid_delta = delta_time > 0.0
     local_rates = (
-        aspect_ratio
-        * delta_x[valid_delta]
-        / delta_time[valid_delta]
-        / max(median_height, 0.001)
+        aspect_ratio * lagged_rates(times, x, rate_span) / max(median_height, 0.001)
     )
     raw_proxy = (
         DEFAULT_PERSON_HEIGHT_M
@@ -1061,10 +1127,7 @@ def track_features(
     corrected_q = aspect_ratio * (corrected_x - 0.50) / height
     corrected_q_slope, _, _, _ = robust_line(times, corrected_q)
     corrected_local_rates = (
-        aspect_ratio
-        * corrected_delta_x[valid_delta]
-        / delta_time[valid_delta]
-        / max(median_height, 0.001)
+        aspect_ratio * lagged_rates(times, corrected_x, rate_span) / max(median_height, 0.001)
     )
     compensated_raw = (
         DEFAULT_PERSON_HEIGHT_M
@@ -1145,7 +1208,7 @@ def track_features(
         bottom_rate_abs=abs(float(bottom_slope)),
         edge_fraction=float(np.mean(edge)),
         truncation_fraction=float(np.mean(truncated)),
-        reversal_fraction=reversal_fraction(x),
+        reversal_fraction=reversal_fraction(x, rate_span),
         raw_speed_proxy_mps=float(raw_proxy),
         q_speed_proxy_mps=float(q_proxy),
         robust_speed_proxy_mps=float(robust_proxy),

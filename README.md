@@ -214,6 +214,7 @@ About three quarters of the real crossers that are missed are never detected by 
 | Road-surface crossing rules (`utils/crossing/waymo_segmentation_evaluation.py`) | `road_crossing` finds about twice as many real crossings | Yes, for counting |
 | Training the speed model on the feet-on-road crossings | Validation spread fell to 0.59 (limit 0.65) | No |
 | Camera motion from background optical flow instead of other objects' boxes | Lower-half points: −0.008 to −0.011 m/s, 95% interval includes zero; road-surface points: no gain | No |
+| Speed-feature windows defined in seconds instead of frames (smoothing, outlier cleaning, local-rate and reversal steps, camera-motion pairing), keeping every frame at the video's own frame rate | Identical features at Waymo's 10 fps; on real 30 fps CROWD tracks the 30 vs 10 fps mismatch of direction reversals halves (51% to 23%) and 23% more tracks get an agreeing speed at both rates | Yes |
 
 The remaining error comes mainly from the bounding boxes themselves (jitter, partial occlusion, and box height as a stand-in for distance). Further gains would likely need better boxes or a direct distance estimate, such as a monocular depth model, rather than parameter tuning.
 
