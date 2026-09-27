@@ -2120,6 +2120,51 @@ def _primary_time(
     )
 
 
+BBOX_SPEED_PREFIX = "speed_crossing_bbox"
+BBOX_TIME_PREFIX = "time_crossing_bbox"
+
+
+def _write_bbox_columns(
+    df_mapping_source: "pl.DataFrame",
+    avg_speed_locality: Optional[dict],
+    avg_speed_country: Optional[dict],
+    avg_time_locality: Optional[dict],
+    avg_time_country: Optional[dict],
+    pedestrian_cross_locality_source: dict,
+    pedestrian_cross_country_source: dict,
+) -> "pl.DataFrame":
+    """Write the bounding-box speed and time into their own columns.
+
+    ``speed_crossing_*`` and ``time_crossing_*`` hold the reported values,
+    which every figure reads; with segmentation_is_primary they are the
+    segmentation values. These ``*_bbox_*`` columns always hold the
+    bounding-box derivation, so it is never lost for comparison. A metric
+    passed as None leaves its columns untouched, and the columns being
+    rewritten are cleared first so no stale value survives.
+    """
+    prefixes = []
+    if avg_speed_locality is not None:
+        prefixes.append(BBOX_SPEED_PREFIX)
+    if avg_time_locality is not None:
+        prefixes.append(BBOX_TIME_PREFIX)
+    stale = [column for column in df_mapping_source.columns if column.startswith(tuple(prefixes))] if prefixes else []
+    if stale:
+        df_mapping_source = df_mapping_source.with_columns(
+            [pl.lit(None).cast(pl.Float64).alias(column) for column in stale]
+        )
+    return mapping_enrich.add_speed_and_time_to_mapping(
+        df_mapping=df_mapping_source,
+        avg_speed_locality=avg_speed_locality,
+        avg_speed_country=avg_speed_country,
+        avg_time_locality=avg_time_locality,
+        avg_time_country=avg_time_country,
+        pedestrian_cross_locality=pedestrian_cross_locality_source,
+        pedestrian_cross_country=pedestrian_cross_country_source,
+        speed_col_prefix=BBOX_SPEED_PREFIX,
+        time_col_prefix=BBOX_TIME_PREFIX,
+    )
+
+
 def _apply_segmentation_columns(
     df_mapping_source: "pl.DataFrame",
     segmentation: Dict[str, object],
@@ -2128,10 +2173,10 @@ def _apply_segmentation_columns(
 ) -> "pl.DataFrame":
     """Write the segmentation-derived metrics into their own columns.
 
-    The baseline ``speed_crossing_*`` and ``time_crossing_*`` columns are left
-    exactly as the motion-only calculation produced them. These columns carry
-    the same two quantities measured against the segmented carriageway, so the
-    two derivations can be compared city by city before either is preferred.
+    These ``*_seg_*`` columns carry the two quantities measured against the
+    segmented carriageway, next to the ``*_bbox_*`` columns with the
+    bounding-box derivation (see _write_bbox_columns), so the two can be
+    compared city by city whichever one ``speed_crossing_*`` reports.
     """
     if not segmentation:
         return df_mapping_source
@@ -3687,6 +3732,14 @@ if __name__ == "__main__":
         # Record the average speed and time of crossing on locality basis
         avg_speed_locality, all_speed_locality = metrics.avg_speed_of_crossing_locality(df_mapping, all_speed)
         avg_time_locality, all_time_locality = metrics.avg_time_to_start_cross_locality(df_mapping, all_time)
+        # The bounding-box averages, kept before segmentation_is_primary may
+        # replace the reported ones, for the *_bbox_* columns.
+        bbox_averages = {
+            "speed_locality": avg_speed_locality,
+            "speed_country": avg_speed_country,
+            "time_locality": avg_time_locality,
+            "time_country": avg_time_country,
+        }
 
         # Kill the program if there is no data to analyse
         if len(avg_time_locality) == 0 or len(avg_speed_locality) == 0:
@@ -3701,8 +3754,9 @@ if __name__ == "__main__":
         # segments the crossing windows with SegFormer Cityscapes, derives the
         # interval each pedestrian actually spends on the carriageway, and
         # recomputes both metrics against it. The results are written to
-        # separate columns: the baseline is left untouched so the two can be
-        # compared before anything is switched over.
+        # separate speed_crossing_seg / time_crossing_seg columns, and the
+        # bounding-box values to speed_crossing_bbox / time_crossing_bbox,
+        # so the two can be compared whichever one is reported.
         # ------------------------------------------------------------------
         segmentation_output = segmentation_pass.run_segmentation_pass(
             df_mapping=df_mapping,
@@ -3766,9 +3820,10 @@ if __name__ == "__main__":
             # Every plot reads the crossing metrics out of results.pickle by
             # position, so making the segmentation values the reported ones is
             # a matter of substituting them here, before the pickle is
-            # written. The baseline stays available in the speed_crossing_seg
-            # and time_crossing_seg columns either way, so the two can still
-            # be compared after the switch.
+            # written. The bounding-box values stay available in the
+            # speed_crossing_bbox and time_crossing_bbox columns either way,
+            # and the segmentation values in speed_crossing_seg and
+            # time_crossing_seg, so the two can still be compared.
             #
             # This is off by default because the segmentation metrics do not
             # cover every crossing the baseline covers: a track is dropped
@@ -4487,6 +4542,15 @@ if __name__ == "__main__":
             pedestrian_cross_locality=pedestrian_cross_locality,
             pedestrian_cross_country=pedestrian_cross_country,
         )
+        df_mapping = _write_bbox_columns(
+            df_mapping,
+            bbox_averages["speed_locality"],
+            bbox_averages["speed_country"],
+            bbox_averages["time_locality"],
+            bbox_averages["time_country"],
+            pedestrian_cross_locality,
+            pedestrian_cross_country,
+        )
 
         min_max_speed = duration.get_duration_segment(all_speed, df_mapping, name="speed", duration=None)
         min_max_time = duration.get_duration_segment(all_time, df_mapping, name="time", duration=None)
@@ -4594,6 +4658,10 @@ if __name__ == "__main__":
         # if any still expects pandas, convert inside those functions (not here).
         avg_speed_country, all_speed_country = metrics.avg_speed_of_crossing_country(df_mapping, all_speed)
         avg_speed_locality, all_speed_locality = metrics.avg_speed_of_crossing_locality(df_mapping, all_speed)
+        df_mapping = _write_bbox_columns(
+            df_mapping, avg_speed_locality, avg_speed_country, None, None,
+            pedestrian_cross_locality, pedestrian_cross_country,
+        )
         (
             avg_speed_locality,
             avg_speed_country,
@@ -4664,6 +4732,10 @@ if __name__ == "__main__":
     if common.get_configs("reanalyse_waiting_time"):
         avg_time_country, all_time_country = metrics.avg_time_to_start_cross_country(df_mapping, all_time)
         avg_time_locality, all_time_locality = metrics.avg_time_to_start_cross_locality(df_mapping, all_time)
+        df_mapping = _write_bbox_columns(
+            df_mapping, None, None, avg_time_locality, avg_time_country,
+            pedestrian_cross_locality, pedestrian_cross_country,
+        )
         (
             avg_time_locality,
             avg_time_country,
