@@ -178,6 +178,46 @@ The file server credentials (`ftp_username`, `ftp_password`, `ftp_token`) in `se
 For working with external APIs of [VideoFiles](https://files.mobility-squad.com/), [GeoNames](https://www.geonames.org), [BEA](https://apps.bea.gov/api/signup), [TomTom](https://developer.tomtom.com/user/register), [Trafikab](https://www.trafiklab.se/api/trafiklab-apis), and [Numbeo](https://www.numbeo.com/common/api.jsp) (paid), the API keys need to be placed in file `secret` (no extension) in the root of the project. The file needs to be formatted as `default.secret`. These keys are optional for just running the analysis on the dataset, except for the file server credentials needed by the segmentation pass.
 
 
+### Waymo calibration: current results and what was tried
+Crossing speeds are reported in m/s by a speed model calibrated on the [Waymo Open Dataset](https://waymo.com/open/), whose lidar-derived pedestrian speeds serve as the reference. The analysis refuses to run without a qualified model rather than falling back to a relative index. When `process_waymo_if_missing` is enabled, the raw Waymo TFRecords are exported (in Docker if available, otherwise in a local `uv` environment), tracked with YOLO and BoT-SORT at `yolo_imgsz`, and the speed model is fitted on the Waymo training split and tested once on the untouched validation split. The model is only used when it passes both the cross-validation and the external validation checks.
+
+**Current result** (640 px tracking, speed model trained on the CROWD detector's crossings):
+
+| | Tracks | MAE | RMSE | Bias | Within 0.50 m/s |
+|---|---|---|---|---|---|
+| Development, source-grouped cross-validation | 166 | 0.19 m/s | 0.26 m/s | −0.02 m/s | 95.18% |
+| Untouched validation | 27 | 0.13 m/s | 0.21 m/s | −0.05 m/s | 96.30% |
+
+City averages are close to unbiased; individual crossings are typically off by 0.1–0.2 m/s, and estimates are compressed towards the mean (slow walkers read too fast, fast walkers too slow), so differences between cities are understated but their order is kept. With 27 validation tracks the validation MAE carries an uncertainty of about ±0.03–0.04 m/s.
+
+**Crossing detection**, scored against Waymo's crosswalk-crossing labels (which cover marked crosswalks only, so precision is a lower bound; hand audits found about half of the "wrong" picks to be real crossings elsewhere):
+
+| Rule | Recall, training | Recall, validation | Precision (lower bound) |
+|---|---|---|---|
+| CROWD detector | 139 / 918 (15%) | 19 / 183 (10%) | 65% / 58% |
+| Detector with feet on the road | 139 / 918 (15%) | 19 / 183 (10%) | 70% / 59% |
+| `road_crossing` (used to count crossings) | 232 / 918 (25%) | 51 / 183 (28%) | 49% / 49% |
+
+About three quarters of the real crossers that are missed are never detected by YOLO at all (small, distant pedestrians). On the validation split, speeds of `road_crossing` crossings have an MAE of 0.15 m/s, against 0.11 m/s for the detector's crossings.
+
+**What was tried**, all on the Waymo training split first and confirmed on the untouched validation split only once:
+
+| Change | Result | Kept |
+|---|---|---|
+| Other speed models (random forest, gradient boosting, ridge, a single physics feature) | MAE 0.176–0.191 m/s vs 0.187 m/s; the model type is not the bottleneck | No |
+| More training data of the same kind | Training on 25% of recordings scored the same as 100% | — |
+| Stricter reliability gates (longer, steadier tracks; camera nearly still) | Error 15–25% lower, but a third to a half fewer crossings get a speed | No (trade-off) |
+| Broad evaluation on every laterally moving pedestrian (`utils/crossing/waymo_broad_evaluation.py`) | The model is weak outside crossing-like tracks (r ≈ 0.2), so crossing selection is essential | Evaluation tool only |
+| YOLO input 1280 px instead of 640 px | 40% more real crossers matched and 12% more found, but the speed model's validation spread fell to 0.49 (limit 0.65) | No |
+| Worst-source gate judged only on sources with 3+ reliable tracks | A single well-detected runner no longer blocks every model; 640 px qualifies under both versions | Yes |
+| Road-surface speed (feet-on-road frames only) | Same accuracy as whole-track speed (0.138 vs 0.138 m/s on the same crossers) | No |
+| Road-surface crossing rules (`utils/crossing/waymo_segmentation_evaluation.py`) | `road_crossing` finds about twice as many real crossings | Yes, for counting |
+| Training the speed model on the feet-on-road crossings | Validation spread fell to 0.59 (limit 0.65) | No |
+| Camera motion from background optical flow instead of other objects' boxes | Lower-half points: −0.008 to −0.011 m/s, 95% interval includes zero; road-surface points: no gain | No |
+
+The remaining error comes mainly from the bounding boxes themselves (jitter, partial occlusion, and box height as a stand-in for distance). Further gains would likely need better boxes or a direct distance estimate, such as a monocular depth model, rather than parameter tuning.
+
+
 ## Contact
 If you have any questions or suggestions, feel free to reach out to md_shadab_alam@outlook.com or pavlo.bazilinskyy@gmail.com.
 
