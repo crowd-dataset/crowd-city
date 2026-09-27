@@ -117,6 +117,7 @@ Configuration of the project is defined in `config`. Every value is read from `c
 - **`process_waymo_if_missing`**: When `true`, the processed Waymo data is generated from `waymo_dataset_path` if it does not exist yet.
 - **`min_max_videos`**: Number of fastest and slowest crossings for which video snippets are produced; `0` disables this.
 - **`bbox_tracker`**: Tracker configuration file for YOLO tracking, used by `helper_script.py`.
+- **`yolo_imgsz`**: Input size in pixels YOLO resizes each frame to when tracking the Waymo calibration videos (640). Each tracking CSV records the size it was made with, and changing this re-tracks the videos and rebuilds the speed model, since a speed model only fits tracks made with the same settings. 1280 finds more small, distant pedestrians, but its speed model failed the untouched validation test, so 640 is used.
 - **`cpu_worker`**: Number of worker processes used to analyse detection files in parallel (also overridable with the `CROWD_CSV_WORKERS` environment variable).
 - **`reanalyse_waiting_time`**: Recompute the crossing initiation time aggregates from the cached per-track values, for example after changing `min_waiting_time` or `max_waiting_time`.
 - **`min_waiting_time`**: Minimum crossing initiation time, in seconds, for a crossing to be included.
