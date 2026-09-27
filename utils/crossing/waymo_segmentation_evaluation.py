@@ -149,7 +149,10 @@ def _evaluate_sequence(
             if prediction.get("speed_status") == "valid":
                 bbox_speed = float(prediction["estimated_speed_mps"])
 
-        flags = road_crossing_flags(track, interval, features_by_track.get(track_id), minimum_x_range)
+        track_features = features_by_track.get(track_id)
+        flags = road_crossing_flags(
+            track, interval, None if track_features is None else track_features.log_height_rate_abs, minimum_x_range,
+        )
         rows.append(
             {
                 "split": split,

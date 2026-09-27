@@ -27,6 +27,8 @@ _WORKER_MIN_CONFIDENCE: float = 0.0
 _WORKER_BOUNDARY_LEFT: float = 0.45
 _WORKER_BOUNDARY_RIGHT: float = 0.55
 _WORKER_PROCESSING_FPS: Optional[float] = None
+# "detector" or "road_crossing"; see utils/crossing/road_crossing.py.
+_WORKER_CROSSING_RULE: str = "detector"
 
 _DETECTION = Detection()
 _METRICS = Metrics()
@@ -72,6 +74,7 @@ def initialise_csv_worker(
     global _WORKER_BOUNDARY_LEFT
     global _WORKER_BOUNDARY_RIGHT
     global _WORKER_PROCESSING_FPS
+    global _WORKER_CROSSING_RULE
 
     _WORKER_MAPPING = mapping
     _WORKER_CROSSING_PARAMETERS = dict(crossing_parameters or {})
@@ -81,6 +84,7 @@ def initialise_csv_worker(
     _WORKER_PROCESSING_FPS = _normalise_processing_fps(
         common.get_configs("processing_fps")
     )
+    _WORKER_CROSSING_RULE = str(common.get_configs("crossing_rule"))
 
     # The Waymo speed model is loaded in the parent before the worker pool
     # starts. Copy the already loaded model state into each spawned process so
@@ -557,6 +561,62 @@ def _limit_detection_duration(
     )
 
 
+def _road_crossing_candidates(
+    mapping: pl.DataFrame,
+    df: pl.DataFrame,
+    track_index: TrackIndex,
+    source_id: str,
+    fps: float,
+) -> Dict[str, Any]:
+    """Find rule-D candidates and their metrics, before segmentation.
+
+    Rule D (utils/crossing/road_crossing.py) is decided after segmentation in
+    the parent process, but only for these candidates, so their crossing
+    duration, speed and waiting time are computed here with exactly the code
+    and frozen speed model the detector's picks use.
+    """
+    from utils.crossing.road_crossing import box_only_candidates, longest_track_run
+
+    rows = crossing_metrics_module.bbox_rows_from_polars(df)
+    person_tracks = crossing_metrics_module.group_tracks(
+        row for row in rows if row.class_id == crossing_metrics_module.PERSON_CLASS_ID
+    )
+    trimmed = {}
+    for track_id, track_rows in person_tracks.items():
+        run = longest_track_run([row.frame for row in track_rows], fps)
+        if run is not None:
+            trimmed[track_id] = crossing_metrics_module.trim_rows_to_frame_range(track_rows, *run)
+    aspect_ratio = crossing_metrics_module.safe_float(os.environ.get("CROWD_BBOX_ASPECT_RATIO"))
+    if aspect_ratio is None or aspect_ratio <= 0.0:
+        aspect_ratio = crossing_metrics_module.DEFAULT_ASPECT_RATIO
+    features = crossing_metrics_module.contextual_track_features(
+        trimmed,
+        float(fps),
+        source_id,
+        float(aspect_ratio),
+        crossing_metrics_module.build_scene_motion_profile(rows, float(fps)),
+    )
+    ids, bounds, size_rates = box_only_candidates(
+        track_index,
+        features,
+        fps,
+        float(_WORKER_CROSSING_PARAMETERS["min_crossing_x_range"]),
+    )
+    temp_data = _time_to_cross_from_track_index(track_index, ids, fps, bounds)
+    return {
+        "ids": ids,
+        "id_bounds": bounds,
+        "size_rates": size_rates,
+        "temp_data": temp_data,
+        "speed_value": _METRICS.calculate_speed_of_crossing(
+            mapping, df, {source_id: temp_data}, id_bounds=bounds,
+        ),
+        "time_value": _time_to_start_from_track_index(
+            mapping, track_index, list(temp_data.keys()), source_id, fps, bounds,
+        ),
+    }
+
+
 def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
     """Read and analyse one detection file, returning compact mergeable results."""
     mapping = _WORKER_MAPPING
@@ -631,6 +691,7 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
         temp_data: Dict[Any, Any] = {}
         speed_value = None
         time_value = None
+        road_candidates = None
 
         if is_bbox_stream:
             crossing_parameters = dict(_WORKER_CROSSING_PARAMETERS)
@@ -682,6 +743,11 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 id_bounds,
             )
 
+            if _WORKER_CROSSING_RULE == "road_crossing":
+                road_candidates = _road_crossing_candidates(
+                    mapping, df, track_index, filename_no_ext, fps,
+                )
+
         return {
             "status": "ok",
             "file_name": file_name,
@@ -694,6 +760,7 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "temp_data": temp_data,
             "speed_value": speed_value,
             "time_value": time_value,
+            "road_candidates": road_candidates,
             "object_counts": object_counts,
             "metric_counts": metric_counts,
             "time_video": float(time_video or 0),

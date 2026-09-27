@@ -1823,6 +1823,7 @@ CACHE_CONFIG_KEYS: tuple[str, ...] = (
     "max_footage_hours_per_city",
     "processing_fps",
     "vehicles_analyse",
+    "crossing_rule",
     # Segmentation settings change the derived crossing metrics, so a cached
     # run must not silently reuse values computed under different ones.
     "use_segmentation",
@@ -2427,6 +2428,91 @@ def _run_integrated_speed_reporting(
         logger.error(f"Integrated crossing speed reporting failed: {error}")
 
 
+CROSSING_RULES = ("detector", "road_crossing")
+
+
+def _crossing_rule() -> str:
+    """Return the configured crossing rule, stopping on an unusable setting.
+
+    ``detector`` counts the CROWD detector's picks. ``road_crossing`` counts
+    rule D from utils/crossing/road_crossing.py, which needs road-surface
+    segmentation, so it refuses to run without it instead of silently
+    counting crossings another way.
+    """
+    rule = str(common.get_configs("crossing_rule"))
+    if rule not in CROSSING_RULES:
+        logger.error(f"crossing_rule must be one of {CROSSING_RULES}, not {rule!r}.")
+        sys.exit(1)
+    if rule == "road_crossing" and not common.get_configs("use_segmentation"):
+        logger.error(
+            "crossing_rule is 'road_crossing', which decides crossings from the road "
+            "surface under each pedestrian, but use_segmentation is false in config."
+        )
+        sys.exit(1)
+    return rule
+
+
+def _filter_nested_ids(nested: Optional[dict], stem: str, keep: set) -> Optional[dict]:
+    """Keep only ``keep`` ids of ``stem`` in a ``{locality: {stem: {id: value}}}`` value."""
+    if not nested:
+        return None
+    output = {}
+    for outer_key, videos in nested.items():
+        values = {
+            track_id: value
+            for track_id, value in (videos.get(stem) or {}).items()
+            if crossing_metrics_module.normalise_id(track_id) in keep
+        }
+        if values:
+            output[outer_key] = {stem: values}
+    return output or None
+
+
+def _apply_road_crossing_rule(
+    selected: Dict[str, list],
+    road_candidates: Dict[str, dict],
+    stem_locality: Dict[str, int],
+    pedestrian_crossing_count: dict,
+    pedestrian_crossing_count_all: dict,
+    data: dict,
+    aggregate_by_locality: dict,
+) -> tuple:
+    """Make rule D's crossings the counted ones, in place of the detector's.
+
+    Every structure the rest of the analysis reads (crossing ids and their
+    frame bounds, crossing durations, per-city crossing counts, speeds and
+    waiting times) is rebuilt from the rule-D selection, so nothing downstream
+    needs to know which rule produced it. Returns the new all_speed and
+    all_time.
+    """
+    for bucket in aggregate_by_locality.values():
+        bucket["total_crossing_detect"] = 0
+    all_speed: dict = {}
+    all_time: dict = {}
+    for stem in pedestrian_crossing_count:
+        payload = road_candidates.get(stem) or {}
+        chosen = list(selected.get(stem, []))
+        keep = {crossing_metrics_module.normalise_id(track_id) for track_id in chosen}
+        bounds = payload.get("id_bounds") or {}
+        pedestrian_crossing_count[stem] = {
+            "ids": chosen,
+            "id_bounds": {track_id: bounds[track_id] for track_id in chosen if track_id in bounds},
+        }
+        pedestrian_crossing_count_all[stem] = {"ids": list(payload.get("ids") or [])}
+        data[stem] = {
+            track_id: value
+            for track_id, value in (payload.get("temp_data") or {}).items()
+            if crossing_metrics_module.normalise_id(track_id) in keep
+        }
+        if stem in stem_locality and stem_locality[stem] in aggregate_by_locality:
+            aggregate_by_locality[stem_locality[stem]]["total_crossing_detect"] += len(chosen)
+        for source, target in ((payload.get("speed_value"), all_speed), (payload.get("time_value"), all_time)):
+            filtered = _filter_nested_ids(source, stem, keep)
+            for outer_key, inner in (filtered or {}).items():
+                target.setdefault(outer_key, {}).update(inner)
+    return all_speed, all_time
+
+
 def _prepare_waymo_tuned_parameters() -> Dict[str, object]:
     """Prepare or load the frozen Waymo model before CROWD CSV analysis.
 
@@ -2513,6 +2599,8 @@ if __name__ == "__main__":
     )
 
     waymo_crossing_parameters = _prepare_waymo_tuned_parameters()
+    crossing_rule = _crossing_rule()
+    logger.info(f"Crossing rule: {crossing_rule}.")
     city_limit = _normalise_city_limit(common.get_configs("n_cities"))
 
     current_cache_config = _current_cache_config()
@@ -3382,6 +3470,10 @@ if __name__ == "__main__":
         )
 
         aggregate_by_locality = {}
+        # Rule-D candidates per detection segment, and the locality each
+        # segment belongs to (used only when crossing_rule is road_crossing).
+        road_candidates: Dict[str, dict] = {}
+        stem_locality: Dict[str, int] = {}
 
         pipeline_model = dict(
             getattr(crossing_metrics_module, "_PIPELINE_MODEL", {}) or {}
@@ -3447,6 +3539,9 @@ if __name__ == "__main__":
                 }
                 data[filename_no_ext] = temp_data
                 bucket["total_crossing_detect"] += len(ids)
+                stem_locality[filename_no_ext] = locality_id
+                if result.get("road_candidates") is not None:
+                    road_candidates[filename_no_ext] = result["road_candidates"]
 
                 speed_value = result["speed_value"]
                 if speed_value is not None:
@@ -3491,6 +3586,26 @@ if __name__ == "__main__":
                     desc="Analysing detection files",
                 ):
                     merge_worker_result(result)
+
+        if crossing_rule == "road_crossing":
+            # Rule D decides the crossings from the road surface under each
+            # candidate's feet, so it runs here, before any count, speed or
+            # waiting time is aggregated from the detector's picks.
+            road_selected = segmentation_pass.select_road_crossings(
+                df_mapping,
+                csv_tasks,
+                road_candidates,
+                waymo_crossing_parameters,
+            )
+            all_speed, all_time = _apply_road_crossing_rule(
+                road_selected,
+                road_candidates,
+                stem_locality,
+                pedestrian_crossing_count,
+                pedestrian_crossing_count_all,
+                data,
+                aggregate_by_locality,
+            )
 
         if aggregate_by_locality:
             update_rows = []

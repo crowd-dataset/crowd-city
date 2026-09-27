@@ -1539,6 +1539,10 @@ def refresh_waymo_diagnostic_figures(
     return figures
 
 
+def _size_rate(features: Any) -> Optional[float]:
+    return None if features is None else float(features.log_height_rate_abs)
+
+
 def _road_selections(
     sequences: Sequence[SequenceData],
     detected_by_source: Mapping[str, set[str]],
@@ -1581,7 +1585,9 @@ def _road_selections(
         road_crossings[sequence.source_id] = {
             track_id
             for track_id, track in tracks.items()
-            if road_crossing_flags(track, intervals.get(track_id), features.get(track_id), minimum_x_range)[
+            if road_crossing_flags(
+                track, intervals.get(track_id), _size_rate(features.get(track_id)), minimum_x_range,
+            )[
                 "road_crossing"
             ]
         }

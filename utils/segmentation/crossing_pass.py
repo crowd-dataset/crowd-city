@@ -50,6 +50,10 @@ from utils.segmentation.surface import (
 
 
 logger = CustomLogger(__name__)
+# Largest share of segments whose road surface may fail to be read before
+# the road-crossing selection stops. Failed segments would simply lose their
+# crossings, biasing the cities they belong to, so beyond this the run stops.
+MAXIMUM_FAILED_SEGMENT_SHARE = 0.05
 grouping = Grouping()
 
 
@@ -105,36 +109,25 @@ def _crossing_tracks(
     return tracks
 
 
-def run_segmentation_pass(
+def _segmentation_pipeline(
     df_mapping: pl.DataFrame,
-    detection_tasks: Sequence[Mapping[str, Any]],
-    crossing_ids: Mapping[str, Mapping[str, Any]],
     crossing_parameters: Mapping[str, Any],
-) -> Dict[str, Any]:
-    """Return road-restricted speed and hesitation time, wrapped by locality.
+) -> Optional[SegmentationPipeline]:
+    """Build the CROWD segmentation pipeline from config, or return None.
 
-    Both outputs use the same nested ``{locality_condition: {video: {track:
-    value}}}`` shape as the baseline metrics, so the existing aggregation and
-    plotting paths can consume them unchanged. The hesitation values are in
-    seconds rather than sample counts.
+    Shared by the road-crossing selection and the segmentation metric pass so
+    both read the same store with the same settings.
     """
-    empty: Dict[str, Any] = {
-        "seg_speed": {},
-        "seg_time": {},
-        "diagnostics": Counter(),
-        "enabled": False,
-    }
-
     if not bool(_config("use_segmentation")):
         logger.info("Segmentation-based crossing metrics are disabled in the configuration.")
-        return empty
+        return None
 
     if not segmentation_is_available():
         logger.error(
             "use_segmentation is enabled but torch/transformers are unavailable; "
             "skipping the segmentation pass."
         )
-        return empty
+        return None
 
     root = configured_segmentation_root()
     if not root:
@@ -142,12 +135,12 @@ def run_segmentation_pass(
             "use_segmentation is enabled but 'seg_data' is not configured; "
             "skipping the segmentation pass."
         )
-        return empty
+        return None
 
     store = SurfaceStore(root)
     if not store.available:
         logger.error(f"Segmentation store {root} could not be opened; skipping the pass.")
-        return empty
+        return None
 
     coarse_hz = float(_config("segmentation_coarse_hz"))
     refine_hz = float(_config("segmentation_refine_hz"))
@@ -176,6 +169,7 @@ def run_segmentation_pass(
                 "boundary_left": _config("boundary_left"),
                 "boundary_right": _config("boundary_right"),
                 "processing_fps": _config("processing_fps"),
+                "crossing_rule": _config("crossing_rule"),
             }
         ),
     )
@@ -203,7 +197,7 @@ def run_segmentation_pass(
         token=_secret("ftp_token"),
     )
 
-    pipeline = SegmentationPipeline(
+    return SegmentationPipeline(
         store=store,
         segmenter=segmenter,
         settings=settings,
@@ -212,6 +206,32 @@ def run_segmentation_pass(
         refine_hz=refine_hz,
         minimum_confidence=minimum_confidence,
     )
+
+
+def run_segmentation_pass(
+    df_mapping: pl.DataFrame,
+    detection_tasks: Sequence[Mapping[str, Any]],
+    crossing_ids: Mapping[str, Mapping[str, Any]],
+    crossing_parameters: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Return road-restricted speed and hesitation time, wrapped by locality.
+
+    Both outputs use the same nested ``{locality_condition: {video: {track:
+    value}}}`` shape as the baseline metrics, so the existing aggregation and
+    plotting paths can consume them unchanged. The hesitation values are in
+    seconds rather than sample counts.
+    """
+    empty: Dict[str, Any] = {
+        "seg_speed": {},
+        "seg_time": {},
+        "diagnostics": Counter(),
+        "enabled": False,
+    }
+    pipeline = _segmentation_pipeline(df_mapping, crossing_parameters)
+    if pipeline is None:
+        return empty
+    coarse_hz, refine_hz = pipeline.coarse_hz, pipeline.refine_hz
+    segmenter = pipeline.segmenter
 
     tasks_by_stem = {
         str(task["filename_no_ext"]): task
@@ -298,6 +318,138 @@ def run_segmentation_pass(
     }
 
 
+def _prepared_detections(task: Mapping[str, Any]) -> Tuple[pl.DataFrame, float, int]:
+    """Read one detection file exactly as the detection worker prepared it.
+
+    Otherwise the frame numbers the crossing ids refer to would not line up
+    with the video timestamps derived from them. Returns the detections, the
+    effective frame rate and the first source frame, which resampling
+    renumbers relative to and which is needed to put frames back on video time.
+    """
+    detections = _read_confidence_filtered(str(task["file_path"]))
+    detections = _limit_detection_duration(
+        detections,
+        float(task.get("time_video", 0.0) or 0.0),
+        float(task["fps"]),
+    )
+    first_source_frame = (
+        detections.get_column("frame-count").cast(pl.Float64, strict=False).min()
+        if detections.height and "frame-count" in detections.columns
+        else None
+    )
+    detections, effective_fps = _resample_detection_fps(
+        detections,
+        float(task["fps"]),
+        csv_parallel._WORKER_PROCESSING_FPS,
+    )
+    return detections, float(effective_fps), int(first_source_frame or 0)
+
+
+def _segment_request(
+    task: Mapping[str, Any],
+    stem: str,
+    effective_fps: float,
+    first_source_frame: int,
+    tracks: Dict[str, pl.DataFrame],
+) -> SegmentRequest:
+    return SegmentRequest(
+        stem=stem,
+        video_id=str(task["video_id"]),
+        start_seconds=float(task["start_index"]),
+        detection_fps=float(effective_fps),
+        tracks=tracks,
+        source_fps=float(task["fps"]),
+        first_source_frame=int(first_source_frame),
+    )
+
+
+def select_road_crossings(
+    df_mapping: pl.DataFrame,
+    detection_tasks: Sequence[Mapping[str, Any]],
+    candidates: Mapping[str, Mapping[str, Any]],
+    crossing_parameters: Mapping[str, Any],
+) -> Dict[str, List[Any]]:
+    """Return, per detection segment, the candidates that satisfy rule D.
+
+    ``candidates`` is ``{stem: {"ids", "id_bounds", "size_rates", ...}}`` from
+    the detection workers (see utils/crossing/road_crossing.py). Every
+    candidate is segmented through the same store as the metric pass, which
+    later reuses these labels. Rule D needs to know where the feet are, so if
+    segmentation cannot run this raises rather than silently counting
+    crossings another way.
+    """
+    from utils.crossing.road_crossing import road_crossing_flags
+
+    pipeline = _segmentation_pipeline(df_mapping, crossing_parameters)
+    if pipeline is None:
+        raise RuntimeError(
+            "crossing_rule is 'road_crossing', which needs road-surface segmentation, "
+            "but the segmentation pipeline could not be set up (see the messages above)."
+        )
+    tasks_by_stem = {str(task["filename_no_ext"]): task for task in detection_tasks}
+    pending = sorted(
+        stem for stem, payload in candidates.items()
+        if (payload or {}).get("ids") and stem in tasks_by_stem
+    )
+    minimum_x_range = float(crossing_parameters["min_crossing_x_range"])
+    logger.info(
+        f"Selecting road crossings: segmenting {sum(len(candidates[stem]['ids']) for stem in pending)} "
+        f"candidate track(s) in {len(pending)} detection segment(s)."
+    )
+    selected: Dict[str, List[Any]] = {}
+    diagnostics: Counter = Counter()
+    try:
+        for stem in tqdm(pending, desc="Selecting road crossings"):
+            payload = candidates[stem]
+            task = tasks_by_stem[stem]
+            try:
+                detections, effective_fps, first_source_frame = _prepared_detections(task)
+                tracks = _crossing_tracks(detections, list(payload["ids"]), payload.get("id_bounds") or {})
+                if not tracks:
+                    diagnostics["candidate_tracks_missing"] += 1
+                    continue
+                timelines = pipeline.timelines(
+                    _segment_request(task, stem, effective_fps, first_source_frame, tracks)
+                )
+            except Exception as error:
+                logger.warning(f"Road-crossing selection failed for {stem}: {error}")
+                diagnostics["segment_exception"] += 1
+                continue
+            if not timelines:
+                diagnostics["no_surface_timeline"] += 1
+                continue
+            intervals = road_intervals_for_tracks(timelines)
+            rates = {str(key): value for key, value in (payload.get("size_rates") or {}).items()}
+            chosen = [
+                track_id
+                for track_id in payload["ids"]
+                if str(track_id) in tracks
+                and road_crossing_flags(
+                    tracks[str(track_id)], intervals.get(str(track_id)), rates.get(str(track_id)), minimum_x_range,
+                )["road_crossing"]
+            ]
+            if chosen:
+                selected[stem] = chosen
+    finally:
+        pipeline.close()
+    diagnostics.update(pipeline.statistics)
+    failed = diagnostics["segment_exception"] + diagnostics["no_surface_timeline"]
+    if pending and failed / len(pending) > MAXIMUM_FAILED_SEGMENT_SHARE:
+        raise RuntimeError(
+            f"The road surface could not be read for {failed} of {len(pending)} detection "
+            f"segments (more than {MAXIMUM_FAILED_SEGMENT_SHARE:.0%}), e.g. because the video "
+            "file server is unreachable. Stopping rather than undercounting crossings."
+        )
+    logger.info(
+        f"Road crossings selected: {sum(len(v) for v in selected.values())} track(s) in "
+        f"{len(selected)} segment(s), from {sum(len(candidates[stem]['ids']) for stem in pending)} candidates."
+    )
+    for reason, count in sorted(diagnostics.items(), key=lambda item: -item[1]):
+        if count:
+            logger.info(f"Road-crossing selection diagnostic: {reason}={count}.")
+    return selected
+
+
 def _process_segment(
     df_mapping: pl.DataFrame,
     pipeline: SegmentationPipeline,
@@ -310,27 +462,7 @@ def _process_segment(
     """Segment one detection segment and derive both metrics from it."""
     diagnostics: Counter = Counter()
 
-    # The detection rows must be prepared exactly as the detection worker
-    # prepared them, otherwise the frame numbers the crossing ids refer to
-    # would not line up with the video timestamps derived here.
-    detections = _read_confidence_filtered(str(task["file_path"]))
-    detections = _limit_detection_duration(
-        detections,
-        float(task.get("time_video", 0.0) or 0.0),
-        float(task["fps"]),
-    )
-    # Resampling renumbers frames relative to the first retained frame, so
-    # that origin is needed to put the renumbered frames back on video time.
-    first_source_frame = (
-        detections.get_column("frame-count").cast(pl.Float64, strict=False).min()
-        if detections.height and "frame-count" in detections.columns
-        else None
-    )
-    detections, effective_fps = _resample_detection_fps(
-        detections,
-        float(task["fps"]),
-        csv_parallel._WORKER_PROCESSING_FPS,
-    )
+    detections, effective_fps, first_source_frame = _prepared_detections(task)
     if detections.height == 0:
         diagnostics["empty_detection_file"] += 1
         return None
@@ -341,15 +473,7 @@ def _process_segment(
         return None
 
     timelines = pipeline.timelines(
-        SegmentRequest(
-            stem=stem,
-            video_id=str(task["video_id"]),
-            start_seconds=float(task["start_index"]),
-            detection_fps=float(effective_fps),
-            tracks=tracks,
-            source_fps=float(task["fps"]),
-            first_source_frame=int(first_source_frame or 0),
-        )
+        _segment_request(task, stem, effective_fps, first_source_frame, tracks)
     )
     if not timelines:
         diagnostics["no_surface_timeline"] += 1
