@@ -10,7 +10,8 @@ segments that actually contain a crossing.
 from __future__ import annotations
 
 from collections import Counter
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import polars as pl
 from tqdm import tqdm
@@ -259,24 +260,26 @@ def run_segmentation_pass(
     raw_time: Dict[str, Dict[str, float]] = {}
     diagnostics: Counter = Counter()
 
+    def measure_one(stem: str) -> Any:
+        try:
+            return _process_segment(
+                df_mapping=df_mapping,
+                pipeline=pipeline,
+                task=tasks_by_stem[stem],
+                stem=stem,
+                track_ids=list(crossing_ids[stem]["ids"]),
+                checks_per_second=checks_per_second,
+                id_bounds=crossing_ids[stem].get("id_bounds") or {},
+            )
+        except Exception as error:
+            logger.warning(f"Segmentation failed for {stem}: {error}")
+            return "segment_exception"
+
     try:
-        for stem in tqdm(sorted(pending), desc="Segmenting crossing windows"):
-            task = tasks_by_stem[stem]
-            try:
-                result = _process_segment(
-                    df_mapping=df_mapping,
-                    pipeline=pipeline,
-                    task=task,
-                    stem=stem,
-                    track_ids=list(crossing_ids[stem]["ids"]),
-                    checks_per_second=checks_per_second,
-                    id_bounds=crossing_ids[stem].get("id_bounds") or {},
-                )
-            except Exception as error:
-                logger.warning(f"Segmentation failed for {stem}: {error}")
+        for stem, result in _parallel_segments(measure_one, sorted(pending), "Segmenting crossing windows"):
+            if result == "segment_exception":
                 diagnostics["segment_exception"] += 1
                 continue
-
             if result is None:
                 continue
 
@@ -316,6 +319,24 @@ def run_segmentation_pass(
         "diagnostics": diagnostics,
         "enabled": True,
     }
+
+
+def _parallel_segments(
+    function: Callable[[str], Any],
+    stems: Sequence[str],
+    description: str,
+) -> Iterator[Tuple[str, Any]]:
+    """Run ``function`` on every stem, ``segmentation_parallel_videos`` at a time.
+
+    Reading a window is almost entirely waiting on the file server, so several
+    segments are read at once; the pipeline serialises the GPU model itself.
+    Results are yielded in completion order with a progress bar.
+    """
+    workers = max(1, int(_config("segmentation_parallel_videos")))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(function, stem): stem for stem in stems}
+        for future in tqdm(as_completed(futures), total=len(futures), desc=description):
+            yield futures[future], future.result()
 
 
 def _prepared_detections(task: Mapping[str, Any]) -> Tuple[pl.DataFrame, float, int]:
@@ -396,40 +417,42 @@ def select_road_crossings(
         f"Selecting road crossings: segmenting {sum(len(candidates[stem]['ids']) for stem in pending)} "
         f"candidate track(s) in {len(pending)} detection segment(s)."
     )
+
+    def select_one(stem: str) -> Tuple[str, Any]:
+        payload = candidates[stem]
+        task = tasks_by_stem[stem]
+        try:
+            detections, effective_fps, first_source_frame = _prepared_detections(task)
+            tracks = _crossing_tracks(detections, list(payload["ids"]), payload.get("id_bounds") or {})
+            if not tracks:
+                return "diagnostic", "candidate_tracks_missing"
+            timelines = pipeline.timelines(
+                _segment_request(task, stem, effective_fps, first_source_frame, tracks)
+            )
+        except Exception as error:
+            logger.warning(f"Road-crossing selection failed for {stem}: {error}")
+            return "diagnostic", "segment_exception"
+        if not timelines:
+            return "diagnostic", "no_surface_timeline"
+        intervals = road_intervals_for_tracks(timelines)
+        rates = {str(key): value for key, value in (payload.get("size_rates") or {}).items()}
+        return "selected", [
+            track_id
+            for track_id in payload["ids"]
+            if str(track_id) in tracks
+            and road_crossing_flags(
+                tracks[str(track_id)], intervals.get(str(track_id)), rates.get(str(track_id)), minimum_x_range,
+            )["road_crossing"]
+        ]
+
     selected: Dict[str, List[Any]] = {}
     diagnostics: Counter = Counter()
     try:
-        for stem in tqdm(pending, desc="Selecting road crossings"):
-            payload = candidates[stem]
-            task = tasks_by_stem[stem]
-            try:
-                detections, effective_fps, first_source_frame = _prepared_detections(task)
-                tracks = _crossing_tracks(detections, list(payload["ids"]), payload.get("id_bounds") or {})
-                if not tracks:
-                    diagnostics["candidate_tracks_missing"] += 1
-                    continue
-                timelines = pipeline.timelines(
-                    _segment_request(task, stem, effective_fps, first_source_frame, tracks)
-                )
-            except Exception as error:
-                logger.warning(f"Road-crossing selection failed for {stem}: {error}")
-                diagnostics["segment_exception"] += 1
-                continue
-            if not timelines:
-                diagnostics["no_surface_timeline"] += 1
-                continue
-            intervals = road_intervals_for_tracks(timelines)
-            rates = {str(key): value for key, value in (payload.get("size_rates") or {}).items()}
-            chosen = [
-                track_id
-                for track_id in payload["ids"]
-                if str(track_id) in tracks
-                and road_crossing_flags(
-                    tracks[str(track_id)], intervals.get(str(track_id)), rates.get(str(track_id)), minimum_x_range,
-                )["road_crossing"]
-            ]
-            if chosen:
-                selected[stem] = chosen
+        for stem, (kind, value) in _parallel_segments(select_one, pending, "Selecting road crossings"):
+            if kind == "diagnostic":
+                diagnostics[value] += 1
+            elif value:
+                selected[stem] = value
     finally:
         pipeline.close()
     diagnostics.update(pipeline.statistics)

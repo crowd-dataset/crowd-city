@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -101,7 +102,11 @@ class SegmentationPipeline:
         self.width_fraction = float(width_fraction)
         self.minimum_confidence = float(minimum_confidence)
         self._session: Optional[requests.Session] = None
-        self._last_frame_count = 0
+        # Several segments may be processed at once from worker threads: the
+        # lock guards shared counters and caches, the GPU lock serialises the
+        # model, and network reads run concurrently.
+        self._lock = threading.Lock()
+        self._gpu_lock = threading.Lock()
         self._unresolved: set[str] = set()
         self._video_fps: Dict[str, Optional[float]] = {}
         self.statistics: Dict[str, int] = {
@@ -129,16 +134,22 @@ class SegmentationPipeline:
             self._session = session
         return self._session
 
+    def _count(self, key: str, value: int = 1) -> None:
+        with self._lock:
+            self.statistics[key] += int(value)
+
     def close(self) -> None:
         if self._session is not None:
             self._session.close()
             self._session = None
 
     def _video_source(self, video_id: str) -> Optional[str]:
-        cached = self.store.cached_url(video_id)
+        with self._lock:
+            cached = self.store.cached_url(video_id)
+            unresolved = video_id in self._unresolved
         if cached:
             return cached
-        if video_id in self._unresolved or self.credentials is None:
+        if unresolved or self.credentials is None:
             return None
         url = resolve_video_url(
             video_id,
@@ -147,10 +158,12 @@ class SegmentationPipeline:
         )
         if url is None:
             logger.warning(f"Could not locate video {video_id} on the file server.")
-            self._unresolved.add(video_id)
-            self.statistics["videos_unresolved"] += 1
+            with self._lock:
+                self._unresolved.add(video_id)
+            self._count("videos_unresolved", 1)
             return None
-        self.store.store_url(video_id, url)
+        with self._lock:
+            self.store.store_url(video_id, url)
         return url
 
     def _clock(self, request: SegmentRequest, source: str) -> Optional[FrameClock]:
@@ -158,21 +171,25 @@ class SegmentationPipeline:
         source_fps = float(request.source_fps or request.detection_fps)
         if source_fps <= 0 or request.detection_fps <= 0:
             return None
-        if request.video_id not in self._video_fps:
+        with self._lock:
+            known = request.video_id in self._video_fps
+        if not known:
             probed = probe_video_fps(source, self.credentials)
             if probed is None:
-                self.statistics["videos_fps_unprobed"] += 1
+                self._count("videos_fps_unprobed", 1)
                 logger.warning(
                     f"Could not probe the frame rate of {request.video_id}; "
                     f"using {source_fps:g} fps from the file name."
                 )
             elif abs(probed - source_fps) > 1e-3:
-                self.statistics["videos_fps_fractional"] += 1
+                self._count("videos_fps_fractional", 1)
                 logger.debug(
                     f"{request.video_id} runs at {probed:.3f} fps; file name says {source_fps:g}."
                 )
-            self._video_fps[request.video_id] = probed
-        video_fps = self._video_fps[request.video_id] or source_fps
+            with self._lock:
+                self._video_fps[request.video_id] = probed
+        with self._lock:
+            video_fps = self._video_fps[request.video_id] or source_fps
         return FrameClock.for_segment(
             start_seconds=request.start_seconds,
             video_fps=video_fps,
@@ -193,12 +210,12 @@ class SegmentationPipeline:
         if self.store.is_current(request.stem, self.settings, track_ids):
             stored = self.store.read_index(request.stem)
             if stored is not None:
-                self.statistics["segments_reused"] += 1
+                self._count("segments_reused", 1)
                 return self._timelines_from_index(stored, track_ids)
 
         segmented = self._segment_request(request)
         if segmented is None:
-            self.statistics["segments_failed"] += 1
+            self._count("segments_failed", 1)
             return None
         samples, clock = segmented
 
@@ -217,7 +234,7 @@ class SegmentationPipeline:
                 "sample_count": len(samples),
             },
         )
-        self.statistics["segments_segmented"] += 1
+        self._count("segments_segmented", 1)
         return surface_timeline(samples)
 
     @staticmethod
@@ -273,19 +290,18 @@ class SegmentationPipeline:
         if not coarse_windows:
             return None
 
-        samples = self._sample_windows(
+        samples, frames_read = self._sample_windows(
             source, coarse_windows, self.coarse_hz, boxes, clock,
         )
-        self.statistics["frames_coarse"] += self._last_frame_count
+        self._count("frames_coarse", frames_read)
 
         refine_windows = self._refinement_windows(samples, clock)
         if refine_windows:
-            samples.extend(
-                self._sample_windows(
-                    source, refine_windows, self.refine_hz, boxes, clock,
-                )
+            refined, frames_read = self._sample_windows(
+                source, refine_windows, self.refine_hz, boxes, clock,
             )
-            self.statistics["frames_refine"] += self._last_frame_count
+            samples.extend(refined)
+            self._count("frames_refine", frames_read)
 
         return samples, clock
 
@@ -327,7 +343,7 @@ class SegmentationPipeline:
         cadence_hz: float,
         boxes: Dict[str, Tuple[np.ndarray, Dict[int, Tuple[float, float, float, float]]]],
         clock: FrameClock,
-    ) -> List[SurfaceSample]:
+    ) -> Tuple[List[SurfaceSample], int]:
         """Decode, segment and read the footpoint surface over ``windows``."""
         samples: List[SurfaceSample] = []
         frame_total = 0
@@ -345,9 +361,10 @@ class SegmentationPipeline:
             if len(frames) == 0:
                 continue
 
-            labels, confidence = self.segmenter.segment(frames)
+            with self._gpu_lock:
+                labels, confidence = self.segmenter.segment(frames)
             frame_total += int(len(frames))
-            self.statistics["frames_segmented"] += int(len(frames))
+            self._count("frames_segmented", int(len(frames)))
 
             for offset in range(len(frames)):
                 video_time = window.start_seconds + offset / cadence_hz
@@ -382,8 +399,7 @@ class SegmentationPipeline:
                         )
                     )
 
-        self._last_frame_count = frame_total
-        return samples
+        return samples, frame_total
 
     @staticmethod
     def _boxes_by_track(
@@ -473,7 +489,7 @@ class SegmentationPipeline:
                     f"than the {MAXIMUM_WINDOW_SECONDS:.0f}s ceiling for a "
                     "single crossing, likely a reused tracker id."
                 )
-                self.statistics["windows_too_long_dropped"] += 1
+                self._count("windows_too_long_dropped", 1)
                 continue
             kept.append(window)
         return kept

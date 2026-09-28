@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 from urllib.parse import urljoin
@@ -30,7 +31,19 @@ logger = CustomLogger(__name__)
 # answer "Unknown folder alias".
 SERVER_ALIASES = ("tue4", "tue5")
 FFMPEG_BINARY = "ffmpeg"
+# The file server returns transient 5XX errors and timeouts under load, so a
+# failed read is retried after these pauses (seconds) before giving up.
+READ_RETRY_PAUSES_SECONDS = (5.0, 15.0, 45.0)
+# A healthy window reads in seconds; a read still hanging after this has
+# stalled on the server, and a prompt retry recovers faster than waiting.
+WINDOW_READ_TIMEOUT_SECONDS = 180
+
+
 FFPROBE_BINARY = "ffprobe"
+
+
+class WindowReadError(RuntimeError):
+    """A video window could not be read even after retrying."""
 
 
 @dataclass(frozen=True)
@@ -109,7 +122,23 @@ class RemoteCredentials:
 # ---------------------------------------------------------------------
 
 def _probe(session: requests.Session, url: str, params, timeout: int) -> bool:
-    """Return whether ``url`` serves bytes and honours range requests."""
+    """Return whether ``url`` serves bytes, retrying transient server errors."""
+    for pause in (0.0,) + READ_RETRY_PAUSES_SECONDS:
+        if pause:
+            time.sleep(pause)
+        result = _probe_once(session, url, params, timeout)
+        if result is not None:
+            return result
+    logger.warning(f"The file server kept failing for {url}; treating it as unavailable.")
+    return False
+
+
+def _probe_once(session: requests.Session, url: str, params, timeout: int) -> Optional[bool]:
+    """Return whether ``url`` serves bytes and honours range requests.
+
+    None means the answer is unknown (a timeout, connection error or 5XX
+    reply), which is worth retrying; a 404 is a definite no.
+    """
     try:
         response = session.get(
             url,
@@ -120,9 +149,11 @@ def _probe(session: requests.Session, url: str, params, timeout: int) -> bool:
         )
     except requests.RequestException as error:
         logger.debug(f"Probe failed [{url}]: {error}")
-        return False
+        return None
 
     try:
+        if response.status_code >= 500:
+            return None
         if response.status_code not in (200, 206):
             return False
         if response.status_code == 200:
@@ -262,7 +293,7 @@ def extract_window_frames(
     width: int,
     height: int,
     credentials: Optional[RemoteCredentials] = None,
-    timeout: int = 600,
+    timeout: int = WINDOW_READ_TIMEOUT_SECONDS,
 ) -> np.ndarray:
     """Decode one window and return ``(n, height, width, 3)`` uint8 RGB frames.
 
@@ -298,29 +329,36 @@ def extract_window_frames(
         "-",
     ]
 
-    try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
+    completed = None
+    for attempt, pause in enumerate((0.0,) + READ_RETRY_PAUSES_SECONDS):
+        if pause:
+            time.sleep(pause)
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            problem = f"timed out after {timeout}s"
+        except FileNotFoundError as error:
+            raise WindowReadError(f"{FFMPEG_BINARY} was not found on PATH.") from error
+        else:
+            if completed.returncode == 0:
+                break
+            problem = completed.stderr.decode("utf-8", errors="replace").strip()
         logger.warning(
-            f"ffmpeg timed out extracting {window.duration_seconds:.1f}s at "
-            f"{window.start_seconds:.1f}s from {source}."
+            f"Reading {window.duration_seconds:.1f}s at {window.start_seconds:.1f}s of "
+            f"{source} failed (attempt {attempt + 1} of {len(READ_RETRY_PAUSES_SECONDS) + 1}): {problem}"
         )
-        return np.zeros((0, height, width, 3), dtype=np.uint8)
-    except FileNotFoundError:
-        logger.error(f"{FFMPEG_BINARY} was not found on PATH.")
-        return np.zeros((0, height, width, 3), dtype=np.uint8)
-
-    if completed.returncode != 0:
-        message = completed.stderr.decode("utf-8", errors="replace").strip()
-        logger.warning(
-            f"ffmpeg failed at {window.start_seconds:.1f}s of {source}: {message}"
+        completed = None
+    if completed is None:
+        # Raised rather than returning no frames, so the segment counts as
+        # failed and is never stored as if the window had nothing in it.
+        raise WindowReadError(
+            f"Could not read {window.duration_seconds:.1f}s at {window.start_seconds:.1f}s of {source}."
         )
-        return np.zeros((0, height, width, 3), dtype=np.uint8)
 
     frame_bytes = int(width) * int(height) * 3
     payload = completed.stdout
