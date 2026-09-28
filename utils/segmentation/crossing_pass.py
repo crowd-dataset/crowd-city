@@ -384,13 +384,29 @@ def _segment_request(
     )
 
 
+def check_failure_share(failed: int, attempted: int) -> None:
+    """Stop when the road surface could not be read for too many segments."""
+    if attempted and failed / attempted > MAXIMUM_FAILED_SEGMENT_SHARE:
+        raise RuntimeError(
+            f"The road surface could not be read for {failed} of {attempted} detection "
+            f"segments (more than {MAXIMUM_FAILED_SEGMENT_SHARE:.0%}), e.g. because the video "
+            "file server is unreachable. Stopping rather than undercounting crossings."
+        )
+
+
 def select_road_crossings(
     df_mapping: pl.DataFrame,
     detection_tasks: Sequence[Mapping[str, Any]],
     candidates: Mapping[str, Mapping[str, Any]],
     crossing_parameters: Mapping[str, Any],
+    failure_totals: Optional[List[int]] = None,
 ) -> Dict[str, List[Any]]:
     """Return, per detection segment, the candidates that satisfy rule D.
+
+    ``failure_totals``, when given, is a ``[failed, attempted]`` accumulator:
+    failures are added to it instead of being checked here, so a caller that
+    selects in several small batches can apply the failure limit to the whole
+    run with check_failure_share.
 
     ``candidates`` is ``{stem: {"ids", "id_bounds", "size_rates", ...}}`` from
     the detection workers (see utils/crossing/road_crossing.py). Every
@@ -457,12 +473,11 @@ def select_road_crossings(
         pipeline.close()
     diagnostics.update(pipeline.statistics)
     failed = diagnostics["segment_exception"] + diagnostics["no_surface_timeline"]
-    if pending and failed / len(pending) > MAXIMUM_FAILED_SEGMENT_SHARE:
-        raise RuntimeError(
-            f"The road surface could not be read for {failed} of {len(pending)} detection "
-            f"segments (more than {MAXIMUM_FAILED_SEGMENT_SHARE:.0%}), e.g. because the video "
-            "file server is unreachable. Stopping rather than undercounting crossings."
-        )
+    if failure_totals is not None:
+        failure_totals[0] += failed
+        failure_totals[1] += len(pending)
+    else:
+        check_failure_share(failed, len(pending))
     logger.info(
         f"Road crossings selected: {sum(len(v) for v in selected.values())} track(s) in "
         f"{len(selected)} segment(s), from {sum(len(candidates[stem]['ids']) for stem in pending)} candidates."

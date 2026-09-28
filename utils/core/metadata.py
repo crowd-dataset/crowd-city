@@ -24,6 +24,11 @@ class MetaData:
     # (video, start) of every detection file in the Parquet store; see
     # _available_detection_segments.
     _available_segments_cache: ClassVar[set | None] = None
+    # When set, only these (video, start) segments are indexed; see
+    # restrict_to_segments. None indexes every selected segment.
+    _allowed_segments: ClassVar[set | None] = None
+    # (video, start) -> (city key, position in that city's draw), per mapping.
+    _draw_orders: ClassVar[dict[int, dict[tuple[str, int], tuple[tuple[str, str, str, str], int]]]] = {}
 
     def __init__(self) -> None:
         pass
@@ -125,6 +130,27 @@ class MetaData:
         """Clear all cached mapping indexes."""
         cls._video_index_cache.clear()
         cls._available_segments_cache = None
+        cls._draw_orders.clear()
+
+    @classmethod
+    def restrict_to_segments(cls, segments: set[tuple[str, int]] | None) -> None:
+        """Index only ``segments`` from now on (None lifts the restriction).
+
+        Used once target_crossings_per_city has decided which footage was
+        processed, so every later count (footage time, objects, crossings per
+        hour) is taken over exactly that footage.
+        """
+        cls._allowed_segments = None if segments is None else {(str(v), int(s)) for v, s in segments}
+        cls.clear_video_index_cache()
+
+    @classmethod
+    def segment_draw_order(
+        cls,
+        df: pl.DataFrame,
+    ) -> dict[tuple[str, int], tuple[tuple[str, str, str, str], int]]:
+        """Return each selected segment's city and its position in the city's draw."""
+        cls._indexes(df)
+        return dict(cls._draw_orders.get(id(df), {}))
 
     @staticmethod
     def _normalise_sampling_seed(value: object) -> int:
@@ -342,13 +368,19 @@ class MetaData:
 
         skipped_missing = 0
         skipped_vehicle = 0
-        if max_footage_seconds is not None:
+        # target_crossings_per_city works through each city's footage in the
+        # same seeded random order, so the draw also runs when only it is set.
+        target_crossings = common.get_configs("target_crossings_per_city")
+        sampled = max_footage_seconds is not None or target_crossings is not None
+        draw_order: dict[tuple[str, int], tuple[tuple[str, str, str, str], int]] = {}
+        draw_order_by_city: dict[tuple[str, str, str, str], list[tuple[str, int]]] = {}
+        if sampled:
             seed = cls._normalise_sampling_seed(common.get_configs("footage_sampling_seed"))
             available_files = cls._available_detection_segments()
             vehicle_list = common.get_configs("vehicles_analyse")
 
         for city_key, segments in segments_by_city.items():
-            if max_footage_seconds is not None:
+            if sampled:
                 # Seeded per city, so one city's draw never depends on which
                 # other cities happen to be in the mapping.
                 segments = list(segments)
@@ -358,18 +390,24 @@ class MetaData:
                 duration_seconds = full_duration
                 effective_end_val = end_val
 
+                if cls._allowed_segments is not None and segment_key not in cls._allowed_segments:
+                    continue
+                remaining_seconds = float("inf")
                 if max_footage_seconds is not None:
                     remaining_seconds = (
                         max_footage_seconds - selected_seconds_by_city.get(city_key, 0.0)
                     )
                     if remaining_seconds <= 0:
                         break
+                if sampled:
                     if segment_key not in available_files:
                         skipped_missing += 1
                         continue
                     if vehicle_list and metadata[17] not in vehicle_list:
                         skipped_vehicle += 1
                         continue
+                    draw_order[segment_key] = (city_key, len(draw_order_by_city.setdefault(city_key, [])))
+                    draw_order_by_city[city_key].append(segment_key)
                     if duration_seconds > remaining_seconds:
                         duration_seconds = remaining_seconds
                         clipped_end = float(start_value) + duration_seconds
@@ -418,6 +456,7 @@ class MetaData:
                 short_city_count,
             )
 
+        cls._draw_orders[id(df)] = draw_order
         return metadata_index, segment_index
 
     @classmethod

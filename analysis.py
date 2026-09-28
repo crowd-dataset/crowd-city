@@ -9,6 +9,7 @@ Authors:
 from __future__ import annotations
 
 import ast
+import contextlib
 import math
 import os
 import pickle
@@ -1824,6 +1825,7 @@ CACHE_CONFIG_KEYS: tuple[str, ...] = (
     "processing_fps",
     "vehicles_analyse",
     "crossing_rule",
+    "target_crossings_per_city",
     # Segmentation settings change the derived crossing metrics, so a cached
     # run must not silently reuse values computed under different ones.
     "use_segmentation",
@@ -1877,7 +1879,7 @@ def _current_cache_config() -> Dict[str, object]:
         config["segmentation_index_schema"] = SEGMENTATION_INDEX_SCHEMA
     if MetaData._normalise_max_footage_seconds(
         common.get_configs("max_footage_hours_per_city")
-    ) is not None:
+    ) is not None or common.get_configs("target_crossings_per_city") is not None:
         # With a cap the seed decides which segments fill each city's budget,
         # and the selection rule itself changed from mapping order to a seeded
         # random draw over segments that have a detection file. Both belong
@@ -2474,6 +2476,63 @@ def _run_integrated_speed_reporting(
 
 
 CROSSING_RULES = ("detector", "road_crossing")
+
+
+def _target_crossings_per_city() -> Optional[int]:
+    """Return target_crossings_per_city as a positive integer, or None when off."""
+    value = common.get_configs("target_crossings_per_city")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0 or float(value) != int(value):
+        logger.error(f"target_crossings_per_city must be a positive integer or null, not {value!r}.")
+        sys.exit(1)
+    return int(value)
+
+
+def _process_until_target(
+    tasks: list,
+    draw_order: Dict[tuple, tuple],
+    target: int,
+    process,
+    crossings_found,
+) -> list:
+    """Process each city's segments in its random draw order until it has ``target`` crossings.
+
+    Works in rounds of one segment per unfinished city, so a city stops within
+    one segment of the target (whole segments are processed, so it can end a
+    little above it). A city that runs out of footage keeps what it has. Returns
+    the tasks processed, in processing order.
+    """
+    queues: Dict[tuple, list] = {}
+    for task in tasks:
+        city, position = draw_order.get((str(task["video_id"]), int(task["start_index"])), (None, 0))
+        queues.setdefault(city, []).append((position, task))
+    for queue in queues.values():
+        queue.sort(key=lambda item: item[0])
+    found = {city: 0 for city in queues}
+    processed: list = []
+    round_number = 0
+    while True:
+        batch = [queue.pop(0)[1] for city, queue in queues.items() if queue and found[city] < target]
+        if not batch:
+            break
+        round_number += 1
+        logger.info(
+            f"target_crossings_per_city={target}, round {round_number}: {len(batch)} segment(s) "
+            f"for {len(batch)} cities still below the target."
+        )
+        process(batch)
+        for task in batch:
+            city = draw_order.get((str(task["video_id"]), int(task["start_index"])), (None, 0))[0]
+            found[city] += crossings_found(task)
+        processed.extend(batch)
+    reached = sum(1 for city, count in found.items() if count >= target)
+    logger.info(
+        f"target_crossings_per_city={target}: {reached} of {len(found)} cities reached the target "
+        f"in {round_number} round(s) over {len(processed)} of {len(tasks)} available segments; "
+        "the others used all their footage."
+    )
+    return processed
 
 
 def _crossing_rule() -> str:
@@ -3598,50 +3657,68 @@ if __name__ == "__main__":
                     for outer_key, inner_dict in time_value.items():
                         all_time.setdefault(outer_key, {}).update(inner_dict)
 
+        target_crossings = _target_crossings_per_city()
+        road_selected: Dict[str, list] = {}
+        # [failed, attempted] across rounds: the failure limit applies to the
+        # whole run, not to each (possibly tiny) round.
+        road_failures = [0, 0]
+
+        def run_detection(tasks: list, executor) -> None:
+            if executor is None:
+                results = (process_csv_task(task) for task in tasks)
+            else:
+                results = executor.map(process_csv_task, tasks, chunksize=1)
+            for result in tqdm(results, total=len(tasks), desc="Analysing detection files"):
+                merge_worker_result(result)
+
+        def select_crossings(tasks: list) -> None:
+            # Rule D decides the crossings from the road surface under each
+            # candidate's feet, so it runs before any count, speed or waiting
+            # time is aggregated from the detector's picks.
+            if crossing_rule != "road_crossing":
+                return
+            stems = {str(task["filename_no_ext"]) for task in tasks}
+            road_selected.update(
+                segmentation_pass.select_road_crossings(
+                    df_mapping,
+                    tasks,
+                    {stem: road_candidates[stem] for stem in stems if stem in road_candidates},
+                    waymo_crossing_parameters,
+                    failure_totals=road_failures,
+                )
+            )
+
+        def crossings_found(task: dict) -> int:
+            stem = str(task["filename_no_ext"])
+            if crossing_rule == "road_crossing":
+                return len(road_selected.get(stem, []))
+            return len((pedestrian_crossing_count.get(stem) or {}).get("ids") or [])
+
         if csv_workers == 1:
             initialise_csv_worker(*worker_init_args)
-            result_iterator = (
-                process_csv_task(task)
-                for task in csv_tasks
-            )
-            for result in tqdm(
-                result_iterator,
-                total=len(csv_tasks),
-                desc="Analysing detection files",
-            ):
-                merge_worker_result(result)
+            executor_context = contextlib.nullcontext(None)
         else:
-            mp_context = multiprocessing.get_context("spawn")
-
-            with ProcessPoolExecutor(
+            executor_context = ProcessPoolExecutor(
                 max_workers=csv_workers,
-                mp_context=mp_context,
+                mp_context=multiprocessing.get_context("spawn"),
                 initializer=initialise_csv_worker,
                 initargs=worker_init_args,
-            ) as executor:
-                result_iterator = executor.map(
-                    process_csv_task,
+            )
+        with executor_context as executor:
+            if target_crossings is None:
+                run_detection(csv_tasks, executor)
+                select_crossings(csv_tasks)
+            else:
+                csv_tasks = _process_until_target(
                     csv_tasks,
-                    chunksize=1,
+                    MetaData.segment_draw_order(df_mapping),
+                    int(target_crossings),
+                    lambda tasks: (run_detection(tasks, executor), select_crossings(tasks)),
+                    crossings_found,
                 )
 
-                for result in tqdm(
-                    result_iterator,
-                    total=len(csv_tasks),
-                    desc="Analysing detection files",
-                ):
-                    merge_worker_result(result)
-
         if crossing_rule == "road_crossing":
-            # Rule D decides the crossings from the road surface under each
-            # candidate's feet, so it runs here, before any count, speed or
-            # waiting time is aggregated from the detector's picks.
-            road_selected = segmentation_pass.select_road_crossings(
-                df_mapping,
-                csv_tasks,
-                road_candidates,
-                waymo_crossing_parameters,
-            )
+            segmentation_pass.check_failure_share(*road_failures)
             all_speed, all_time = _apply_road_crossing_rule(
                 road_selected,
                 road_candidates,
@@ -3650,6 +3727,12 @@ if __name__ == "__main__":
                 pedestrian_crossing_count_all,
                 data,
                 aggregate_by_locality,
+            )
+
+        if target_crossings is not None:
+            # From here on every count is taken over the footage processed.
+            MetaData.restrict_to_segments(
+                {(str(task["video_id"]), int(task["start_index"])) for task in csv_tasks}
             )
 
         if aggregate_by_locality:
