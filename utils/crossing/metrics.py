@@ -38,6 +38,26 @@ _PIPELINE_MODEL: Dict[str, Any] = {}
 _SPEED_MODEL: Dict[str, Any] = {}
 
 
+# The most recent detection table's box rows and scene-motion profile. Both
+# are expensive for long CROWD segments and a detection worker needs them
+# several times for the same file (detector picks, then rule-D candidates),
+# so they are built once. Holding the table itself makes the identity check
+# safe. Worker processes handle one file at a time; this is not used from the
+# threaded segmentation pass.
+_ROWS_AND_SCENE_CACHE: List[Any] = [None, None, None, None]
+
+
+def rows_and_scene_profile(df: pl.DataFrame, fps: float) -> Tuple[List["BBoxRow"], "SceneMotionProfile"]:
+    """Return the box rows of ``df`` and their scene-motion profile, built once per table."""
+    cache = _ROWS_AND_SCENE_CACHE
+    if cache[0] is df and cache[1] == float(fps):
+        return cache[2], cache[3]
+    rows = bbox_rows_from_polars(df)
+    profile = build_scene_motion_profile(rows, float(fps))
+    cache[:] = [df, float(fps), rows, profile]
+    return rows, profile
+
+
 def load_tuned_pipeline_model(path: os.PathLike[str] | str) -> Dict[str, Any]:
     """Load the frozen Waymo parameters used by the CROWD CSV analysis."""
     global _PIPELINE_MODEL, _SPEED_MODEL
@@ -197,7 +217,7 @@ class Metrics:
         if fps is None or fps <= 0:
             return None
 
-        rows = bbox_rows_from_polars(df)
+        rows, scene_motion_profile = rows_and_scene_profile(df, float(fps))
         aspect_ratio = safe_float(os.environ.get("CROWD_BBOX_ASPECT_RATIO"))
         if aspect_ratio is None or aspect_ratio <= 0.0:
             aspect_ratio = DEFAULT_ASPECT_RATIO
@@ -220,7 +240,7 @@ class Metrics:
                     trimmed = trim_rows_to_frame_range(track_rows, *bounds)
                     if trimmed:
                         person_tracks[track_id] = trimmed
-            scene_profile = build_scene_motion_profile(rows, float(fps))
+            scene_profile = scene_motion_profile
             features_by_track = contextual_track_features(
                 person_tracks,
                 float(fps),
@@ -933,14 +953,27 @@ def trim_rows_to_frame_range(
 
 
 def rolling_median(values: np.ndarray, window: int = 3) -> np.ndarray:
+    """Centred rolling median; the window shrinks at the ends of the series.
+
+    Vectorised with a sliding window view: for long CROWD tracks at 30 fps the
+    per-element Python loop dominated the whole detection pass. The result is
+    identical to taking np.median over values[max(0, i - r):i + r + 1].
+    """
     if len(values) < 3 or window <= 1:
         return values.astype(float, copy=True)
+    values = np.asarray(values, dtype=float)
     radius = window // 2
-    output = np.empty(len(values), dtype=float)
-    for index in range(len(values)):
-        left = max(0, index - radius)
-        right = min(len(values), index + radius + 1)
-        output[index] = float(np.median(values[left:right]))
+    count = len(values)
+    output = np.empty(count, dtype=float)
+    if count > 2 * radius:
+        output[radius:count - radius] = np.median(
+            np.lib.stride_tricks.sliding_window_view(values, 2 * radius + 1), axis=1
+        )
+        edges = list(range(radius)) + list(range(count - radius, count))
+    else:
+        edges = range(count)
+    for index in edges:
+        output[index] = float(np.median(values[max(0, index - radius):min(count, index + radius + 1)]))
     return output
 
 

@@ -577,7 +577,7 @@ def _road_crossing_candidates(
     """
     from utils.crossing.road_crossing import box_only_candidates, longest_track_run
 
-    rows = crossing_metrics_module.bbox_rows_from_polars(df)
+    rows, scene_profile = crossing_metrics_module.rows_and_scene_profile(df, float(fps))
     person_tracks = crossing_metrics_module.group_tracks(
         row for row in rows if row.class_id == crossing_metrics_module.PERSON_CLASS_ID
     )
@@ -594,7 +594,7 @@ def _road_crossing_candidates(
         float(fps),
         source_id,
         float(aspect_ratio),
-        crossing_metrics_module.build_scene_motion_profile(rows, float(fps)),
+        scene_profile,
     )
     ids, bounds, size_rates = box_only_candidates(
         track_index,

@@ -1102,14 +1102,27 @@ def group_tracks(rows: Sequence[BBoxRow]) -> Dict[str, List[BBoxRow]]:
 
 
 def rolling_median(values: np.ndarray, window: int = 3) -> np.ndarray:
+    """Centred rolling median; the window shrinks at the ends of the series.
+
+    Vectorised with a sliding window view: for long CROWD tracks at 30 fps the
+    per-element Python loop dominated the whole detection pass. The result is
+    identical to taking np.median over values[max(0, i - r):i + r + 1].
+    """
     if len(values) < 3 or window <= 1:
         return values.astype(float, copy=True)
+    values = np.asarray(values, dtype=float)
     radius = window // 2
-    output = np.empty(len(values), dtype=float)
-    for index in range(len(values)):
-        left = max(0, index - radius)
-        right = min(len(values), index + radius + 1)
-        output[index] = float(np.median(values[left:right]))
+    count = len(values)
+    output = np.empty(count, dtype=float)
+    if count > 2 * radius:
+        output[radius:count - radius] = np.median(
+            np.lib.stride_tricks.sliding_window_view(values, 2 * radius + 1), axis=1
+        )
+        edges = list(range(radius)) + list(range(count - radius, count))
+    else:
+        edges = range(count)
+    for index in edges:
+        output[index] = float(np.median(values[max(0, index - radius):min(count, index + radius + 1)]))
     return output
 
 
