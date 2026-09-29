@@ -134,7 +134,7 @@ Configuration of the project is defined in `config`. Every value is read from `c
 - **`min_speed_limit`**: Minimum crossing speed for a crossing to be included.
 - **`max_speed_limit`**: Maximum crossing speed for a crossing to be included.
 - **`countries_analyse`**: ISO3 codes of the countries to analyse; an empty list analyses all countries.
-- **`cities_analyse`**: Cities to analyse; an empty list analyses all cities. City names repeat across countries and states, so each entry is `"City"`, `"City, ISO3"` or `"City, State, ISO3"`, for example `["Aberdeen, GBR", "Aberdeen, WA, USA", "Tokyo"]`. State and ISO3 are written as in `mapping.csv`, and names are matched case-insensitively against `locality` and `locality_aka`. A bare name keeps every city with that name and logs which ones matched. An entry that matches no city stops the run. When `countries_analyse` is also set, a city must satisfy both lists, and `n_cities` then chooses among the cities that remain.
+- **`cities_analyse`**: Cities to analyse; an empty list analyses all cities. City names repeat across countries and states, so each entry is `"City"`, `"City, ISO3"` or `"City, State, ISO3"`, for example `["Aberdeen, GBR", "Aberdeen, WA, USA", "Tokyo"]`. State and ISO3 are written as in `mapping.csv`, and names are matched case-insensitively against `locality` and `locality_aka`. A bare name keeps every city with that name and logs which ones matched. An entry that matches no city in `mapping.csv` stops the run. When `countries_analyse` is also set, a city must satisfy both lists, and `n_cities` then chooses among the cities that remain.
 - **`n_cities`**: Number of cities to analyse, chosen by total footage: a positive value keeps the cities with the most footage, a negative value those with the least, and `null` keeps all cities.
 - **`max_footage_hours_per_city`**: Caps the footage analysed per city, in hours; `null` analyses everything. Segments are drawn in a random order per city rather than in mapping order, so the budget is spread across that city's videos. Segments with no detection file in the Parquet store, or with a vehicle type outside `vehicles_analyse`, are skipped and the next segment is drawn in their place, so the whole budget goes to footage that is actually analysed. The last segment drawn is trimmed to fit the cap.
 - **`footage_sampling_seed`**: Seed for that random draw (default `42`). The same seed always selects the same segments, so runs are reproducible; change it to analyse a different sample.
@@ -153,6 +153,34 @@ Configuration of the project is defined in `config`. Every value is read from `c
 - **`delete_labels`**: Read by `helper_script.py` but currently has no effect.
 - **`delete_frames`**: Read by `helper_script.py` but currently has no effect.
 - **`save_images`**: Whether to export PNG and EPS alongside the interactive HTML. Raster export goes through kaleido, which launches a headless Chromium and is prone to hanging indefinitely on Windows. Set this to `false` to keep only the HTML, which carries the same data, when a run stalls on "Saving png file for ...".
+
+### Choosing which cities to analyse
+The analysis runs on every city in `mapping.csv` unless you narrow it down. The settings take effect in this order:
+
+1. `countries_analyse` keeps only the listed countries (ISO3 codes).
+2. `cities_analyse` keeps only the listed cities.
+3. `n_cities` keeps the cities with the most footage (or the least, if negative) out of those that remain.
+4. `max_footage_hours_per_city` and `target_crossings_per_city` limit how much of each remaining city's footage is processed.
+5. After the detections are analysed, `population_threshold`, `min_locality_population_percentage` and `footage_threshold` drop small cities and cities with little footage from the reported results.
+
+City names are not unique: `mapping.csv` has, for example, an Aberdeen in Great Britain and two in the United States. Each `cities_analyse` entry can therefore name the country, and the state too when a country has several cities with that name:
+
+```json
+"countries_analyse": [],
+"cities_analyse": [
+  "Aberdeen, GBR",
+  "Aberdeen, WA, USA",
+  "Tokyo"
+],
+```
+
+- `"City, ISO3"` picks the city in one country, and `"City, State, ISO3"` picks one within a country. Write state and ISO3 exactly as in the `state` and `iso3` columns of `mapping.csv`.
+- A bare `"City"` keeps every city with that name. The log then lists the cities it matched, so you can narrow the entry down if that was not intended.
+- Case is ignored, and alternative names in `locality_aka` are matched too, so `"Aliabad-e Katul"` finds Ali Abad in Iran.
+- An entry that matches no city in `mapping.csv`, such as a misspelling, stops the run at the start with an error naming it, instead of silently analysing nothing. A listed city that the thresholds in step 5 later remove is only noted in the log.
+- Leave both lists empty (`[]`) to analyse all cities.
+
+Changing either list changes which results are valid, so the next run reanalyses instead of reusing `results.pickle`. With `always_analyse` set to `false`, a rerun with unchanged settings reuses `results.pickle` and goes straight to the figures.
 
 ### Road-surface segmentation
 Crossing speed and crossing initiation time can additionally be measured against the road surface rather than from bounding-box motion alone. When enabled, the analysis segments only the video windows that contain an already-detected crossing with SegFormer finetuned on Cityscapes, reads the surface under each pedestrian's feet, and derives the interval that pedestrian actually spends on the carriageway. The initiation time then becomes the stationary interval immediately before stepping onto the road, and the speed is fitted over the on-road frames only.

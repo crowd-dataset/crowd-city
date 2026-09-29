@@ -2505,7 +2505,7 @@ def _parse_city_entry(entry: object) -> tuple:
     return parts[0], parts[1], parts[2]
 
 
-def _filter_cities(df_mapping: pl.DataFrame) -> pl.DataFrame:
+def _filter_cities(df_mapping: pl.DataFrame, require_match: bool = True) -> pl.DataFrame:
     """Keep only the cities listed in cities_analyse; an empty list keeps all.
 
     City names repeat across countries and states (Aberdeen is in GBR and in
@@ -2513,7 +2513,10 @@ def _filter_cities(df_mapping: pl.DataFrame) -> pl.DataFrame:
     well, to pick one of them. A bare name keeps every city of that name and
     logs which ones matched. Names are matched case-insensitively against
     locality and locality_aka. An entry that matches no city stops the run,
-    so a typo is not mistaken for a city with no data.
+    so a typo is not mistaken for a city with no data. The second pass, after
+    the population and footage thresholds, passes require_match=False,
+    because a listed city those thresholds removed is a legitimate result
+    there, not a typo, and its matches were already reported.
     """
     entries = common.get_configs("cities_analyse")
     if not entries:
@@ -2544,7 +2547,7 @@ def _filter_cities(df_mapping: pl.DataFrame) -> pl.DataFrame:
         matches = df_mapping.filter(condition).select(["locality", "state", "iso3"]).unique()
         if matches.height == 0:
             unmatched.append(entry)
-        elif matches.height > 1 and entry_iso3 is None:
+        elif matches.height > 1 and entry_iso3 is None and require_match:
             found = "; ".join(
                 ", ".join(str(v) for v in (row["locality"], row["state"], row["iso3"]) if v)
                 for row in matches.sort(["iso3", "state"], nulls_last=True).iter_rows(named=True)
@@ -2555,12 +2558,14 @@ def _filter_cities(df_mapping: pl.DataFrame) -> pl.DataFrame:
             )
         keep = keep | condition
 
-    if unmatched:
-        logger.error(
-            f"cities_analyse entries match no city in the mapping (or were removed by the population and "
-            f"footage filters): {', '.join(repr(e) for e in unmatched)}."
-        )
+    if unmatched and require_match:
+        logger.error(f"cities_analyse entries match no city in the mapping: {', '.join(repr(e) for e in unmatched)}.")
         sys.exit(1)
+    if unmatched:
+        logger.info(
+            f"cities_analyse entries removed by the population and footage thresholds: "
+            f"{', '.join(repr(e) for e in unmatched)}."
+        )
     return df_mapping.filter(keep)
 
 
@@ -4676,7 +4681,7 @@ if __name__ == "__main__":
         countries_include = common.get_configs("countries_analyse")
         if countries_include:
             df_mapping = df_mapping.filter(pl.col("iso3").is_in(countries_include))
-        df_mapping = _filter_cities(df_mapping)
+        df_mapping = _filter_cities(df_mapping, require_match=False)
         log_rollups(df_mapping)
 
         total_duration = dataset_stats.calculate_total_seconds(df_mapping)
