@@ -275,6 +275,14 @@ class Mapping_Enrich:
             # only day > 0 -> day
             # only night > 0 -> night
             # otherwise -> null
+            # A mapping CSV read from disk carries missing values as NaN, and
+            # Polars orders NaN above every number (NaN > 0 is true), so a
+            # locality without night footage would average to NaN. Treat NaN
+            # as missing first.
+            out = out.with_columns([
+                pl.col(day_col).cast(pl.Float64, strict=False).fill_nan(None).alias(day_col),
+                pl.col(night_col).cast(pl.Float64, strict=False).fill_nan(None).alias(night_col),
+            ])
             out = out.with_columns(
                 pl.when(
                     (pl.col(day_col) > 0)
