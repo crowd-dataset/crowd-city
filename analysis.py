@@ -1872,6 +1872,11 @@ def _current_cache_config() -> Dict[str, object]:
         for key in CACHE_CONFIG_KEYS
         if segmentation_enabled or key not in skipped
     }
+    cities = common.get_configs("cities_analyse")
+    if cities:
+        # Left out when empty, so a results.pickle from before the setting
+        # existed still matches a run that analyses every city.
+        config["cities_analyse"] = list(cities)
     if segmentation_enabled:
         # The surface-label schema changes whenever stored labels stop being
         # valid (for example the move to the probed video frame rate), so a
@@ -2476,6 +2481,87 @@ def _run_integrated_speed_reporting(
 
 
 CROSSING_RULES = ("detector", "road_crossing")
+
+
+def _parse_city_entry(entry: object) -> tuple:
+    """Split a cities_analyse entry into (locality, state, iso3), lower-cased.
+
+    An entry is "City", "City, ISO3" or "City, State, ISO3". State and ISO3
+    are None when not given, and then match any value.
+    """
+    if not isinstance(entry, str) or not entry.strip():
+        logger.error(f"cities_analyse entries must be non-empty strings, not {entry!r}.")
+        sys.exit(1)
+    parts = [part.strip().lower() for part in entry.split(",")]
+    if len(parts) > 3 or not all(parts):
+        logger.error(
+            f"cities_analyse entry {entry!r} is not \"City\", \"City, ISO3\" or \"City, State, ISO3\"."
+        )
+        sys.exit(1)
+    if len(parts) == 1:
+        return parts[0], None, None
+    if len(parts) == 2:
+        return parts[0], None, parts[1]
+    return parts[0], parts[1], parts[2]
+
+
+def _filter_cities(df_mapping: pl.DataFrame) -> pl.DataFrame:
+    """Keep only the cities listed in cities_analyse; an empty list keeps all.
+
+    City names repeat across countries and states (Aberdeen is in GBR and in
+    two US states), so an entry can name the ISO3 code, and the state as
+    well, to pick one of them. A bare name keeps every city of that name and
+    logs which ones matched. Names are matched case-insensitively against
+    locality and locality_aka. An entry that matches no city stops the run,
+    so a typo is not mistaken for a city with no data.
+    """
+    entries = common.get_configs("cities_analyse")
+    if not entries:
+        return df_mapping
+    if not isinstance(entries, list):
+        logger.error(f"cities_analyse must be a list, not {entries!r}.")
+        sys.exit(1)
+
+    locality = pl.col("locality").cast(pl.Utf8).str.strip_chars().str.to_lowercase()
+    aliases = (
+        pl.col("locality_aka").cast(pl.Utf8).fill_null("").str.strip_chars("[] ")
+        .str.to_lowercase().str.split(",").list.eval(pl.element().str.strip_chars().str.strip_chars("'\""))
+        if "locality_aka" in df_mapping.columns
+        else pl.lit([], dtype=pl.List(pl.Utf8))
+    )
+    state = pl.col("state").cast(pl.Utf8).fill_null("").str.strip_chars().str.to_lowercase()
+    iso3 = pl.col("iso3").cast(pl.Utf8).fill_null("").str.strip_chars().str.to_lowercase()
+
+    keep = pl.lit(False)
+    unmatched = []
+    for entry in entries:
+        name, entry_state, entry_iso3 = _parse_city_entry(entry)
+        condition = (locality == name) | aliases.list.contains(name)
+        if entry_state is not None:
+            condition = condition & (state == entry_state)
+        if entry_iso3 is not None:
+            condition = condition & (iso3 == entry_iso3)
+        matches = df_mapping.filter(condition).select(["locality", "state", "iso3"]).unique()
+        if matches.height == 0:
+            unmatched.append(entry)
+        elif matches.height > 1 and entry_iso3 is None:
+            found = "; ".join(
+                ", ".join(str(v) for v in (row["locality"], row["state"], row["iso3"]) if v)
+                for row in matches.sort(["iso3", "state"], nulls_last=True).iter_rows(named=True)
+            )
+            logger.warning(
+                f"cities_analyse entry {entry!r} matches {matches.height} cities, all of which are kept: "
+                f"{found}. Write \"City, ISO3\" or \"City, State, ISO3\" to keep only one."
+            )
+        keep = keep | condition
+
+    if unmatched:
+        logger.error(
+            f"cities_analyse entries match no city in the mapping (or were removed by the population and "
+            f"footage filters): {', '.join(repr(e) for e in unmatched)}."
+        )
+        sys.exit(1)
+    return df_mapping.filter(keep)
 
 
 def _target_crossings_per_city() -> Optional[int]:
@@ -3376,6 +3462,7 @@ if __name__ == "__main__":
         countries_include = common.get_configs("countries_analyse")
         if countries_include:
             df_mapping = df_mapping.filter(pl.col("iso3").is_in(countries_include))
+        df_mapping = _filter_cities(df_mapping)
         df_mapping = _select_cities_by_footage(
             df_mapping,
             city_limit,
@@ -4589,6 +4676,7 @@ if __name__ == "__main__":
         countries_include = common.get_configs("countries_analyse")
         if countries_include:
             df_mapping = df_mapping.filter(pl.col("iso3").is_in(countries_include))
+        df_mapping = _filter_cities(df_mapping)
         log_rollups(df_mapping)
 
         total_duration = dataset_stats.calculate_total_seconds(df_mapping)
