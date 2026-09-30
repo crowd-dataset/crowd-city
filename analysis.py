@@ -1838,6 +1838,8 @@ CACHE_CONFIG_KEYS: tuple[str, ...] = (
 CACHE_RESULTS_COUNT = 43
 # Identifies how max_footage_hours_per_city picks segments; bump when it changes.
 FOOTAGE_SELECTION_RULE = "seeded_random_available_v1"
+# Zero hesitation times are left out of the segmentation averages.
+SEGMENTATION_METRICS_RULE = "hesitation_excludes_zero_v1"
 CACHE_METADATA_VERSION = 1
 
 
@@ -1882,6 +1884,9 @@ def _current_cache_config() -> Dict[str, object]:
         # valid (for example the move to the probed video frame rate), so a
         # cached run must not keep segmentation metrics derived from old ones.
         config["segmentation_index_schema"] = SEGMENTATION_INDEX_SCHEMA
+        # Bumped when the per-track segmentation metrics change meaning, so a
+        # cached run does not keep values computed under the old definition.
+        config["segmentation_metrics_rule"] = SEGMENTATION_METRICS_RULE
     if MetaData._normalise_max_footage_seconds(
         common.get_configs("max_footage_hours_per_city")
     ) is not None or common.get_configs("target_crossings_per_city") is not None:

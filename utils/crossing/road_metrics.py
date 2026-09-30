@@ -77,7 +77,9 @@ def hesitation_seconds(
     recording it as a zero would pull every city mean towards zero in
     proportion to how often the camera arrives late rather than to how little
     anyone waited. A genuine zero, meaning the pedestrian walked up and
-    stepped straight out without stopping, is still reported as ``0.0``.
+    stepped straight out without stopping, is reported as ``0.0``; the
+    segmentation pass leaves those out of the hesitation averages too, as
+    the bounding-box metric does.
     """
     required = {"frame-count", "x-center", "height"}
     if track is None or track.height == 0 or not required.issubset(set(track.columns)):

@@ -536,6 +536,14 @@ def _process_segment(
             # cannot contribute a hesitation time stays visible in the log.
             diagnostics["hesitation_unobservable"] += 1
             continue
+        if wait <= 0.0:
+            # The pedestrian did not stand still before stepping onto the
+            # road. Like the bounding-box metric, which only records a track
+            # once it has a stationary run, such a crossing has no hesitation
+            # time rather than a hesitation time of zero, so it is left out
+            # of the averages instead of pulling them towards zero.
+            diagnostics["hesitation_absent"] += 1
+            continue
         time_values[track_id] = float(wait)
 
     speed_values, speed_diagnostics = road_restricted_speed(
