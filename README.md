@@ -1,5 +1,10 @@
 ## CROWD-city
 
+Analyses how pedestrians cross the road in dashcam footage from cities around the world (the [CROWD dataset](https://github.com/crowd-dataset/crowd)). For every city it counts road crossings and measures crossing speed in m/s and crossing initiation time (how long a pedestrian stands still before stepping onto the road), then relates them to city and country indicators.
+
+![Cities in the analysis](docs/images/cities_world_map.png)
+*Cities in the current analysis (red dots) and the countries they are in.*
+
 ## Citation and usage of code
 If you use this work for academic work please cite the following paper:
 
@@ -191,6 +196,22 @@ Nothing needs a surface label for every frame. The crossing speed is measured be
 
 Video is never downloaded in full: ffmpeg seeks over HTTP range requests and decodes only the crossing windows. Only the derived per-frame surface labels are cached, keyed by a fingerprint of the crossing configuration, so re-tuning the crossing detector correctly invalidates the store rather than reusing labels sampled for a different set of tracks.
 
+**What it looks like.** Each sample below shows the road (red) and footpath (green) found by the segmentation model, and a box on each pedestrian counted as crossing. For these images the boxes were also labelled with each pedestrian's road-restricted speed and initiation time. `speed: n/a` means the speed model's reliability gates rejected that track; `wait unseen` means the pedestrian was already on the road when first seen.
+
+![Crossings that are counted correctly](docs/images/crossing_samples_good.jpg)
+*Correctly counted crossings: a zebra crossing in Catania (1.39 m/s, no wait), a signalised crossing in Birmingham, a pedestrian waiting 2.56 s at the kerb in Prague at night, and a crossing in front of a shop in the United States.*
+
+The rule also counts some pedestrians who are not crossing, which is why its precision on Waymo is about 50% (see below). The common causes are snow at the road edge labelled as road, and people walking along the edge of the carriageway:
+
+![Typical false crossings](docs/images/crossing_samples_failures.jpg)
+*Typical false crossings: in Sapporo the snowbank is labelled as road, so a pedestrian beside it counts as on the road; in Bengaluru a pedestrian walks along the road edge beside the barrier.*
+
+To render sample clips from your own run, with the surface overlay and the boxes labelled by track id (the clips are written to `_output/segmentation_samples/`):
+
+```bash
+uv run python visualize_segmentation_samples.py --samples 8
+```
+
 - **`crossing_rule`**: Decides which pedestrians count as crossing, for every count, speed, waiting time and figure. `detector` uses the CROWD crossing detector alone: the track must pass through the vertical strip between `boundary_left` and `boundary_right` and survive its motion filters. `road_crossing` uses the road surface instead: the pedestrian's feet are on the road, the track moves across at least `min_crossing_x_range` of the image while there, and its box size changes slowly, which rejects people walking along the road. Tested against Waymo ground truth, `road_crossing` finds about twice as many real crossings as `detector` (training 232 vs 139, untouched validation 51 vs 19) at a precision of about 49% against Waymo's crosswalk-only labels, which audits showed undercounts real crossings. It requires `use_segmentation` and the video file server: candidates are first found from the boxes alone, then segmented, and the run stops if the road surface cannot be read for more than 5% of segments rather than undercounting crossings. The rules are defined in `utils/crossing/road_crossing.py`.
 - **`use_segmentation`**: Enables the road-surface segmentation pass. When disabled, the analysis is exactly the baseline. Required when `crossing_rule` is `road_crossing`.
 - **`segmentation_is_primary`**: Determines which derivation the figures report. When `false` every figure and correlation uses the bounding-box metrics. When `true` the segmentation values become the reported crossing speed and initiation time throughout, i.e. in `speed_crossing_*` and `time_crossing_*`. Either way the bounding-box values stay in `speed_crossing_bbox_*` / `time_crossing_bbox_*` and the segmentation values in `speed_crossing_seg_*` / `time_crossing_seg_*`, so the two can always be compared. Note that the segmentation metrics do not cover every crossing the baseline covers: a track is dropped when it never reaches the carriageway, when the frozen speed model's reliability gates reject the shortened window, and, for the initiation time, whenever the pedestrian was already on the road when first detected. The count of localities that lose a value is logged when this is enabled.
@@ -221,6 +242,9 @@ Crossing speeds are reported in m/s by a speed model calibrated on the [Waymo Op
 
 City averages are close to unbiased; individual crossings are typically off by 0.1–0.2 m/s, and estimates are compressed towards the mean (slow walkers read too fast, fast walkers too slow), so differences between cities are understated but their order is kept. With 27 validation tracks the validation MAE carries an uncertainty of about ±0.03–0.04 m/s.
 
+![Waymo reference speed against estimated speed](docs/images/waymo_speed_validation.png)
+*Estimated crossing speed against Waymo's lidar-derived reference speed, for the training fit, the source-held-out cross-validation and the untouched validation set. Points on the dashed line are exact.*
+
 **Crossing detection**, scored against Waymo's crosswalk-crossing labels (which cover marked crosswalks only, so precision is a lower bound; hand audits found about half of the "wrong" picks to be real crossings elsewhere):
 
 | Rule | Recall, training | Recall, validation | Precision (lower bound) |
@@ -249,6 +273,18 @@ About three quarters of the real crossers that are missed are never detected by 
 
 The remaining error comes mainly from the bounding boxes themselves (jitter, partial occlusion, and box height as a stand-in for distance). Further gains would likely need better boxes or a direct distance estimate, such as a monocular depth model, rather than parameter tuning.
 
+
+## Example results
+These figures come from a run with `max_footage_hours_per_city` set to 1, `crossing_rule` set to `road_crossing` and `segmentation_is_primary` enabled: 200 cities in 84 countries, one hour of footage per city. That run counted 8,915 crossings; 2,514 of them received a reliable road-restricted speed and 482 an initiation time (most pedestrians step onto the road without stopping, or are already on it when first seen). Every run writes its figures to `figures/` as interactive HTML and, when `save_images` is enabled, as PNG and EPS.
+
+![Distribution of crossing speed](docs/images/crossing_speed_histogram.png)
+*Crossing speed per pedestrian (median 1.30 m/s).*
+
+![Distribution of crossing initiation time](docs/images/initiation_time_histogram.png)
+*Crossing initiation time per pedestrian (median 2.0 s). Waits shorter than three stationary checks (about 1 s, see `check_per_sec_time`) are not recorded.*
+
+![City average crossing speed against initiation time](docs/images/speed_vs_initiation_time.png)
+*City averages of crossing speed against initiation time, coloured by continent. Cities with only a few measured waits can show extreme averages (Chișinău), so read single cities with care.*
 
 ## Contact
 If you have any questions or suggestions, feel free to reach out to md_shadab_alam@outlook.com or pavlo.bazilinskyy@gmail.com.
