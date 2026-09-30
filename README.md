@@ -123,7 +123,7 @@ Configuration of the project is defined in `config`. Every value is read from `c
 - **`min_waiting_time`**: Minimum crossing initiation time, in seconds, for a crossing to be included.
 - **`max_waiting_time`**: Maximum crossing initiation time, in seconds, for a crossing to be included.
 - **`min_locality_population_percentage`**: A city is also kept when its population is at least this fraction of its country's population, even if it is below `population_threshold`.
-- **`check_per_sec_time`**: Number of position checks per second used when measuring how long a pedestrian stands still before crossing.
+- **`check_per_sec_time`**: Number of position checks per second used when measuring how long a pedestrian stands still before crossing. The checks are `round(fps / check_per_sec_time)` frames apart, and a check counts as standing still when the pedestrian moves no more than 10% of their box height. A wait needs at least three consecutive still checks, so the shortest recorded wait is about `3 / check_per_sec_time` seconds. Both the bounding-box and the road-surface initiation times are measured from the frames the checks actually span, so they stay in true seconds at any frame rate (at 40 fps a check is 13 frames, i.e. 0.325 s). A higher value lets slower walking pass as standing still, because the 10% limit applies to each check.
 - **`analysis_level`**: Level at which results are reported: `city` or `country`.
 - **`boundary_left`**: x-coordinate of one edge of the crossing area used to detect road crossings (normalised between 0 and 1).
 - **`boundary_right`**: x-coordinate of the opposite edge of the crossing area used to detect road crossings (normalised between 0 and 1).

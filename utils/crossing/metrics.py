@@ -115,6 +115,53 @@ def metric_speed_is_qualified() -> bool:
     return bool(_SPEED_MODEL)
 
 
+# Consecutive stationary checks required before a wait is recorded at all.
+MINIMUM_STATIONARY_CHECKS = 3
+
+
+def leading_wait_check_units(
+    x_values: np.ndarray,
+    frames: Optional[np.ndarray],
+    heights: np.ndarray,
+    fps: float,
+    checks_per_second: float,
+) -> Optional[float]:
+    """Return the leading stationary run of a track, in check_per_sec_time units.
+
+    Positions are compared ``round(fps / checks_per_second)`` rows apart. A
+    comparison moving no more than 10% of the median box height counts as a
+    stationary check, and the first run of at least three such checks is the
+    wait. Its length is measured from the frame numbers the checks actually
+    span rather than assumed to be 1 / checks_per_second per check: the frame
+    step is rounded (13 frames at 40 fps is 0.325 s, not 0.333 s) and missed
+    detections make a check span more frames. The result is returned
+    multiplied by checks_per_second, the unit every consumer of the baseline
+    initiation time divides by, so its average comes out in true seconds.
+    Returns None when the track has no such run.
+    """
+    if fps <= 0 or checks_per_second <= 0 or len(x_values) == 0 or len(heights) == 0:
+        return None
+    step = max(1, int(round(float(fps) / float(checks_per_second))))
+    if frames is None or len(frames) != len(x_values):
+        frames = np.arange(len(x_values), dtype=float)
+    margin = 0.1 * float(np.median(heights))
+    stable_checks = 0
+    stable_frames = 0.0
+    for index in range(0, len(x_values) - step, step):
+        delta = abs(float(x_values[index + step]) - float(x_values[index]))
+        if delta <= margin:
+            stable_checks += 1
+            stable_frames += float(frames[index + step]) - float(frames[index])
+        elif stable_checks >= MINIMUM_STATIONARY_CHECKS:
+            break
+        else:
+            stable_checks = 0
+            stable_frames = 0.0
+    if stable_checks < MINIMUM_STATIONARY_CHECKS:
+        return None
+    return stable_frames / float(fps) * float(checks_per_second)
+
+
 class Metrics:
     """Public crossing metrics used by analysis.py."""
 
@@ -412,20 +459,15 @@ class Metrics:
                 pl.Float64,
                 strict=False,
             ).drop_nulls()
-            if not len(x_values) or heights.len() == 0:
-                continue
-            margin = 0.1 * float(heights.median())
-            stable_samples = 0
-            for index in range(0, len(x_values) - step, step):
-                delta = abs(float(x_values[index + step]) - float(x_values[index]))
-                if delta <= margin:
-                    stable_samples += 1
-                elif stable_samples >= 3:
-                    break
-                else:
-                    stable_samples = 0
-            if stable_samples >= 3:
-                durations[track_id] = stable_samples
+            wait = leading_wait_check_units(
+                x_values,
+                track.get_column("frame-count").cast(pl.Float64, strict=False).to_numpy(),
+                heights.to_numpy(),
+                float(fps),
+                checks_per_second,
+            )
+            if wait is not None:
+                durations[track_id] = wait
 
         if not durations:
             return None

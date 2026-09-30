@@ -359,7 +359,7 @@ def _time_to_start_from_track_index(
         return None
 
     step = max(1, int(round(float(fps) / checks_per_second)))
-    durations: Dict[Any, int] = {}
+    durations: Dict[Any, float] = {}
 
     for track_id in track_ids:
         track = _track(track_index, track_id)
@@ -387,25 +387,16 @@ def _time_to_start_from_track_index(
             pl.Float64,
             strict=False,
         ).drop_nulls()
-        if not len(x_values) or heights.len() == 0:
-            continue
-
-        margin = 0.1 * float(heights.median())
-        stable_samples = 0
-        for index in range(0, len(x_values) - step, step):
-            delta = abs(
-                float(x_values[index + step])
-                - float(x_values[index])
-            )
-            if delta <= margin:
-                stable_samples += 1
-            elif stable_samples >= 3:
-                break
-            else:
-                stable_samples = 0
-
-        if stable_samples >= 3:
-            durations[track_id] = stable_samples
+        frames = (
+            track.get_column("frame-count").cast(pl.Float64, strict=False).to_numpy()
+            if "frame-count" in track.columns
+            else None
+        )
+        wait = crossing_metrics_module.leading_wait_check_units(
+            x_values, frames, heights.to_numpy(), float(fps), checks_per_second,
+        )
+        if wait is not None:
+            durations[track_id] = wait
 
     if not durations:
         return None

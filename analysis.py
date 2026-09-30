@@ -1840,6 +1840,8 @@ CACHE_RESULTS_COUNT = 43
 FOOTAGE_SELECTION_RULE = "seeded_random_available_v1"
 # Zero hesitation times are left out of the segmentation averages.
 SEGMENTATION_METRICS_RULE = "hesitation_excludes_zero_v1"
+# The box-based initiation time is measured from the frames its checks span.
+HESITATION_RULE = "frame_timed_checks_v1"
 CACHE_METADATA_VERSION = 1
 
 
@@ -1874,6 +1876,7 @@ def _current_cache_config() -> Dict[str, object]:
         for key in CACHE_CONFIG_KEYS
         if segmentation_enabled or key not in skipped
     }
+    config["hesitation_rule"] = HESITATION_RULE
     cities = common.get_configs("cities_analyse")
     if cities:
         # Left out when empty, so a results.pickle from before the setting
