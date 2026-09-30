@@ -134,6 +134,7 @@ def _current_crossing_fingerprint() -> str:
             "boundary_left": common.get_configs("boundary_left"),
             "boundary_right": common.get_configs("boundary_right"),
             "processing_fps": common.get_configs("processing_fps"),
+            "crossing_rule": common.get_configs("crossing_rule"),
         }
     )
 
