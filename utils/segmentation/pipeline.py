@@ -142,6 +142,9 @@ class SegmentationPipeline:
         if self._session is not None:
             self._session.close()
             self._session = None
+        close_segmenter = getattr(self.segmenter, "close", None)
+        if close_segmenter is not None:
+            close_segmenter()
 
     def _video_source(self, video_id: str) -> Optional[str]:
         with self._lock:

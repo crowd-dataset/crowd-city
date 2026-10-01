@@ -35,7 +35,7 @@ from utils.crossing.road_metrics import (
 from utils.segmentation.frames import RemoteCredentials
 from utils.segmentation.pipeline import SegmentationPipeline, SegmentRequest
 from utils.segmentation.segformer import (
-    SurfaceSegmenter,
+    IsolatedSurfaceSegmenter,
     segmentation_is_available,
 )
 from utils.segmentation.store import (
@@ -145,7 +145,7 @@ def _segmentation_pipeline(
 
     coarse_hz = float(_config("segmentation_coarse_hz"))
     refine_hz = float(_config("segmentation_refine_hz"))
-    segmenter = SurfaceSegmenter(
+    segmenter = IsolatedSurfaceSegmenter(
         model_name=str(_config("segmentation_model")),
         device=str(_config("segmentation_device")),
         batch_size=int(_config("segmentation_batch_size")),
