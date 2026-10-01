@@ -272,6 +272,7 @@ def run_segmentation_pass(
                 id_bounds=crossing_ids[stem].get("id_bounds") or {},
             )
         except Exception as error:
+            _raise_if_gpu_failure(error)
             logger.warning(f"Segmentation failed for {stem}: {error}")
             return "segment_exception"
 
@@ -321,6 +322,29 @@ def run_segmentation_pass(
     }
 
 
+class GpuFailure(RuntimeError):
+    """The GPU stopped working, so no further segment can be segmented."""
+
+
+def _raise_if_gpu_failure(error: BaseException) -> None:
+    """Turn a fatal CUDA error into GpuFailure instead of a per-segment failure.
+
+    Once a kernel times out or the device faults (for example an NVIDIA Xid 8
+    watchdog timeout), the CUDA context stays broken for the rest of the
+    process, so every later segment fails in milliseconds. Counting those as
+    ordinary per-segment failures burned through a whole 2,511-segment run and
+    then stopped on the failure share, losing the run. Stopping at the first
+    one keeps everything segmented so far in the store for the next run.
+    """
+    message = str(error)
+    if "CUDA error" in message or "CUDA-capable device" in message or "cudaError" in message:
+        raise GpuFailure(
+            f"The GPU stopped working during segmentation ({message.splitlines()[0]}). Every segment "
+            "segmented so far is saved in the segmentation store and is reused when analysis.py is "
+            "started again; check the GPU (nvidia-smi, kernel log) and rerun."
+        ) from error
+
+
 def _parallel_segments(
     function: Callable[[str], Any],
     stems: Sequence[str],
@@ -333,10 +357,15 @@ def _parallel_segments(
     Results are yielded in completion order with a progress bar.
     """
     workers = max(1, int(_config("segmentation_parallel_videos")))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    executor = ThreadPoolExecutor(max_workers=workers)
+    try:
         futures = {executor.submit(function, stem): stem for stem in stems}
         for future in tqdm(as_completed(futures), total=len(futures), desc=description):
             yield futures[future], future.result()
+    finally:
+        # On an error (GpuFailure above all) do not start the segments still
+        # queued; only the few already running are waited for.
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _prepared_detections(task: Mapping[str, Any]) -> Tuple[pl.DataFrame, float, int]:
@@ -446,6 +475,7 @@ def select_road_crossings(
                 _segment_request(task, stem, effective_fps, first_source_frame, tracks)
             )
         except Exception as error:
+            _raise_if_gpu_failure(error)
             logger.warning(f"Road-crossing selection failed for {stem}: {error}")
             return "diagnostic", "segment_exception"
         if not timelines:
