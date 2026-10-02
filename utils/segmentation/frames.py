@@ -11,10 +11,11 @@ from __future__ import annotations
 import base64
 import json
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import numpy as np
 import requests
@@ -40,6 +41,69 @@ WINDOW_READ_TIMEOUT_SECONDS = 180
 
 
 FFPROBE_BINARY = "ffprobe"
+
+# When the file server itself is down (it answers 5XX or not at all for its
+# front page), every read fails, and failing each segment in turn would burn
+# through a whole run in hours and then stop it on the failure limit. Reads
+# instead wait for the server to come back, polling it at this interval, for
+# at most this long before the failure is accepted.
+SERVER_POLL_SECONDS = 60.0
+SERVER_OUTAGE_MAX_WAIT_SECONDS = 12 * 3600.0
+
+_server_lock = threading.Lock()
+_last_recovery_time = 0.0
+
+
+def _server_responding(origin: str) -> bool:
+    """Return whether the file server answers at all (any reply below 500)."""
+    try:
+        response = requests.get(origin, timeout=20, stream=True)
+    except requests.RequestException:
+        return False
+    try:
+        return response.status_code < 500
+    finally:
+        response.close()
+
+
+def wait_through_outage(url: str, failed_since: float) -> bool:
+    """Wait while the file server is down; return True once it is back.
+
+    True means the caller's failures may have been caused by an outage that
+    has now ended, so the read is worth repeating. False means the server is
+    responding normally (the failure belongs to this file) or stayed down for
+    SERVER_OUTAGE_MAX_WAIT_SECONDS. Only one thread polls; the others queue on
+    the lock and then see the recovery it recorded.
+    """
+    global _last_recovery_time
+    parts = urlsplit(str(url))
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return False
+    origin = f"{parts.scheme}://{parts.netloc}/"
+    with _server_lock:
+        if _last_recovery_time > failed_since:
+            return True
+        if _server_responding(origin):
+            return False
+        started = time.time()
+        logger.warning(
+            f"The file server {origin} is down; pausing reads until it responds again "
+            f"(checking every {SERVER_POLL_SECONDS:.0f}s, for at most {SERVER_OUTAGE_MAX_WAIT_SECONDS / 3600:.0f} h)."
+        )
+        last_report = started
+        while time.time() - started < SERVER_OUTAGE_MAX_WAIT_SECONDS:
+            time.sleep(SERVER_POLL_SECONDS)
+            if _server_responding(origin):
+                _last_recovery_time = time.time()
+                logger.warning(
+                    f"The file server is back after {(_last_recovery_time - started) / 60:.0f} min; resuming reads."
+                )
+                return True
+            if time.time() - last_report >= 1800:
+                logger.warning(f"The file server is still down after {(time.time() - started) / 60:.0f} min.")
+                last_report = time.time()
+        logger.error(f"The file server stayed down for {SERVER_OUTAGE_MAX_WAIT_SECONDS / 3600:.0f} h; giving up.")
+        return False
 
 
 class WindowReadError(RuntimeError):
@@ -123,12 +187,16 @@ class RemoteCredentials:
 
 def _probe(session: requests.Session, url: str, params, timeout: int) -> bool:
     """Return whether ``url`` serves bytes, retrying transient server errors."""
-    for pause in (0.0,) + READ_RETRY_PAUSES_SECONDS:
-        if pause:
-            time.sleep(pause)
-        result = _probe_once(session, url, params, timeout)
-        if result is not None:
-            return result
+    failed_since = time.time()
+    for _round in range(2):
+        for pause in (0.0,) + READ_RETRY_PAUSES_SECONDS:
+            if pause:
+                time.sleep(pause)
+            result = _probe_once(session, url, params, timeout)
+            if result is not None:
+                return result
+        if not wait_through_outage(url, failed_since):
+            break
     logger.warning(f"The file server kept failing for {url}; treating it as unavailable.")
     return False
 
@@ -330,7 +398,15 @@ def extract_window_frames(
     ]
 
     completed = None
-    for attempt, pause in enumerate((0.0,) + READ_RETRY_PAUSES_SECONDS):
+    failed_since = time.time()
+    pauses = (0.0,) + READ_RETRY_PAUSES_SECONDS
+    # A second round of attempts is made only after an outage of the whole
+    # server has ended (see wait_through_outage).
+    schedule = list(enumerate(pauses))
+    position = 0
+    while position < len(schedule):
+        attempt, pause = schedule[position]
+        position += 1
         if pause:
             time.sleep(pause)
         try:
@@ -350,9 +426,12 @@ def extract_window_frames(
             problem = completed.stderr.decode("utf-8", errors="replace").strip()
         logger.warning(
             f"Reading {window.duration_seconds:.1f}s at {window.start_seconds:.1f}s of "
-            f"{source} failed (attempt {attempt + 1} of {len(READ_RETRY_PAUSES_SECONDS) + 1}): {problem}"
+            f"{source} failed (attempt {attempt + 1} of {len(pauses)}): {problem}"
         )
         completed = None
+        if position == len(schedule) and is_remote and len(schedule) == len(pauses):
+            if wait_through_outage(str(source), failed_since):
+                schedule += list(enumerate(pauses))
     if completed is None:
         # Raised rather than returning no frames, so the segment counts as
         # failed and is never stored as if the window had nothing in it.
