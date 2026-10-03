@@ -591,11 +591,19 @@ def _road_crossing_candidates(
         float(aspect_ratio),
         scene_profile,
     )
+    # A crossing pedestrian passes in front of the camera: through the same
+    # middle strip the CROWD detector uses (the frozen parameters, else config).
+    camera_strip = (
+        float(_WORKER_CROSSING_PARAMETERS.get("boundary_left", _WORKER_BOUNDARY_LEFT)),
+        float(_WORKER_CROSSING_PARAMETERS.get("boundary_right", _WORKER_BOUNDARY_RIGHT)),
+        float(_WORKER_CROSSING_PARAMETERS.get("tol", 0.0)),
+    )
     ids, bounds, size_rates = box_only_candidates(
         track_index,
         features,
         fps,
         float(_WORKER_CROSSING_PARAMETERS["min_crossing_x_range"]),
+        camera_strip,
     )
     # Riders and tracks that only move with the camera are not pedestrians
     # crossing on foot; both checks look at every object in the candidate's

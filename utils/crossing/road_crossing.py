@@ -68,7 +68,7 @@ TRACK_GAP_SECONDS = 2.0
 MINIMUM_RELATIVE_X_RANGE = 0.08
 # Recorded in the results.pickle fingerprint; bump when rule D changes, so
 # cached results from an earlier version of the rule are not reused.
-ROAD_CROSSING_RULE_VERSION = "rule_d_rider_camera_v1"
+ROAD_CROSSING_RULE_VERSION = "rule_d_rider_camera_passes_camera_v2"
 STATIC_REFERENCE_MIN_FRAMES = 8
 DETECTOR_BASE_FPS = 30.0
 WAYMO_STORE_FOLDER = "segmentation_store"
@@ -130,6 +130,40 @@ def longest_track_run(frames: Sequence[int], fps: float) -> Optional[Tuple[int, 
     return best
 
 
+def passes_camera(x_values: Sequence[float], left: float, right: float, tolerance: float = 0.0) -> bool:
+    """Return whether a track crosses the camera's path, from one side to the other.
+
+    Having the feet on the road is not enough to be crossing: the pedestrian
+    has to pass in front of the camera. As in the CROWD detector, the box
+    centre must go from left of the middle strip ``[left, right]`` through it
+    to the right of it, or the other way round, in time order. ``tolerance``
+    widens the strip edges into a band where the side does not change, so
+    jitter at an edge is not a pass.
+    """
+    left_hard, left_soft = float(left) - float(tolerance), float(left) + float(tolerance)
+    right_soft, right_hard = float(right) - float(tolerance), float(right) + float(tolerance)
+    state, seen_left, seen_right = None, False, False
+    for value in x_values:
+        x = float(value)
+        if state is None:
+            state = 0 if x < left else (2 if x > right else 1)
+        elif x <= left_hard:
+            state = 0
+        elif x >= right_hard:
+            state = 2
+        elif left_soft <= x <= right_soft:
+            state = 1
+        if state == 0:
+            if seen_right:
+                return True
+            seen_left = True
+        elif state == 2:
+            if seen_left:
+                return True
+            seen_right = True
+    return False
+
+
 def independent_motion_rejection(
     window: pl.DataFrame,
     track_id: Any,
@@ -175,6 +209,7 @@ def box_only_candidates(
     features_by_track: Mapping[str, Any],
     fps: float,
     minimum_x_range: float,
+    camera_strip: Optional[Tuple[float, float, float]] = None,
 ) -> Tuple[List[Any], Dict[Any, Tuple[int, int]], Dict[Any, float]]:
     """Return the tracks that could satisfy rule D, before any segmentation.
 
@@ -187,7 +222,8 @@ def box_only_candidates(
     ``features_by_track`` holds speed-model features computed on each track
     restricted to its candidate bounds, keyed by normalised id. Returns the
     candidate ids, their ``(start_frame, end_frame)`` bounds and their box
-    size change rates.
+    size change rates. ``camera_strip`` is ``(left, right, tolerance)``; when
+    given, a candidate must also pass in front of the camera (passes_camera).
     """
     candidates: List[Any] = []
     bounds: Dict[Any, Tuple[int, int]] = {}
@@ -202,6 +238,9 @@ def box_only_candidates(
         if rows.height < minimum_rows:
             continue
         x_range = float(rows["x-center"].max() - rows["x-center"].min())
+        if camera_strip is not None:
+            if not passes_camera(rows.sort("frame-count")["x-center"].to_list(), *camera_strip):
+                continue
         features = features_by_track.get(crossing_metrics.normalise_id(track_id))
         if x_range < float(minimum_x_range) or features is None:
             continue
