@@ -230,6 +230,22 @@ The file server credentials (`ftp_username`, `ftp_password`, `ftp_token`) in `se
 For working with external APIs of [VideoFiles](https://files.mobility-squad.com/), [GeoNames](https://www.geonames.org), [BEA](https://apps.bea.gov/api/signup), [TomTom](https://developer.tomtom.com/user/register), [Trafikab](https://www.trafiklab.se/api/trafiklab-apis), and [Numbeo](https://www.numbeo.com/common/api.jsp) (paid), the API keys need to be placed in file `secret` (no extension) in the root of the project. The file needs to be formatted as `default.secret`. These keys are optional for just running the analysis on the dataset, except for the file server credentials needed by the segmentation pass.
 
 
+### Checking crossings by hand
+`crossing_review.py` is a small local web tool for counting, on real footage, how well crossings are detected. Start it and open the address it prints:
+
+```bash
+uv run python crossing_review.py
+```
+
+Enter a video id. The page lists that video's segments from `mapping.csv`; picking one runs the detection worker and the configured `crossing_rule` on it (the first time takes a few minutes, after that it is cached in `_output/crossing_review/segments/`) and plays the video with every YOLO person box drawn on it. Click a box to judge it, and press `M` (or Shift-click) where a pedestrian crosses without any box. The counts are:
+
+1. **Crossed, not detected by YOLO**: marked where there is no box.
+2. **Detected crossing, algorithm missed**: a person box (grey, or blue for a candidate the rule rejected) marked as crossing.
+3. **Algorithm crossing, real**: a crossing the algorithm counted (yellow until judged) confirmed as real.
+4. **Algorithm crossing, fake**: a crossing the algorithm counted that is not one.
+
+From these it shows precision (3 / (3 + 4)) and recall (3 / (1 + 2 + 3)), for the segment or the whole video. Labels are saved after every change in `_output/crossing_review/labels/<video_id>.json`, and **Export CSV** writes the counts per segment. The video is streamed through the tool with the credentials from the secrets file. Detection files missing locally are downloaded from the file server's `data` alias (`--csv-url-path`) and converted to Parquet. The road-surface rule needs the GPU, so analysing a new segment competes with a running `analysis.py`.
+
 ### Waymo calibration: current results and what was tried
 Crossing speeds are reported in m/s by a speed model calibrated on the [Waymo Open Dataset](https://waymo.com/open/), whose lidar-derived pedestrian speeds serve as the reference. The analysis refuses to run without a qualified model rather than falling back to a relative index. When `process_waymo_if_missing` is enabled, the raw Waymo TFRecords are exported (in Docker if available, otherwise in a local `uv` environment), tracked with YOLO and BoT-SORT at `yolo_imgsz`, and the speed model is fitted on the Waymo training split and tested once on the untouched validation split. The model is only used when it passes both the cross-validation and the external validation checks.
 
