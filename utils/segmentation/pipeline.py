@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -46,12 +47,13 @@ WINDOW_PADDING_SECONDS = 2.0
 # the gap; splitting on it keeps a single stale id from producing an
 # hours-long decode window.
 TRACK_SPAN_GAP_SECONDS = 2.0
-# Hard ceiling on one ffmpeg window, applied after splitting and merging.
-# No real pedestrian crossing (plus its padded approach and departure) lasts
-# this long; a window still this large is a sign the id-reuse split above
-# missed a case, and decoding it would risk an ffmpeg timeout or, for a
-# window that does complete, materialising tens of gigabytes of raw frames in
-# memory at once.
+# Longest single ffmpeg window, applied after splitting and merging. Decoding
+# a much longer one at once risks an ffmpeg timeout and holding gigabytes of
+# raw frames in memory. A longer merged window is cut into consecutive pieces
+# of at most this length rather than dropped: in a busy street the spans of
+# many pedestrians crossing one after another chain into one long window, and
+# dropping it lost every crossing in it (on one reviewed Chinese segment, 16
+# of the 20 crossers YOLO detected but the rule missed).
 MAXIMUM_WINDOW_SECONDS = 120.0
 # Widen each refinement bracket slightly so the transition cannot sit exactly
 # on its edge and be missed by rounding.
@@ -119,7 +121,7 @@ class SegmentationPipeline:
             "videos_unresolved": 0,
             "videos_fps_unprobed": 0,
             "videos_fps_fractional": 0,
-            "windows_too_long_dropped": 0,
+            "windows_split": 0,
         }
 
     # ------------------------------------------------------------------
@@ -485,16 +487,16 @@ class SegmentationPipeline:
         windows = self._merge_spans(spans)
         kept: List[FrameWindow] = []
         for window in windows:
-            if window.duration_seconds > MAXIMUM_WINDOW_SECONDS:
-                logger.warning(
-                    f"Dropping a {window.duration_seconds:.1f}s window for "
-                    f"{request.stem} at {window.start_seconds:.1f}s; longer "
-                    f"than the {MAXIMUM_WINDOW_SECONDS:.0f}s ceiling for a "
-                    "single crossing, likely a reused tracker id."
-                )
-                self._count("windows_too_long_dropped", 1)
+            if window.duration_seconds <= MAXIMUM_WINDOW_SECONDS:
+                kept.append(window)
                 continue
-            kept.append(window)
+            pieces = int(math.ceil(window.duration_seconds / MAXIMUM_WINDOW_SECONDS))
+            length = window.duration_seconds / pieces
+            kept.extend(
+                FrameWindow(start_seconds=window.start_seconds + index * length, duration_seconds=length)
+                for index in range(pieces)
+            )
+            self._count("windows_split", 1)
         return kept
 
     @staticmethod

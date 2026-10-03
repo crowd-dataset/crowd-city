@@ -30,7 +30,9 @@ logger = CustomLogger(__name__)
 # rate instead of the integer rate in the file name. v1 labels were read under
 # boxes that drift by one frame every ~33 s on 29.97 fps footage, so they are
 # re-segmented rather than reused.
-INDEX_SCHEMA = "crowd_surface_index_v2"
+# v3: merged windows longer than the per-window ceiling are split instead of
+# dropped, so v2 entries can be missing whole stretches of crossing tracks.
+INDEX_SCHEMA = "crowd_surface_index_v3"
 INDEX_FOLDER = "index"
 MANIFEST_FOLDER = "manifest"
 URL_CACHE_FILE = "video_urls.json"
