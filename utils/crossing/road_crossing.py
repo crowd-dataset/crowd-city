@@ -68,7 +68,15 @@ TRACK_GAP_SECONDS = 2.0
 MINIMUM_RELATIVE_X_RANGE = 0.08
 # Recorded in the results.pickle fingerprint; bump when rule D changes, so
 # cached results from an earlier version of the rule are not reused.
-ROAD_CROSSING_RULE_VERSION = "rule_d_rider_camera_passes_camera_v2"
+ROAD_CROSSING_RULE_VERSION = "rule_d_rider_camera_passes_camera_tol003_v3"
+# How far past each edge of the middle strip a track must go to count as
+# having passed in front of the camera (passes_camera). A pedestrian standing
+# far ahead can be carried just across the strip when the car turns; with
+# 0.03 such a case on a reviewed CROWD segment (0.43 -> 0.58) is rejected,
+# while 151 of the 153 real Waymo training crossers that pass the strip and
+# all 24 validation ones are kept. The detector's own tolerance (the frozen
+# "tol") is left unchanged.
+PASS_TOLERANCE = 0.03
 STATIC_REFERENCE_MIN_FRAMES = 8
 DETECTOR_BASE_FPS = 30.0
 WAYMO_STORE_FOLDER = "segmentation_store"

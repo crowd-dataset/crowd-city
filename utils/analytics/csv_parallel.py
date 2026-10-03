@@ -567,6 +567,7 @@ def _road_crossing_candidates(
     and frozen speed model the detector's picks use.
     """
     from utils.crossing.road_crossing import (
+        PASS_TOLERANCE,
         box_only_candidates,
         independent_motion_rejection,
         longest_track_run,
@@ -592,11 +593,12 @@ def _road_crossing_candidates(
         scene_profile,
     )
     # A crossing pedestrian passes in front of the camera: through the same
-    # middle strip the CROWD detector uses (the frozen parameters, else config).
+    # middle strip the CROWD detector uses (the frozen parameters, else config),
+    # with rule D's own edge tolerance.
     camera_strip = (
         float(_WORKER_CROSSING_PARAMETERS.get("boundary_left", _WORKER_BOUNDARY_LEFT)),
         float(_WORKER_CROSSING_PARAMETERS.get("boundary_right", _WORKER_BOUNDARY_RIGHT)),
-        float(_WORKER_CROSSING_PARAMETERS.get("tol", 0.0)),
+        PASS_TOLERANCE,
     )
     ids, bounds, size_rates = box_only_candidates(
         track_index,
