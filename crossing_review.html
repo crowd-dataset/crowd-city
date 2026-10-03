@@ -49,6 +49,8 @@
   .chip { font-size: 11px; padding: 1px 6px; border-radius: 10px; color: #fff; background: var(--c); white-space: nowrap; }
   .row button { padding: 2px 7px; font-size: 12px; }
   .hint { font-size: 12px; color: var(--muted); }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; color: var(--muted); }
+  .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border: 2px solid var(--c); margin-right: 4px; vertical-align: -1px; }
   #status { font-size: 12px; color: var(--muted); margin-left: auto; }
   kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; font-size: 11px; }
   .note { font-size: 12px; padding: 6px 8px; border-radius: 6px; background: color-mix(in srgb, var(--accent) 8%, transparent); margin-bottom: 10px; }
@@ -90,9 +92,14 @@
       </select>
       <input id="seek" type="range" min="0" max="1" step="0.1" value="0">
       <span class="time" id="timeLabel">–</span>
-      <label class="hint"><input type="checkbox" id="showBoxes" disabled> after comparing: show the matched YOLO boxes</label>
     </div>
-    <div class="hint">Watch the segment and <b>click on every pedestrian you see crossing the road</b>, once each, while they are on the road. Click a yellow mark again to remove it.
+    <div class="legend">
+      <span style="--c: var(--mark)">algorithm crossing, not confirmed</span>
+      <span style="--c: var(--c3)">3 · confirmed by you</span>
+      <span style="--c: var(--c2)">2 · you clicked, algorithm missed</span>
+      <span style="--c: var(--c1)">1 · you clicked, no YOLO box</span>
+    </div>
+    <div class="hint">Yellow boxes are the crossings the algorithm counted: <b>click one if it is a real crossing</b> (it turns green). <b>Click any other pedestrian you see crossing</b>: a purple box appears if YOLO detected them, an orange circle if it did not. Click a green or purple box, or an orange circle, again to undo.
       Keys: <kbd>Space</kbd> play, <kbd>←</kbd>/<kbd>→</kbd> 1 s, <kbd>Shift</kbd>+arrows 5 s, <kbd>,</kbd>/<kbd>.</kbd> one frame, <kbd>[</kbd>/<kbd>]</kbd> speed.</div>
   </div>
   <div class="panel">
@@ -101,15 +108,14 @@
     <div class="derived" id="derived"></div>
     <div style="display:flex; gap:6px; margin-bottom:10px; flex-wrap: wrap">
       <button id="segDone">Mark segment fully reviewed</button>
-      <button id="compareBtn" class="primary">Compare</button>
       <button id="exportBtn">Export CSV</button>
     </div>
     <div id="runNote" class="note" style="display:none"></div>
     <h2>Your crossings</h2>
     <div id="markList" class="hint">–</div>
     <div id="fakeBlock" style="display:none">
-      <h2 style="margin-top:14px">4. Algorithm crossings you did not click</h2>
-      <div class="hint" style="margin-bottom:4px">Check each one with Go (its box is shown in red). If it is a real crossing you missed, click the person and compare again.</div>
+      <h2 style="margin-top:14px">Algorithm crossings not confirmed</h2>
+      <div class="hint" style="margin-bottom:4px">These count as fake (category 4) unless you confirm them. Go jumps to each.</div>
       <div id="fakeList"></div>
     </div>
   </div>
@@ -122,8 +128,8 @@ const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
 const state = {
-  videoId: null, info: null, seg: null, data: null, byId: {},
-  labels: { video_id: null, segments: {} }, compare: null, focusFake: null,
+  videoId: null, info: null, seg: null, data: null, byId: {}, segData: {},
+  labels: { video_id: null, segments: {} },
   scope: "segment", poll: null,
 };
 const CATS = [
@@ -132,8 +138,12 @@ const CATS = [
   { key: "real", label: "Crossing detected by YOLO and counted by the algorithm", color: "--c3" },
   { key: "fake", label: "Fake crossing counted by the algorithm", color: "--c4" },
 ];
-const CAT_CHIP = { 0: ["duplicate", "--dup"], 1: ["1 · YOLO missed", "--c1"], 2: ["2 · algorithm missed", "--c2"], 3: ["3 · counted", "--c3"] };
+const CAT_CHIP = { 1: ["1 · YOLO missed", "--c1"], 2: ["2 · algorithm missed", "--c2"], 3: ["3 · confirmed", "--c3"] };
 const MARK_RADIUS = 16, MARK_SHOW_SECONDS = 1.5;
+// A click matches a YOLO box shown within MATCH_WINDOW s; boxes are enlarged by
+// MATCH_MARGIN of their size; a counted crossing is shown, and can be confirmed,
+// within BOUNDS_SLACK s of the frames the algorithm accepted.
+const MATCH_WINDOW = 0.5, MATCH_MARGIN = 0.15, BOUNDS_SLACK = 2.0;
 
 function fmt(t) {
   if (!isFinite(t)) return "–";
@@ -158,7 +168,7 @@ async function loadVideo() {
   try { info = await api("/api/video?video_id=" + encodeURIComponent(id)); }
   catch (error) { setStatus(error.message); return; }
   clearInterval(state.poll);
-  state.info = info; state.videoId = id; state.seg = null; state.data = null; state.compare = null;
+  state.info = info; state.videoId = id; state.seg = null; state.data = null; state.segData = {};
   history.replaceState(null, "", "?video=" + encodeURIComponent(id));
   $("cityLabel").textContent = info.city + " · " + info.segments.length + " segment(s)";
   try { state.labels = await api("/api/labels?video_id=" + encodeURIComponent(id)); } catch { state.labels = {}; }
@@ -179,7 +189,7 @@ function showProcessing(p) {
     p.status === "error" ? "Processing failed: " + p.message : (p.message || "");
   $("overlayMsg").style.display = "flex";
   $("overlayMsg").textContent = ready ? "Pick a segment on the left." : "Process the video to start reviewing.";
-  if (ready && !video.getAttribute("src")) video.src = "/video/" + encodeURIComponent(state.videoId);
+  if (ready && !video.getAttribute("src")) { video.src = "/video/" + encodeURIComponent(state.videoId); loadAllSegments(); }
 }
 function pollProcessing() {
   clearInterval(state.poll);
@@ -216,12 +226,22 @@ function renderSegments() {
     box.appendChild(div);
   }
 }
+async function segmentData(start) {
+  if (!state.segData[start]) {
+    const data = await api(`/api/segment?video_id=${encodeURIComponent(state.videoId)}&start=${start}`);
+    data.byId = Object.fromEntries(data.tracks.map((t) => [t.id, t]));
+    state.segData[start] = data;
+  }
+  return state.segData[start];
+}
+async function loadAllSegments() {
+  for (const s of state.info.segments) { try { await segmentData(s.start); } catch { /* not processed */ } }
+  renderSide();
+}
 async function openSegment(s) {
-  state.seg = s; state.focusFake = null;
-  try {
-    const data = await api(`/api/segment?video_id=${encodeURIComponent(state.videoId)}&start=${s.start}`);
-    state.data = data; state.byId = Object.fromEntries(data.tracks.map((t) => [t.id, t]));
-  } catch (error) { setStatus(error.message); return; }
+  state.seg = s;
+  try { state.data = await segmentData(s.start); state.byId = state.data.byId; }
+  catch (error) { setStatus(error.message); return; }
   $("overlayMsg").style.display = "none";
   $("seek").min = s.start; $("seek").max = s.end;
   seek(s.start); renderSegments(); renderSide();
@@ -239,83 +259,103 @@ function changed() {
 }
 
 // ---------------- results ----------------
-function compared(start) { return state.compare && state.compare.segments[String(start)]; }
-function categoryOf(start, mark) {
-  const c = compared(start);
-  if (!c) return null;
-  const found = c.marks.find((m) => Math.abs(m.t - mark.t) < 0.005 && Math.abs(m.x - mark.x) < 1e-4 && Math.abs(m.y - mark.y) < 1e-4);
-  return found || null;
+function boxNear(track, time) {
+  const ts = track.t;
+  if (time < ts[0] - MATCH_WINDOW || time > ts[ts.length - 1] + MATCH_WINDOW) return null;
+  let lo = 0, hi = ts.length - 1;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (ts[mid] <= time) lo = mid; else hi = mid - 1; }
+  const best = [lo, lo + 1].filter((i) => i < ts.length).sort((a, b) => Math.abs(ts[a] - time) - Math.abs(ts[b] - time))[0];
+  return Math.abs(ts[best] - time) <= MATCH_WINDOW ? track.b[best] : null;
+}
+function matchClick(data, mark) {
+  let best = null, bestScore = Infinity;
+  for (const track of data.tracks) {
+    const box = boxNear(track, mark.t);
+    if (!box) continue;
+    const [cx, cy, w, h] = box;
+    const dx = Math.abs(mark.x - cx) / Math.max(w * (0.5 + MATCH_MARGIN), 1e-6), dy = Math.abs(mark.y - cy) / Math.max(h * (0.5 + MATCH_MARGIN), 1e-6);
+    if (dx <= 1 && dy <= 1 && dx * dx + dy * dy < bestScore) { best = track; bestScore = dx * dx + dy * dy; }
+  }
+  return best;
+}
+function countedWindow(data, id) {
+  const w = (data.counted_windows || {})[id];
+  if (w) return w;
+  const t = data.byId[id];
+  return t ? [t.t[0], t.t[t.t.length - 1]] : null;
+}
+// Category of one click: 3 confirms a counted crossing, 2 is a YOLO track the
+// algorithm did not count, 1 has no YOLO box.
+function categoryOf(data, mark) {
+  if (!mark.track) return 1;
+  const w = data.counted.includes(mark.track) ? countedWindow(data, mark.track) : null;
+  return w && mark.t >= w[0] - BOUNDS_SLACK && mark.t <= w[1] + BOUNDS_SLACK ? 3 : 2;
+}
+function segmentResult(start) {
+  const data = state.segData[start];
+  const lab = state.labels.segments[String(start)] || { crossings: [] };
+  const r = { yolo: 0, algo: 0, real: 0, fake: 0, confirmed: new Set(), unconfirmed: [], ready: !!data };
+  if (!data) return r;
+  for (const mark of lab.crossings || []) {
+    const c = categoryOf(data, mark);
+    if (c === 1) r.yolo++; else if (c === 2) r.algo++; else { r.real++; r.confirmed.add(mark.track); }
+  }
+  r.unconfirmed = data.counted.filter((id) => !r.confirmed.has(id));
+  r.fake = r.unconfirmed.length;
+  return r;
 }
 function totals() {
   const starts = state.scope === "segment" ? (state.seg ? [state.seg.start] : []) : (state.info ? state.info.segments.map((s) => s.start) : []);
-  const t = { clicked: 0, yolo: 0, algo: 0, real: 0, fake: 0, comparedSegs: 0, notReviewed: 0, stale: false };
+  const t = { yolo: 0, algo: 0, real: 0, fake: 0, segments: 0, notReviewed: 0 };
   for (const start of starts) {
+    const r = segmentResult(start);
+    if (!r.ready) continue;
+    t.segments++; t.yolo += r.yolo; t.algo += r.algo; t.real += r.real; t.fake += r.fake;
     const lab = state.labels.segments[String(start)];
-    t.clicked += lab && lab.crossings ? lab.crossings.length : 0;
-    const c = compared(start);
-    if (!c) continue;
-    t.comparedSegs++;
-    t.yolo += c.counts.yolo; t.algo += c.counts.algo; t.real += c.counts.real;
-    t.fake += c.counts.fake; if (!c.reviewed) t.notReviewed++;
-    if ((lab ? lab.crossings.length : 0) !== c.marks.length) t.stale = true;
+    if (!(lab && lab.reviewed)) t.notReviewed++;
   }
   return t;
 }
 function renderSide() {
-  const t = totals(), have = t.comparedSegs > 0;
+  const t = totals();
   $("tiles").innerHTML = CATS.map((cat, i) =>
-    `<div class="tile" style="--c: var(${cat.color})"><div class="n">${have ? t[cat.key] : "–"}</div><div class="l">${i + 1}. ${cat.label}</div></div>`).join("");
+    `<div class="tile" style="--c: var(${cat.color})"><div class="n">${t[cat.key]}</div><div class="l">${i + 1}. ${cat.label}</div></div>`).join("");
   const pct = (a, b) => (b ? (100 * a / b).toFixed(0) + "%" : "–");
-  let text = `You clicked <b>${t.clicked}</b> crossing(s).`;
-  if (have) {
-    const truth = t.yolo + t.algo + t.real, found = t.real + t.fake;
-    text += ` Real crossings: <b>${truth}</b>; the algorithm counted <b>${found}</b>.` +
-      `<br>Precision ${pct(t.real, found)} · recall ${pct(t.real, truth)} · recall among YOLO detections ${pct(t.real, t.real + t.algo)} · YOLO detected ${pct(t.algo + t.real, truth)}`;
-  } else text += "<br>The four counts appear after <b>Compare</b>.";
-  $("derived").innerHTML = text;
+  const truth = t.yolo + t.algo + t.real, found = t.real + t.fake;
+  $("derived").innerHTML = `Real crossings: <b>${truth}</b>; the algorithm counted <b>${found}</b>.` +
+    `<br>Precision ${pct(t.real, found)} · recall ${pct(t.real, truth)} · recall among YOLO detections ${pct(t.real, t.real + t.algo)} · YOLO detected ${pct(t.algo + t.real, truth)}`;
   const notes = [];
-  if (state.compare && state.compare.rule) notes.push("Compared with the algorithm (crossing_rule " + state.compare.rule + ").");
-  if (t.stale) notes.push("<b>You changed your clicks since comparing; compare again.</b>");
-  if (t.notReviewed) notes.push(`${t.notReviewed} compared segment(s) are not marked fully reviewed; crossings you have not reached yet show up as fake.`);
+  if (t.notReviewed) notes.push(`${t.notReviewed} segment(s) here are not marked fully reviewed yet; their unconfirmed crossings count as fake for now.`);
   $("runNote").style.display = notes.length ? "block" : "none"; $("runNote").innerHTML = notes.join("<br>");
   const lab = state.seg ? segLabels(state.seg.start) : null;
   $("segDone").textContent = lab && lab.reviewed ? "Segment reviewed ✓ (undo)" : "Mark segment fully reviewed";
-  $("showBoxes").disabled = !(state.seg && compared(state.seg.start));
 
   const list = $("markList");
   if (!state.data) { list.innerHTML = "–"; list.classList.add("hint"); $("fakeBlock").style.display = "none"; return; }
   list.classList.remove("hint");
   const marks = [...lab.crossings].sort((a, b) => a.t - b.t);
-  list.innerHTML = marks.length ? "" : "<div class='hint'>No crossings clicked yet.</div>";
+  list.innerHTML = marks.length ? "" : "<div class='hint'>Nothing clicked yet.</div>";
   for (const mark of marks) {
-    const result = categoryOf(state.seg.start, mark);
-    const chip = result ? CAT_CHIP[result.category] : ["not compared", "--mark"];
+    const chip = CAT_CHIP[categoryOf(state.data, mark)];
     const row = document.createElement("div"); row.className = "row";
-    row.innerHTML = `<span class="t">${fmt(mark.t)}</span><span class="id">${result && result.track ? "YOLO id " + result.track : result ? "no YOLO box" : "crossing"}</span>` +
+    row.innerHTML = `<span class="t">${fmt(mark.t)}</span><span class="id">${mark.track ? "YOLO id " + mark.track : "no YOLO box"}</span>` +
       `<span class="chip" style="--c: var(${chip[1]})">${chip[0]}</span>`;
     row.append(button("Go", () => seek(mark.t - 1)), button("✕", () => removeMark(mark)));
     list.appendChild(row);
   }
-  const c = compared(state.seg.start), fakes = $("fakeList");
-  $("fakeBlock").style.display = c ? "block" : "none";
-  if (c) {
-    fakes.innerHTML = c.fake.length ? "" : "<div class='hint'>None.</div>";
-    for (const f of c.fake) {
-      const row = document.createElement("div"); row.className = "row";
-      row.innerHTML = `<span class="t">${fmt(f.t)}</span><span class="id">YOLO id ${f.track}</span>`;
-      row.append(button("Go", () => { state.focusFake = f; seek(f.t - 1); }));
-      fakes.appendChild(row);
-    }
+  const result = segmentResult(state.seg.start), fakes = $("fakeList");
+  $("fakeBlock").style.display = "block";
+  fakes.innerHTML = result.unconfirmed.length ? "" : "<div class='hint'>None.</div>";
+  for (const id of result.unconfirmed) {
+    const w = countedWindow(state.data, id);
+    const row = document.createElement("div"); row.className = "row";
+    row.innerHTML = `<span class="t">${w ? fmt(w[0]) : "?"}</span><span class="id">YOLO id ${id}</span>`;
+    row.append(button("Go", () => seek((w ? w[0] : state.data.start) - 1)));
+    fakes.appendChild(row);
   }
 }
-async function compare() {
-  if (!state.videoId) return;
-  try { state.compare = await api("/api/compare?video_id=" + encodeURIComponent(state.videoId)); setStatus("Compared"); }
-  catch (error) { setStatus("Compare failed: " + error.message); }
-  renderSide();
-}
 
-// ---------------- marks and drawing ----------------
+// ---------------- drawing ----------------
 function videoRect() {
   const w = canvas.clientWidth, h = canvas.clientHeight, vw = video.videoWidth || 16, vh = video.videoHeight || 9;
   const scale = Math.min(w / vw, h / vh);
@@ -333,21 +373,29 @@ function boxAt(track, time) {
   const f = (time - ta) / (tb - ta);
   return a.map((v, i) => v + (b[i] - v) * f);
 }
-function drawBox(track, colour, label, dashed) {
-  const box = track && boxAt(track, video.currentTime);
-  if (!box) return;
-  const r = videoRect(), [cx, cy, bw, bh] = box;
-  const x = r.x + (cx - bw / 2) * r.w, y = r.y + (cy - bh / 2) * r.h;
-  ctx.strokeStyle = colour; ctx.lineWidth = 2.5; ctx.setLineDash(dashed ? [6, 4] : []);
-  ctx.strokeRect(x, y, bw * r.w, bh * r.h); ctx.setLineDash([]);
-  ctx.font = "12px system-ui, sans-serif";
-  ctx.fillStyle = "rgba(0,0,0,.65)"; ctx.fillRect(x, y - 17, ctx.measureText(label).width + 8, 16);
-  ctx.fillStyle = colour; ctx.fillText(label, x + 4, y - 5);
-}
-function visibleMarks() {
-  if (!state.seg) return [];
-  const time = video.currentTime;
-  return segLabels(state.seg.start).crossings.filter((m) => Math.abs(time - m.t) <= MARK_SHOW_SECONDS);
+// The boxes on screen now: counted crossings (yellow, or green once confirmed)
+// and the YOLO tracks of clicks the algorithm missed (purple).
+function shownBoxes() {
+  if (!state.data) return [];
+  const time = video.currentTime, r = videoRect(), out = [], data = state.data;
+  const marks = segLabels(state.seg.start).crossings;
+  const push = (track, colour, label, mark) => {
+    const box = boxAt(track, time);
+    if (!box) return;
+    const [cx, cy, bw, bh] = box;
+    out.push({ track, colour, label, mark, x: r.x + (cx - bw / 2) * r.w, y: r.y + (cy - bh / 2) * r.h, w: bw * r.w, h: bh * r.h });
+  };
+  for (const id of data.counted) {
+    const w = countedWindow(data, id);
+    if (!w || time < w[0] - BOUNDS_SLACK || time > w[1] + BOUNDS_SLACK) continue;
+    const mark = marks.find((m) => m.track === id && categoryOf(data, m) === 3);
+    push(data.byId[id], css(mark ? "--c3" : "--mark"), "id " + id + (mark ? " · confirmed" : ""), mark);
+  }
+  for (const mark of marks) {
+    if (categoryOf(data, mark) !== 2 || Math.abs(time - mark.t) > 30) continue;
+    push(data.byId[mark.track], css("--c2"), "id " + mark.track + " · algorithm missed", mark);
+  }
+  return out;
 }
 function draw() {
   const dpr = window.devicePixelRatio || 1;
@@ -357,18 +405,20 @@ function draw() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
   if (state.data) {
+    for (const b of shownBoxes()) {
+      ctx.strokeStyle = b.colour; ctx.lineWidth = 2.5; ctx.strokeRect(b.x, b.y, b.w, b.h);
+      ctx.font = "12px system-ui, sans-serif";
+      ctx.fillStyle = "rgba(0,0,0,.65)"; ctx.fillRect(b.x, b.y - 17, ctx.measureText(b.label).width + 8, 16);
+      ctx.fillStyle = b.colour; ctx.fillText(b.label, b.x + 4, b.y - 5);
+    }
     const r = videoRect(), time = video.currentTime;
-    for (const m of visibleMarks()) {
-      const result = categoryOf(state.seg.start, m);
-      const colour = result ? css(CAT_CHIP[result.category][1]) : css("--mark");
+    for (const m of segLabels(state.seg.start).crossings) {
+      if (m.track || Math.abs(time - m.t) > MARK_SHOW_SECONDS) continue;
       ctx.globalAlpha = Math.max(0.3, 1 - Math.abs(time - m.t) / MARK_SHOW_SECONDS);
-      ctx.strokeStyle = colour; ctx.lineWidth = 3;
+      ctx.strokeStyle = css("--c1"); ctx.lineWidth = 3;
       ctx.beginPath(); ctx.arc(r.x + m.x * r.w, r.y + m.y * r.h, MARK_RADIUS, 0, 2 * Math.PI); ctx.stroke();
       ctx.globalAlpha = 1;
-      if (result && result.track && $("showBoxes").checked) drawBox(state.byId[result.track], colour, "YOLO id " + result.track, false);
     }
-    const f = state.focusFake;
-    if (f && time >= f.t - 2 && time <= f.t_end + 2) drawBox(state.byId[f.track], css("--c4"), "algorithm counted id " + f.track, true);
     if (time >= state.data.end && !video.paused) video.pause();
   }
   $("timeLabel").textContent = state.data ? `${fmt(video.currentTime)} / segment ${fmt(state.data.start)}–${fmt(state.data.end)}` : fmt(video.currentTime);
@@ -389,11 +439,27 @@ function removeMark(mark) {
 canvas.addEventListener("click", (event) => {
   if (!state.data) return;
   const rect = canvas.getBoundingClientRect(), x = event.clientX - rect.left, y = event.clientY - rect.top, r = videoRect();
-  const hitMark = visibleMarks().find((m) => Math.hypot(r.x + m.x * r.w - x, r.y + m.y * r.h - y) <= MARK_RADIUS + 4);
-  if (hitMark) { removeMark(hitMark); return; }
-  const mark = { t: +video.currentTime.toFixed(2), x: +((x - r.x) / r.w).toFixed(4), y: +((y - r.y) / r.h).toFixed(4) };
+  const time = +video.currentTime.toFixed(2);
+  const mark = { t: time, x: +((x - r.x) / r.w).toFixed(4), y: +((y - r.y) / r.h).toFixed(4) };
   if (mark.x < 0 || mark.x > 1 || mark.y < 0 || mark.y > 1) return;
-  segLabels(state.seg.start).crossings.push(mark);
+  const marks = segLabels(state.seg.start).crossings;
+  // A click on an orange circle removes it.
+  const circle = marks.find((m) => !m.track && Math.abs(time - m.t) <= MARK_SHOW_SECONDS &&
+    Math.hypot(r.x + m.x * r.w - x, r.y + m.y * r.h - y) <= MARK_RADIUS + 4);
+  if (circle) { removeMark(circle); return; }
+  // A click on a box: green or purple undoes the click, yellow confirms it.
+  const hits = shownBoxes().filter((b) => x >= b.x - 4 && x <= b.x + b.w + 4 && y >= b.y - 4 && y <= b.y + b.h + 4)
+    .sort((a, b) => a.w * a.h - b.w * b.h);
+  if (hits.length) {
+    const hit = hits[0];
+    if (hit.mark) removeMark(hit.mark);
+    else { marks.push({ ...mark, track: hit.track.id }); changed(); }
+    return;
+  }
+  // Anyone else: the YOLO track under the click, if there is one.
+  const track = matchClick(state.data, mark);
+  if (track && marks.some((m) => m.track === track.id && Math.abs(m.t - time) < 15)) return;
+  marks.push({ ...mark, track: track ? track.id : null });
   changed();
 });
 
@@ -407,7 +473,6 @@ const frameStep = () => 1 / ((state.data && state.data.video_fps) || 30);
 document.querySelectorAll("[data-frame]").forEach((b) => (b.onclick = () => { video.pause(); seek(video.currentTime + b.dataset.frame * frameStep()); }));
 $("speed").onchange = () => (video.playbackRate = +$("speed").value);
 $("seek").oninput = () => seek(+$("seek").value);
-$("compareBtn").onclick = compare;
 $("processBtn").onclick = startProcessing;
 $("scopeSeg").onclick = () => { state.scope = "segment"; $("scopeSeg").classList.add("sel"); $("scopeVideo").classList.remove("sel"); renderSide(); };
 $("scopeVideo").onclick = () => { state.scope = "video"; $("scopeVideo").classList.add("sel"); $("scopeSeg").classList.remove("sel"); renderSide(); };
@@ -416,11 +481,10 @@ $("exportBtn").onclick = () => {
   if (!state.info) return;
   const lines = ["video_id,city,segment_start,segment_end,reviewed,crossings_clicked,not_detected_by_yolo,detected_algorithm_missed,detected_and_counted,fake"];
   for (const s of state.info.segments) {
-    const lab = state.labels.segments[String(s.start)], c = compared(s.start);
-    if (!lab && !c) continue;
-    const n = c ? c.counts : {};
+    const lab = state.labels.segments[String(s.start)], n = segmentResult(s.start);
+    if (!n.ready) continue;
     lines.push([state.videoId, `"${state.info.city}"`, s.start, s.end, !!(lab && lab.reviewed),
-                lab && lab.crossings ? lab.crossings.length : 0, n.yolo ?? "", n.algo ?? "", n.real ?? "", n.fake ?? ""].join(","));
+                lab && lab.crossings ? lab.crossings.length : 0, n.yolo, n.algo, n.real, n.fake].join(","));
   }
   const link = document.createElement("a");
   link.href = URL.createObjectURL(new Blob([lines.join("\n") + "\n"], { type: "text/csv" }));

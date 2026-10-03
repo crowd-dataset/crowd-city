@@ -11,14 +11,16 @@ any reviewing starts, so nothing lags afterwards:
 * the crossing algorithm (detection worker, then ``crossing_rule``, with the
   current config) runs on every full segment, reading the local video.
 
-While reviewing, nothing is drawn on the video, so neither YOLO nor the
-algorithm can bias the reviewer, who clicks on every pedestrian seen crossing
-the road. **Compare** then sorts each click:
+While reviewing, the crossings the algorithm counted are drawn as yellow
+boxes. The reviewer clicks one to confirm it is a real crossing (it turns
+green), and clicks every other pedestrian seen crossing: if a YOLO person box
+is there it is drawn in purple, otherwise an orange circle marks the spot. The
+page keeps four counts as the reviewer goes:
 
-1. crossing, not detected by YOLO: no YOLO person box at that spot and moment,
-2. crossing detected by YOLO, missed by the algorithm,
-3. crossing detected by YOLO and counted by the algorithm,
-4. fake crossing: a crossing the algorithm counted that was never clicked.
+1. crossing, not detected by YOLO (orange),
+2. crossing detected by YOLO, missed by the algorithm (purple),
+3. crossing detected by YOLO and counted by the algorithm (green),
+4. fake crossing: a counted crossing never confirmed (still yellow).
 
 Labels are saved after every change in
 ``_output/crossing_review/labels/<video_id>.json``. The file-server
@@ -28,7 +30,6 @@ credentials come from the secrets file and never reach the browser.
 from __future__ import annotations
 
 import argparse
-import bisect
 import dataclasses
 import json
 import os
@@ -39,7 +40,7 @@ import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlsplit
 
 import polars as pl
@@ -70,17 +71,6 @@ SERVE_CHUNK_BYTES = 256 * 1024
 VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
 # Bumped when the cached segment files change shape or meaning.
 SEGMENT_CACHE_VERSION = 3
-
-# A click matches a YOLO person box shown within this many seconds of it, so a
-# box missing for a frame or two does not turn a detected person into a miss.
-MATCH_WINDOW_SECONDS = 0.5
-# Boxes are enlarged by this fraction of their size when testing a click.
-MATCH_MARGIN = 0.15
-# A counted crossing covers the track's frames the algorithm accepted; the
-# tracker can reuse an id later for someone else, so a click must fall near them.
-BOUNDS_SLACK_SECONDS = 2.0
-# Two clicks on the same track this close together are the same person.
-DUPLICATE_SECONDS = 15.0
 
 
 # ---------------------------------------------------------------------------
@@ -504,84 +494,6 @@ class Processor:
 
 
 # ---------------------------------------------------------------------------
-# Sorting the clicks
-# ---------------------------------------------------------------------------
-
-def _box_near(track: Dict[str, Any], time_s: float) -> Optional[List[float]]:
-    """The track's box closest in time to ``time_s``, if within MATCH_WINDOW_SECONDS."""
-    times = track["t"]
-    if time_s < times[0] - MATCH_WINDOW_SECONDS or time_s > times[-1] + MATCH_WINDOW_SECONDS:
-        return None
-    index = bisect.bisect_left(times, time_s)
-    candidates = [i for i in (index - 1, index) if 0 <= i < len(times)]
-    best = min(candidates, key=lambda i: abs(times[i] - time_s))
-    return track["b"][best] if abs(times[best] - time_s) <= MATCH_WINDOW_SECONDS else None
-
-
-def match_click(tracks: List[Dict[str, Any]], mark: Dict[str, float]) -> Optional[Dict[str, Any]]:
-    """Return the YOLO person track under a click, or None when there is none."""
-    best, best_score = None, None
-    for track in tracks:
-        box = _box_near(track, float(mark["t"]))
-        if box is None:
-            continue
-        cx, cy, width, height = box
-        dx = abs(float(mark["x"]) - cx) / max(width * (0.5 + MATCH_MARGIN), 1e-6)
-        dy = abs(float(mark["y"]) - cy) / max(height * (0.5 + MATCH_MARGIN), 1e-6)
-        if dx <= 1 and dy <= 1:
-            score = dx * dx + dy * dy
-            if best_score is None or score < best_score:
-                best, best_score = track, score
-    return best
-
-
-def compare_segment(data: Dict[str, Any], marks: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Sort a segment's clicks into the four categories against the algorithm's crossings."""
-    tracks = data.get("tracks") or []
-    by_id = {track["id"]: track for track in tracks}
-    counted = set(data.get("counted") or [])
-    windows: Dict[str, Tuple[float, float]] = data.get("counted_windows") or {}
-    results, claimed, matched_at = [], set(), {}
-    for mark in sorted(marks, key=lambda item: float(item["t"])):
-        where = {"t": mark["t"], "x": mark["x"], "y": mark["y"]}
-        track = match_click(tracks, mark)
-        if track is None:
-            results.append({**where, "category": 1, "track": None})
-            continue
-        previous = matched_at.get(track["id"])
-        if previous is not None and float(mark["t"]) - previous < DUPLICATE_SECONDS:
-            # The same person clicked twice; category 0 is not counted.
-            # (Further apart, the tracker may have reused the id.)
-            results.append({**where, "category": 0, "track": track["id"]})
-            continue
-        matched_at[track["id"]] = float(mark["t"])
-        is_counted = track["id"] in counted
-        window = windows.get(track["id"])
-        if is_counted and window is not None:
-            is_counted = window[0] - BOUNDS_SLACK_SECONDS <= float(mark["t"]) <= window[1] + BOUNDS_SLACK_SECONDS
-        if is_counted:
-            claimed.add(track["id"])
-        results.append({**where, "category": 3 if is_counted else 2, "track": track["id"]})
-    fake = []
-    for track_id in sorted(counted - claimed):
-        window = windows.get(track_id)
-        track = by_id.get(track_id)
-        first = window[0] if window else (track["t"][0] if track else float(data["start"]))
-        last = window[1] if window else (track["t"][-1] if track else float(data["start"]))
-        fake.append({"track": track_id, "t": first, "t_end": last})
-    return {
-        "marks": results,
-        "fake": fake,
-        "counts": {
-            "yolo": sum(1 for m in results if m["category"] == 1),
-            "algo": sum(1 for m in results if m["category"] == 2),
-            "real": sum(1 for m in results if m["category"] == 3),
-            "fake": len(fake),
-        },
-    }
-
-
-# ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
 
@@ -640,8 +552,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(Processor.segment_path(video_id, start).read_bytes(), "application/json")
             if path == "/api/labels":
                 return self._json(self._labels(video_id))
-            if path == "/api/compare":
-                return self._json(self._compare(video_id, info))
             self._json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -669,21 +579,6 @@ class Handler(BaseHTTPRequestHandler):
             os.replace(temporary, label_path)
             return self._json({"saved": time.strftime("%H:%M:%S")})
         self._json({"error": "not found"}, 404)
-
-    def _compare(self, video_id: str, info: Dict[str, Any]) -> Dict[str, Any]:
-        labels = self._labels(video_id)
-        output: Dict[str, Any] = {"segments": {}}
-        for segment in info["segments"]:
-            if not self.processor.segment_ready(video_id, segment["start"]):
-                continue
-            key = str(segment["start"])
-            lab = (labels.get("segments") or {}).get(key) or {}
-            data = json.loads(Processor.segment_path(video_id, segment["start"]).read_text(encoding="utf-8"))
-            entry = compare_segment(data, lab.get("crossings") or [])
-            entry["reviewed"] = bool(lab.get("reviewed"))
-            output["segments"][key] = entry
-            output["rule"] = data.get("crossing_rule")
-        return output
 
     def _video(self, video_id: str) -> None:
         """Serve the downloaded video with range support, so seeking is instant."""

@@ -239,14 +239,20 @@ uv run python crossing_review.py
 
 Enter a video id and press **Process video**. This does all the slow work once, before you start, so the review itself has no lag: the whole video is downloaded (over 8 parallel connections) into `_output/crossing_review/videos/`, every segment's YOLO person tracks are read (detection files missing locally are fetched from the file server's `data` alias, see `--csv-url-path`, and converted to Parquet), and the crossing algorithm, i.e. the detection worker and then `crossing_rule` with the current `config`, runs on every full segment, reading the local video. An hour of video takes roughly 10 minutes, mostly the download.
 
-Then pick a segment. The video plays from the local copy with nothing drawn on it, so neither YOLO nor the algorithm can bias you. **Click on every pedestrian you see crossing the road**, once each, while they are on the road; click a mark again to remove it. When the segment is done, mark it fully reviewed and press **Compare**. Each click is matched to the YOLO person box at that spot and moment and checked against the algorithm's crossings:
+Then pick a segment. The video plays from the local copy, with the crossings the algorithm counted drawn as **yellow** boxes:
 
-1. **Crossing, not detected by YOLO**: no YOLO person box where you clicked.
-2. **Crossing detected by YOLO, missed by the algorithm**: there is a box, but the algorithm did not count that person as crossing.
-3. **Crossing detected by YOLO and counted by the algorithm**.
-4. **Fake crossing**: a crossing the algorithm counted that you never clicked. These are listed with a **Go** button that shows the counted box, so you can check each one; if it was a real crossing you missed, click it and compare again.
+- **Click a yellow box if it is a real crossing**; it turns **green**.
+- **Click every other pedestrian you see crossing.** If YOLO detected them, a **purple** box appears around them; if not, an **orange** circle marks the spot.
+- Click a green or purple box, or an orange circle, again to undo.
 
-The page shows the four counts per segment or for the whole video, with precision (3 / (3 + 4)), recall (3 / (1 + 2 + 3)) and the share YOLO detected. After comparing, the YOLO box each click was matched to can be shown to check the matching. A second click on the same person within 15 s counts once. Labels are saved after every change in `_output/crossing_review/labels/<video_id>.json`, and **Export CSV** writes the counts per segment. The file-server credentials come from the secrets file and never reach the browser.
+The four counts update as you go:
+
+1. **Crossing, not detected by YOLO**: orange circles.
+2. **Crossing detected by YOLO, missed by the algorithm**: purple boxes.
+3. **Crossing detected by YOLO and counted by the algorithm**: green boxes.
+4. **Fake crossing**: yellow boxes never confirmed. They are listed with a **Go** button, so you can check each before finishing.
+
+The page shows them per segment or for the whole video, with precision (3 / (3 + 4)), recall (3 / (1 + 2 + 3)) and the share YOLO detected. Mark a segment fully reviewed once you have watched all of it. Labels are saved after every change in `_output/crossing_review/labels/<video_id>.json`, and **Export CSV** writes the counts per segment. The file-server credentials come from the secrets file and never reach the browser.
 
 ### Waymo calibration: current results and what was tried
 Crossing speeds are reported in m/s by a speed model calibrated on the [Waymo Open Dataset](https://waymo.com/open/), whose lidar-derived pedestrian speeds serve as the reference. The analysis refuses to run without a qualified model rather than falling back to a relative index. When `process_waymo_if_missing` is enabled, the raw Waymo TFRecords are exported (in Docker if available, otherwise in a local `uv` environment), tracked with YOLO and BoT-SORT at `yolo_imgsz`, and the speed model is fitted on the Waymo training split and tested once on the untouched validation split. The model is only used when it passes both the cross-validation and the external validation checks.
