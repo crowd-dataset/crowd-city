@@ -6,9 +6,8 @@
 <title>Crossing review</title>
 <style>
   :root {
-    --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #5d6676; --line: #dde1e8;
-    --accent: #2459d6; --real: #1f9d55; --fake: #d93a3a; --missed-algo: #8e44ad; --missed-yolo: #e8590c;
-    --marked: #1f9d55; --person: #c9ced8;
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #5d6676; --line: #dde1e8; --accent: #2459d6;
+    --c1: #e8590c; --c2: #8e44ad; --c3: #1f9d55; --c4: #d93a3a; --mark: #ffd400; --dup: #8a93a3;
   }
   @media (prefers-color-scheme: dark) {
     :root { --bg: #14171c; --panel: #1d2128; --ink: #e8ebf0; --muted: #a0a8b6; --line: #2e343e; --accent: #6d95ff; }
@@ -21,7 +20,6 @@
   button, select { font: inherit; padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); cursor: pointer; }
   button:hover { border-color: var(--accent); }
   button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-  button.on { background: var(--missed-yolo); color: #fff; border-color: var(--missed-yolo); }
   #layout { display: grid; grid-template-columns: 230px 1fr 340px; gap: 12px; padding: 12px; height: calc(100vh - 56px); }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow: auto; }
   .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 4px 0 8px; }
@@ -48,13 +46,8 @@
   .row { display: flex; align-items: center; gap: 6px; padding: 5px 4px; border-bottom: 1px solid var(--line); }
   .row .t { font-variant-numeric: tabular-nums; color: var(--muted); width: 54px; }
   .row .id { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .chip { font-size: 11px; padding: 1px 6px; border-radius: 10px; color: #fff; background: var(--c); }
+  .chip { font-size: 11px; padding: 1px 6px; border-radius: 10px; color: #fff; background: var(--c); white-space: nowrap; }
   .row button { padding: 2px 7px; font-size: 12px; }
-  .legend { display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px; color: var(--muted); margin: 6px 0 4px; }
-  .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border: 2px solid var(--c); margin-right: 4px; vertical-align: -1px; }
-  #popover { position: fixed; display: none; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.25); z-index: 10; min-width: 220px; }
-  #popover .title { font-weight: 600; margin-bottom: 6px; }
-  #popover button { display: block; width: 100%; text-align: left; margin-top: 4px; }
   .hint { font-size: 12px; color: var(--muted); }
   #status { font-size: 12px; color: var(--muted); margin-left: auto; }
   kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; font-size: 11px; }
@@ -94,16 +87,9 @@
       </select>
       <input id="seek" type="range" min="0" max="1" step="0.1" value="0">
       <span class="time" id="timeLabel">–</span>
-      <button id="missedBtn" title="M">Crossing without a box</button>
-      <label class="hint"><input type="checkbox" id="showRun" disabled> show the run's crossings</label>
+      <label class="hint"><input type="checkbox" id="showBoxes" disabled> after comparing: show the matched YOLO boxes</label>
     </div>
-    <div class="legend">
-      <span style="--c: var(--person)">YOLO person</span>
-      <span style="--c: var(--marked)">you marked: crossing</span>
-      <span style="--c: var(--missed-yolo)">you marked: crossing without a box</span>
-      <span style="--c: var(--fake)">run counted, you did not mark (after comparing)</span>
-    </div>
-    <div class="hint">Watch the segment and mark every pedestrian who crosses the road: click their box, or, if YOLO drew none, press <kbd>M</kbd> (or Shift-click) and click where they are.
+    <div class="hint">Watch the segment and <b>click on every pedestrian you see crossing the road</b>, once each, while they are on the road. Click a yellow mark again to remove it.
       Keys: <kbd>Space</kbd> play, <kbd>←</kbd>/<kbd>→</kbd> 1 s, <kbd>Shift</kbd>+arrows 5 s, <kbd>,</kbd>/<kbd>.</kbd> one frame, <kbd>[</kbd>/<kbd>]</kbd> speed.</div>
   </div>
   <div class="panel">
@@ -116,16 +102,15 @@
       <button id="exportBtn">Export CSV</button>
     </div>
     <div id="runNote" class="note" style="display:none"></div>
-    <h2>Your marks</h2>
+    <h2>Your crossings</h2>
     <div id="markList" class="hint">–</div>
     <div id="fakeBlock" style="display:none">
-      <h2 style="margin-top:14px">Run's crossings you did not mark</h2>
-      <div class="hint" style="margin-bottom:4px">Check each one: if it is a real crossing you missed, mark it and compare again.</div>
+      <h2 style="margin-top:14px">4. Run's crossings you did not click</h2>
+      <div class="hint" style="margin-bottom:4px">Check each one with Go (its box is shown in red). If it is a real crossing you missed, click the person, then compare again.</div>
       <div id="fakeList"></div>
     </div>
   </div>
 </div>
-<div id="popover"></div>
 
 <script>
 "use strict";
@@ -135,15 +120,17 @@ const css = (name) => getComputedStyle(document.documentElement).getPropertyValu
 
 const state = {
   videoId: null, info: null, seg: null, data: null, byId: {},
-  labels: { video_id: null, segments: {} }, compare: null,
-  scope: "segment", missedMode: false, poll: null, hover: null,
+  labels: { video_id: null, segments: {} }, compare: null, focusFake: null,
+  scope: "segment", poll: null,
 };
 const CATS = [
-  { key: "yolo", label: "Crossed, not detected by YOLO", color: "--missed-yolo" },
-  { key: "algo", label: "Detected crossing, algorithm missed", color: "--missed-algo" },
-  { key: "real", label: "Algorithm crossing, real", color: "--real" },
-  { key: "fake", label: "Algorithm crossing, fake", color: "--fake" },
+  { key: "yolo", label: "Crossing, not detected by YOLO", color: "--c1" },
+  { key: "algo", label: "Crossing detected by YOLO, missed by the algorithm", color: "--c2" },
+  { key: "real", label: "Crossing detected by YOLO and counted by the algorithm", color: "--c3" },
+  { key: "fake", label: "Fake crossing counted by the algorithm", color: "--c4" },
 ];
+const CAT_CHIP = { 0: ["duplicate", "--dup"], 1: ["1 · YOLO missed", "--c1"], 2: ["2 · algorithm missed", "--c2"], 3: ["3 · counted", "--c3"] };
+const MARK_RADIUS = 16, MARK_SHOW_SECONDS = 1.5;
 
 function fmt(t) {
   if (!isFinite(t)) return "–";
@@ -177,26 +164,27 @@ async function loadVideo() {
 }
 function segLabels(start) {
   const key = String(start);
-  if (!state.labels.segments[key]) state.labels.segments[key] = { tracks: {}, yolo_missed: [], reviewed: false };
+  if (!state.labels.segments[key]) state.labels.segments[key] = { crossings: [], reviewed: false };
+  if (!state.labels.segments[key].crossings) state.labels.segments[key].crossings = [];
   return state.labels.segments[key];
 }
 function renderSegments() {
   const box = $("segments"); box.innerHTML = ""; box.classList.remove("hint");
   for (const s of state.info.segments) {
     const lab = state.labels.segments[String(s.start)];
-    const marks = lab ? Object.values(lab.tracks || {}).filter((v) => v === "crossed").length + (lab.yolo_missed || []).length : 0;
+    const marks = lab && lab.crossings ? lab.crossings.length : 0;
     const div = document.createElement("div");
     div.className = "seg" + (state.seg && state.seg.start === s.start ? " active" : "");
     div.innerHTML = `<b>${fmt(s.start)} – ${fmt(s.end)}</b><small>${((s.end - s.start) / 60).toFixed(1)} min · ${s.time_of_day}` +
-      `${marks ? " · " + marks + " marked" : ""}${lab && lab.reviewed ? " · reviewed ✓" : ""}</small>`;
+      `${marks ? " · " + marks + " crossing(s)" : ""}${lab && lab.reviewed ? " · reviewed ✓" : ""}</small>`;
     div.onclick = () => openSegment(s);
     box.appendChild(div);
   }
 }
 async function openSegment(s) {
-  state.seg = s; state.data = null; state.byId = {}; clearInterval(state.poll);
+  state.seg = s; state.data = null; state.byId = {}; state.focusFake = null; clearInterval(state.poll);
   renderSegments(); renderSide();
-  $("overlayMsg").style.display = "flex"; $("overlayMsg").textContent = "Loading the person boxes…";
+  $("overlayMsg").style.display = "flex"; $("overlayMsg").textContent = "Loading the segment…";
   const url = `/api/segment?video_id=${encodeURIComponent(state.videoId)}&start=${s.start}`;
   const check = async () => {
     const result = await api(url);
@@ -205,8 +193,7 @@ async function openSegment(s) {
       state.data = result; state.byId = Object.fromEntries(result.tracks.map((t) => [t.id, t]));
       $("overlayMsg").style.display = "none";
       $("seek").min = result.start; $("seek").max = result.end;
-      seek(result.start); renderSegments(); renderSide();
-      setStatus(`${result.tracks.length} YOLO person track(s) in this segment`);
+      seek(result.start); renderSegments(); renderSide(); setStatus("");
       return true;
     }
     $("overlayMsg").textContent = result.status === "error" ? "Loading failed: " + result.message : (result.message || "Loading…");
@@ -229,83 +216,74 @@ function changed() {
   }, 300);
   renderSegments(); renderSide();
 }
-function isMarked(id) { return state.seg && segLabels(state.seg.start).tracks[id] === "crossed"; }
-function toggleMark(id) {
-  const tracks = segLabels(state.seg.start).tracks;
-  if (tracks[id] === "crossed") delete tracks[id]; else tracks[id] = "crossed";
-  changed();
-}
 
-// ---------------- counting ----------------
-function markCounts(start) {
-  const lab = state.labels.segments[String(start)] || { tracks: {}, yolo_missed: [] };
-  return { boxed: Object.values(lab.tracks || {}).filter((v) => v === "crossed").length, yolo: (lab.yolo_missed || []).length };
-}
+// ---------------- results ----------------
 function compared(start) { return state.compare && state.compare.segments[String(start)]; }
+function categoryOf(start, mark) {
+  const c = compared(start);
+  if (!c) return null;
+  const found = c.marks.find((m) => Math.abs(m.t - mark.t) < 0.005 && Math.abs(m.x - mark.x) < 1e-4 && Math.abs(m.y - mark.y) < 1e-4);
+  return found || null;
+}
 function totals() {
   const starts = state.scope === "segment" ? (state.seg ? [state.seg.start] : []) : (state.info ? state.info.segments.map((s) => s.start) : []);
-  const t = { yolo: 0, boxed: 0, algo: 0, real: 0, fake: 0, comparedSegs: 0, notInRun: 0, notReviewed: 0 };
+  const t = { clicked: 0, yolo: 0, algo: 0, real: 0, fake: 0, comparedSegs: 0, notInRun: 0, notReviewed: 0, stale: false };
   for (const start of starts) {
-    const m = markCounts(start); t.yolo += m.yolo; t.boxed += m.boxed;
+    const lab = state.labels.segments[String(start)];
+    t.clicked += lab && lab.crossings ? lab.crossings.length : 0;
     const c = compared(start);
-    if (c && c.in_run) { t.algo += c.algo; t.real += c.real; t.fake += c.fake; t.comparedSegs++; if (!c.reviewed) t.notReviewed++; }
-    else if (c) t.notInRun++;
+    if (!c) continue;
+    t.comparedSegs++;
+    t.yolo += c.counts.yolo; t.algo += c.counts.algo; t.real += c.counts.real;
+    if (c.in_run) { t.fake += c.counts.fake; if (!c.reviewed) t.notReviewed++; } else t.notInRun++;
+    if ((lab ? lab.crossings.length : 0) !== c.marks.length) t.stale = true;
   }
   return t;
 }
 function renderSide() {
   const t = totals(), have = t.comparedSegs > 0;
-  $("tiles").innerHTML = CATS.map((cat, i) => {
-    const value = cat.key === "yolo" ? t.yolo : (have ? t[cat.key] : "–");
-    return `<div class="tile" style="--c: var(${cat.color})"><div class="n">${value}</div><div class="l">${i + 1}. ${cat.label}</div></div>`;
-  }).join("");
+  $("tiles").innerHTML = CATS.map((cat, i) =>
+    `<div class="tile" style="--c: var(${cat.color})"><div class="n">${have ? t[cat.key] : "–"}</div><div class="l">${i + 1}. ${cat.label}</div></div>`).join("");
   const pct = (a, b) => (b ? (100 * a / b).toFixed(0) + "%" : "–");
-  let text = `You marked <b>${t.boxed + t.yolo}</b> crossing(s): ${t.boxed} with a YOLO box, ${t.yolo} without.`;
+  let text = `You clicked <b>${t.clicked}</b> crossing(s).`;
   if (have) {
     const truth = t.yolo + t.algo + t.real, found = t.real + t.fake;
-    text += `<br>Run counted <b>${found}</b>. Precision ${pct(t.real, found)} · recall ${pct(t.real, truth)} · recall among YOLO detections ${pct(t.real, t.real + t.algo)}`;
-  } else text += "<br>Categories 2–4 appear after <b>Compare with run</b>.";
+    text += ` Real crossings: <b>${truth}</b>; the run counted <b>${found}</b>.` +
+      `<br>Precision ${pct(t.real, found)} · recall ${pct(t.real, truth)} · recall among YOLO detections ${pct(t.real, t.real + t.algo)} · YOLO detected ${pct(t.algo + t.real, truth)}`;
+  } else text += "<br>The four counts appear after <b>Compare with run</b>.";
   $("derived").innerHTML = text;
   const notes = [];
   if (state.compare) notes.push("Compared with the " + state.compare.run + ".");
-  if (t.notInRun) notes.push(`${t.notInRun} segment(s) here were not analysed in that run, so they count only towards category 1.`);
-  if (t.notReviewed) notes.push(`${t.notReviewed} compared segment(s) are not marked fully reviewed yet; unmarked crossings there count as fake.`);
+  if (t.stale) notes.push("<b>You changed your clicks since comparing; compare again.</b>");
+  if (t.notInRun) notes.push(`${t.notInRun} segment(s) were not analysed in that run, so their crossings count as categories 1 and 2 only.`);
+  if (t.notReviewed) notes.push(`${t.notReviewed} compared segment(s) are not marked fully reviewed; crossings you have not reached yet show up as fake.`);
   $("runNote").style.display = notes.length ? "block" : "none"; $("runNote").innerHTML = notes.join("<br>");
   const lab = state.seg ? segLabels(state.seg.start) : null;
   $("segDone").textContent = lab && lab.reviewed ? "Segment reviewed ✓ (undo)" : "Mark segment fully reviewed";
-  $("showRun").disabled = !(state.seg && compared(state.seg.start) && compared(state.seg.start).in_run);
+  $("showBoxes").disabled = !(state.seg && compared(state.seg.start));
 
-  const marks = $("markList");
-  if (!state.data) { marks.innerHTML = "–"; marks.classList.add("hint"); $("fakeBlock").style.display = "none"; return; }
-  marks.classList.remove("hint");
-  const items = [];
-  for (const [id, value] of Object.entries(lab.tracks)) if (value === "crossed") {
-    const track = state.byId[id], c = compared(state.seg.start);
-    const verdict = c && c.in_run ? (c.real_ids.includes(id) ? ["run counted it", "--real"] : ["run missed it", "--missed-algo"]) : ["with box", "--marked"];
-    items.push({ time: track ? track.t[0] : 0, html: `<span class="id">id ${id}</span><span class="chip" style="--c: var(${verdict[1]})">${verdict[0]}</span>`,
-                 go: () => seek((track ? track.t[0] : 0) - 1), del: () => toggleMark(id) });
-  }
-  (lab.yolo_missed || []).forEach((m, i) => items.push({
-    time: m.t, html: `<span class="id">no box</span><span class="chip" style="--c: var(--missed-yolo)">YOLO missed</span>`,
-    go: () => seek(m.t - 1), del: () => { lab.yolo_missed.splice(i, 1); changed(); } }));
-  items.sort((a, b) => a.time - b.time);
-  marks.innerHTML = items.length ? "" : "<div class='hint'>Nothing marked yet.</div>";
-  for (const item of items) {
+  const list = $("markList");
+  if (!state.data) { list.innerHTML = "–"; list.classList.add("hint"); $("fakeBlock").style.display = "none"; return; }
+  list.classList.remove("hint");
+  const marks = [...lab.crossings].sort((a, b) => a.t - b.t);
+  list.innerHTML = marks.length ? "" : "<div class='hint'>No crossings clicked yet.</div>";
+  for (const mark of marks) {
+    const result = categoryOf(state.seg.start, mark);
+    const chip = result ? CAT_CHIP[result.category] : ["not compared", "--mark"];
     const row = document.createElement("div"); row.className = "row";
-    row.innerHTML = `<span class="t">${fmt(item.time)}</span>` + item.html;
-    row.append(button("Go", item.go), button("✕", item.del));
-    marks.appendChild(row);
+    row.innerHTML = `<span class="t">${fmt(mark.t)}</span><span class="id">${result && result.track ? "YOLO id " + result.track : result ? "no YOLO box" : "crossing"}</span>` +
+      `<span class="chip" style="--c: var(${chip[1]})">${chip[0]}</span>`;
+    row.append(button("Go", () => seek(mark.t - 1)), button("✕", () => removeMark(mark)));
+    list.appendChild(row);
   }
   const c = compared(state.seg.start), fakes = $("fakeList");
   $("fakeBlock").style.display = c && c.in_run ? "block" : "none";
   if (c && c.in_run) {
-    fakes.innerHTML = c.fake_ids.length ? "" : "<div class='hint'>None.</div>";
-    for (const id of c.fake_ids) {
-      const track = state.byId[id];
+    fakes.innerHTML = c.fake.length ? "" : "<div class='hint'>None.</div>";
+    for (const f of c.fake) {
       const row = document.createElement("div"); row.className = "row";
-      row.innerHTML = `<span class="t">${track ? fmt(track.t[0]) : "?"}</span><span class="id">id ${id}</span>`;
-      row.append(button("Go", () => { $("showRun").checked = true; seek((track ? track.t[0] : state.data.start) - 1); }),
-                 button("Mark crossing", () => toggleMark(id)));
+      row.innerHTML = `<span class="t">${fmt(f.t)}</span><span class="id">YOLO id ${f.track}</span>`;
+      row.append(button("Go", () => { state.focusFake = f; seek(f.t - 1); }));
       fakes.appendChild(row);
     }
   }
@@ -317,7 +295,7 @@ async function compare() {
   renderSide();
 }
 
-// ---------------- drawing ----------------
+// ---------------- marks and drawing ----------------
 function videoRect() {
   const w = canvas.clientWidth, h = canvas.clientHeight, vw = video.videoWidth || 16, vh = video.videoHeight || 9;
   const scale = Math.min(w / vw, h / vh);
@@ -335,20 +313,21 @@ function boxAt(track, time) {
   const f = (time - ta) / (tb - ta);
   return a.map((v, i) => v + (b[i] - v) * f);
 }
-function runCounted(id) {
-  const c = state.seg && compared(state.seg.start);
-  return $("showRun").checked && c && c.in_run && (c.real_ids.includes(id) || c.fake_ids.includes(id));
+function drawBox(track, colour, label, dashed) {
+  const box = track && boxAt(track, video.currentTime);
+  if (!box) return;
+  const r = videoRect(), [cx, cy, bw, bh] = box;
+  const x = r.x + (cx - bw / 2) * r.w, y = r.y + (cy - bh / 2) * r.h;
+  ctx.strokeStyle = colour; ctx.lineWidth = 2.5; ctx.setLineDash(dashed ? [6, 4] : []);
+  ctx.strokeRect(x, y, bw * r.w, bh * r.h); ctx.setLineDash([]);
+  ctx.font = "12px system-ui, sans-serif";
+  ctx.fillStyle = "rgba(0,0,0,.65)"; ctx.fillRect(x, y - 17, ctx.measureText(label).width + 8, 16);
+  ctx.fillStyle = colour; ctx.fillText(label, x + 4, y - 5);
 }
-function visibleBoxes() {
-  if (!state.data) return [];
-  const time = video.currentTime, r = videoRect(), out = [];
-  for (const track of state.data.tracks) {
-    const box = boxAt(track, time);
-    if (!box) continue;
-    const [cx, cy, bw, bh] = box;
-    out.push({ track, x: r.x + (cx - bw / 2) * r.w, y: r.y + (cy - bh / 2) * r.h, w: bw * r.w, h: bh * r.h });
-  }
-  return out;
+function visibleMarks() {
+  if (!state.seg) return [];
+  const time = video.currentTime;
+  return segLabels(state.seg.start).crossings.filter((m) => Math.abs(time - m.t) <= MARK_SHOW_SECONDS);
 }
 function draw() {
   const dpr = window.devicePixelRatio || 1;
@@ -358,28 +337,19 @@ function draw() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
   if (state.data) {
-    for (const b of visibleBoxes()) {
-      const marked = isMarked(b.track.id), counted = runCounted(b.track.id), hover = state.hover === b.track.id;
-      const colour = marked ? css("--marked") : counted ? css("--fake") : css("--person");
-      ctx.strokeStyle = colour; ctx.lineWidth = (marked || counted ? 2.5 : 1.3) + (hover ? 1.5 : 0);
-      ctx.setLineDash(counted && !marked ? [6, 4] : []);
-      ctx.strokeRect(b.x, b.y, b.w, b.h); ctx.setLineDash([]);
-      if (marked || counted || hover) {
-        const text = "id " + b.track.id + (marked ? " · crossing" : "") + (counted ? " · run counted" : "");
-        ctx.font = "12px system-ui, sans-serif";
-        ctx.fillStyle = "rgba(0,0,0,.65)"; ctx.fillRect(b.x, b.y - 17, ctx.measureText(text).width + 8, 16);
-        ctx.fillStyle = colour; ctx.fillText(text, b.x + 4, b.y - 5);
-      }
-    }
     const r = videoRect(), time = video.currentTime;
-    for (const m of segLabels(state.seg.start).yolo_missed || []) {
-      if (Math.abs(time - m.t) > 1.5) continue;
-      ctx.globalAlpha = Math.max(0.25, 1 - Math.abs(time - m.t) / 1.5);
-      ctx.strokeStyle = css("--missed-yolo"); ctx.lineWidth = 3;
-      ctx.beginPath(); ctx.arc(r.x + m.x * r.w, r.y + m.y * r.h, 16, 0, 2 * Math.PI); ctx.stroke();
+    for (const m of visibleMarks()) {
+      const result = categoryOf(state.seg.start, m);
+      const colour = result ? css(CAT_CHIP[result.category][1]) : css("--mark");
+      ctx.globalAlpha = Math.max(0.3, 1 - Math.abs(time - m.t) / MARK_SHOW_SECONDS);
+      ctx.strokeStyle = colour; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(r.x + m.x * r.w, r.y + m.y * r.h, MARK_RADIUS, 0, 2 * Math.PI); ctx.stroke();
       ctx.globalAlpha = 1;
+      if (result && result.track && $("showBoxes").checked) drawBox(state.byId[result.track], colour, "YOLO id " + result.track, false);
     }
-    if (video.currentTime >= state.data.end && !video.paused) video.pause();
+    const f = state.focusFake;
+    if (f && time >= f.t - 2 && time <= f.t_end + 2) drawBox(state.byId[f.track], css("--c4"), "run counted id " + f.track, true);
+    if (time >= state.data.end && !video.paused) video.pause();
   }
   $("timeLabel").textContent = state.data ? `${fmt(video.currentTime)} / segment ${fmt(state.data.start)}–${fmt(state.data.end)}` : fmt(video.currentTime);
   if (document.activeElement !== $("seek")) $("seek").value = video.currentTime;
@@ -387,46 +357,26 @@ function draw() {
 }
 requestAnimationFrame(draw);
 
-// ---------------- interaction ----------------
 function seek(t) {
   if (state.data) t = Math.min(Math.max(t, state.data.start), state.data.end);
   video.currentTime = Math.max(0, t);
 }
-function hit(event) {
-  const rect = canvas.getBoundingClientRect(), x = event.clientX - rect.left, y = event.clientY - rect.top;
-  const hits = visibleBoxes().filter((b) => x >= b.x - 4 && x <= b.x + b.w + 4 && y >= b.y - 4 && y <= b.y + b.h + 4);
-  hits.sort((a, b) => a.w * a.h - b.w * b.h);
-  return { x, y, box: hits[0] };
+function removeMark(mark) {
+  const list = segLabels(state.seg.start).crossings, i = list.indexOf(mark);
+  if (i >= 0) list.splice(i, 1);
+  changed();
 }
-canvas.addEventListener("mousemove", (e) => { const h = hit(e); state.hover = h.box ? h.box.track.id : null; });
 canvas.addEventListener("click", (event) => {
   if (!state.data) return;
-  const { x, y, box } = hit(event);
-  if (state.missedMode || (!box && event.shiftKey)) {
-    const r = videoRect();
-    const mark = { t: +video.currentTime.toFixed(2), x: +((x - r.x) / r.w).toFixed(4), y: +((y - r.y) / r.h).toFixed(4) };
-    if (mark.x < 0 || mark.x > 1 || mark.y < 0 || mark.y > 1) return;
-    segLabels(state.seg.start).yolo_missed.push(mark);
-    setMissedMode(false); changed(); return;
-  }
-  if (!box) { hidePopover(); return; }
-  video.pause(); showPopover(box.track, event.clientX, event.clientY);
+  const rect = canvas.getBoundingClientRect(), x = event.clientX - rect.left, y = event.clientY - rect.top, r = videoRect();
+  const hitMark = visibleMarks().find((m) => Math.hypot(r.x + m.x * r.w - x, r.y + m.y * r.h - y) <= MARK_RADIUS + 4);
+  if (hitMark) { removeMark(hitMark); return; }
+  const mark = { t: +video.currentTime.toFixed(2), x: +((x - r.x) / r.w).toFixed(4), y: +((y - r.y) / r.h).toFixed(4) };
+  if (mark.x < 0 || mark.x > 1 || mark.y < 0 || mark.y > 1) return;
+  segLabels(state.seg.start).crossings.push(mark);
+  changed();
 });
-function showPopover(track, px, py) {
-  const pop = $("popover"), marked = isMarked(track.id);
-  pop.innerHTML = `<div class="title">id ${track.id}</div><div class="hint">YOLO person, seen ${fmt(track.t[0])}–${fmt(track.t[track.t.length - 1])}</div>`;
-  pop.append(button(marked ? "✓ Crosses the road (click to undo)" : "This person crosses the road", () => { toggleMark(track.id); hidePopover(); }));
-  pop.append(button("Jump to where this track starts", () => { seek(track.t[0] - 0.5); hidePopover(); }));
-  pop.style.display = "block";
-  pop.style.left = Math.min(px + 8, innerWidth - pop.offsetWidth - 8) + "px";
-  pop.style.top = Math.min(py + 8, innerHeight - pop.offsetHeight - 8) + "px";
-}
-function hidePopover() { $("popover").style.display = "none"; }
-function setMissedMode(on) {
-  state.missedMode = on; $("missedBtn").classList.toggle("on", on);
-  $("missedBtn").textContent = on ? "Click where the person is…" : "Crossing without a box";
-  if (on) video.pause();
-}
+
 $("loadBtn").onclick = loadVideo;
 $("videoInput").addEventListener("keydown", (e) => { if (e.key === "Enter") loadVideo(); });
 $("playBtn").onclick = () => (video.paused ? video.play() : video.pause());
@@ -437,21 +387,19 @@ const frameStep = () => 1 / ((state.data && state.data.video_fps) || 30);
 document.querySelectorAll("[data-frame]").forEach((b) => (b.onclick = () => { video.pause(); seek(video.currentTime + b.dataset.frame * frameStep()); }));
 $("speed").onchange = () => (video.playbackRate = +$("speed").value);
 $("seek").oninput = () => seek(+$("seek").value);
-$("missedBtn").onclick = () => setMissedMode(!state.missedMode);
 $("compareBtn").onclick = compare;
-$("showRun").onchange = renderSide;
 $("scopeSeg").onclick = () => { state.scope = "segment"; $("scopeSeg").classList.add("sel"); $("scopeVideo").classList.remove("sel"); renderSide(); };
 $("scopeVideo").onclick = () => { state.scope = "video"; $("scopeVideo").classList.add("sel"); $("scopeSeg").classList.remove("sel"); renderSide(); };
 $("segDone").onclick = () => { if (!state.seg) return; const lab = segLabels(state.seg.start); lab.reviewed = !lab.reviewed; changed(); };
 $("exportBtn").onclick = () => {
   if (!state.info) return;
-  const lines = ["video_id,city,segment_start,segment_end,reviewed,in_run,not_detected_by_yolo,detected_algorithm_missed,algorithm_real,algorithm_fake"];
+  const lines = ["video_id,city,segment_start,segment_end,reviewed,in_run,crossings_clicked,not_detected_by_yolo,detected_algorithm_missed,detected_and_counted,fake"];
   for (const s of state.info.segments) {
-    const lab = state.labels.segments[String(s.start)];
-    if (!lab) continue;
-    const c = compared(s.start) || {}, m = markCounts(s.start);
-    lines.push([state.videoId, `"${state.info.city}"`, s.start, s.end, !!lab.reviewed, c.in_run ?? "", m.yolo,
-                c.in_run ? c.algo : "", c.in_run ? c.real : "", c.in_run ? c.fake : ""].join(","));
+    const lab = state.labels.segments[String(s.start)], c = compared(s.start);
+    if (!lab && !c) continue;
+    const n = c ? c.counts : {};
+    lines.push([state.videoId, `"${state.info.city}"`, s.start, s.end, !!(lab && lab.reviewed), c ? c.in_run : "",
+                lab && lab.crossings ? lab.crossings.length : 0, n.yolo ?? "", n.algo ?? "", n.real ?? "", n.fake ?? ""].join(","));
   }
   const link = document.createElement("a");
   link.href = URL.createObjectURL(new Blob([lines.join("\n") + "\n"], { type: "text/csv" }));
@@ -464,14 +412,12 @@ document.addEventListener("keydown", (e) => {
   else if (e.key === "ArrowRight") { e.preventDefault(); seek(video.currentTime + (e.shiftKey ? 5 : 1)); }
   else if (e.key === ",") { video.pause(); seek(video.currentTime - frameStep()); }
   else if (e.key === ".") { video.pause(); seek(video.currentTime + frameStep()); }
-  else if (e.key === "m" || e.key === "M") setMissedMode(!state.missedMode);
   else if (e.key === "[" || e.key === "]") {
     const options = [...$("speed").options].map((o) => +o.value), i = options.indexOf(+$("speed").value);
     const next = options[Math.min(options.length - 1, Math.max(0, i + (e.key === "]" ? 1 : -1)))];
     $("speed").value = String(next); video.playbackRate = next;
-  } else if (e.key === "Escape") { hidePopover(); setMissedMode(false); }
+  }
 });
-document.addEventListener("click", (e) => { if (!$("popover").contains(e.target) && e.target !== canvas) hidePopover(); });
 const initial = new URLSearchParams(location.search).get("video");
 if (initial) { $("videoInput").value = initial; loadVideo(); }
 </script>

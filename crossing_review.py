@@ -2,18 +2,18 @@
 
 Run ``python crossing_review.py`` and open the address it prints. Enter a
 video id; the page lists the video's segments from the mapping and plays the
-footage from the file server with every YOLO person box drawn on it. No
-algorithm runs while reviewing, so its decisions cannot bias the review: the
-reviewer marks every crossing they see, either by clicking the crossing
-person's box or, when YOLO drew no box, by clicking where the person is.
+footage from the file server. Nothing is drawn on the video and no algorithm
+runs while reviewing, so neither can bias the review: the reviewer clicks on
+every pedestrian they see crossing the road.
 
-**Compare with run** then sets those marks against the crossings the last
-analysis.py run counted (its results.pickle) and fills four counts:
+**Compare with run** then sorts each click, using the segment's YOLO person
+tracks and the crossings the last analysis.py run counted (its results.pickle):
 
-1. crossed, not detected by YOLO: the reviewer's marks without a box,
-2. detected crossing the algorithm missed: marked boxes the run did not count,
-3. algorithm crossing, real: marked boxes the run also counted,
-4. algorithm crossing, fake: crossings the run counted that were not marked.
+1. crossing, not detected by YOLO: no YOLO person box at that spot and moment,
+2. crossing detected by YOLO, missed by the algorithm: a box is there, but the
+   run did not count that track as crossing,
+3. crossing detected by YOLO and counted by the algorithm,
+4. fake crossing: a crossing the run counted that the reviewer never clicked.
 
 Labels are saved after every change in
 ``_output/crossing_review/labels/<video_id>.json``. The video is streamed
@@ -36,7 +36,7 @@ import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 import polars as pl
@@ -290,6 +290,48 @@ class Loader:
 # Comparison with an analysis run
 # ---------------------------------------------------------------------------
 
+# A click matches a YOLO person box shown within this many seconds of it, so a
+# box missing for a frame or two does not turn a detected person into a miss.
+MATCH_WINDOW_SECONDS = 0.5
+# Boxes are enlarged by this fraction of their size when testing a click.
+MATCH_MARGIN = 0.15
+# A run's crossing is the track's frames between these bounds; the tracker can
+# reuse an id later for someone else, so a click must fall near them.
+BOUNDS_SLACK_SECONDS = 2.0
+# Two clicks on the same track this close together are the same person.
+DUPLICATE_SECONDS = 15.0
+
+
+def _box_near(track: Dict[str, Any], time_s: float) -> Optional[List[float]]:
+    """The track's box closest in time to ``time_s``, if within MATCH_WINDOW_SECONDS."""
+    times = track["t"]
+    if time_s < times[0] - MATCH_WINDOW_SECONDS or time_s > times[-1] + MATCH_WINDOW_SECONDS:
+        return None
+    import bisect
+
+    index = bisect.bisect_left(times, time_s)
+    candidates = [i for i in (index - 1, index) if 0 <= i < len(times)]
+    best = min(candidates, key=lambda i: abs(times[i] - time_s))
+    return track["b"][best] if abs(times[best] - time_s) <= MATCH_WINDOW_SECONDS else None
+
+
+def match_click(tracks: List[Dict[str, Any]], mark: Dict[str, float]) -> Optional[Dict[str, Any]]:
+    """Return the YOLO person track under a click, or None when there is none."""
+    best, best_score = None, None
+    for track in tracks:
+        box = _box_near(track, float(mark["t"]))
+        if box is None:
+            continue
+        cx, cy, width, height = box
+        dx = abs(float(mark["x"]) - cx) / max(width * (0.5 + MATCH_MARGIN), 1e-6)
+        dy = abs(float(mark["y"]) - cy) / max(height * (0.5 + MATCH_MARGIN), 1e-6)
+        if dx <= 1 and dy <= 1:
+            score = dx * dx + dy * dy
+            if best_score is None or score < best_score:
+                best, best_score = track, score
+    return best
+
+
 class RunResults:
     """The crossings an analysis.py run counted, per detection segment."""
 
@@ -312,9 +354,11 @@ class RunResults:
         counts = results[11] if isinstance(results, tuple) and len(results) > 11 else {}
         for stem, payload in (counts or {}).items():
             video, start, _fps = str(stem).rsplit("_", 2)
+            payload = payload or {}
+            bounds = {_normalise_id(k): v for k, v in (payload.get("id_bounds") or {}).items()}
             self._by_segment[f"{video}_{int(start)}"] = {
-                "stem": stem,
-                "ids": [_normalise_id(value) for value in (payload or {}).get("ids") or []],
+                "ids": [_normalise_id(value) for value in payload.get("ids") or []],
+                "bounds": bounds,
             }
         settings = results[-1].get("config", {}) if isinstance(results[-1], dict) else {}
         written = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
@@ -325,24 +369,67 @@ class RunResults:
 
     def compare(self, video_id: str, labels: Dict[str, Any], segments: List[Dict[str, Any]]) -> Dict[str, Any]:
         self._refresh()
-        output = {"run": self.description, "segments": {}}
+        output: Dict[str, Any] = {"run": self.description, "segments": {}}
         for segment in segments:
             key = str(segment["start"])
             lab = (labels.get("segments") or {}).get(key) or {}
+            marks = lab.get("crossings") or []
             run = self._by_segment.get(f"{video_id}_{segment['start']}")
-            marked = {track_id for track_id, value in (lab.get("tracks") or {}).items() if value == "crossed"}
-            entry: Dict[str, Any] = {
-                "reviewed": bool(lab.get("reviewed")),
-                "yolo": len(lab.get("yolo_missed") or []),
-                "in_run": run is not None,
-            }
+            cache = Loader.cache_path(video_id, segment["start"])
+            data = json.loads(cache.read_text(encoding="utf-8")) if cache.is_file() else None
+            if not marks and run is None:
+                continue
+            entry: Dict[str, Any] = {"reviewed": bool(lab.get("reviewed")), "in_run": run is not None,
+                                     "marks": [], "fake": []}
+            tracks = (data or {}).get("tracks") or []
+            by_id = {track["id"]: track for track in tracks}
+            fps = float((data or {}).get("video_fps") or 30.0)
+            start_s = float(segment["start"])
+
+            def counted_window(track_id: str) -> Optional[Tuple[float, float]]:
+                frames = (run or {}).get("bounds", {}).get(track_id)
+                if frames is None:
+                    return None
+                return start_s + frames[0] / fps, start_s + frames[1] / fps
+
+            claimed, matched_at = set(), {}
+            for mark in sorted(marks, key=lambda item: float(item["t"])):
+                where = {"t": mark["t"], "x": mark["x"], "y": mark["y"]}
+                track = match_click(tracks, mark)
+                if track is None:
+                    entry["marks"].append({**where, "category": 1, "track": None})
+                    continue
+                previous = matched_at.get(track["id"])
+                if previous is not None and float(mark["t"]) - previous < DUPLICATE_SECONDS:
+                    # The same person clicked twice; category 0 is not counted.
+                    # (Further apart, the tracker may have reused the id.)
+                    entry["marks"].append({**where, "category": 0, "track": track["id"]})
+                    continue
+                matched_at[track["id"]] = float(mark["t"])
+                counted = run is not None and track["id"] in run["ids"]
+                window = counted_window(track["id"])
+                if counted and window is not None:
+                    counted = window[0] - BOUNDS_SLACK_SECONDS <= float(mark["t"]) <= window[1] + BOUNDS_SLACK_SECONDS
+                if counted:
+                    claimed.add(track["id"])
+                entry["marks"].append({**where, "category": 3 if counted else 2, "track": track["id"]})
             if run is not None:
-                counted = set(run["ids"])
-                entry.update(
-                    algo=len(marked - counted), real=len(marked & counted), fake=len(counted - marked),
-                    algo_ids=sorted(marked - counted), real_ids=sorted(marked & counted),
-                    fake_ids=sorted(counted - marked),
-                )
+                for track_id in run["ids"]:
+                    if track_id in claimed:
+                        continue
+                    window = counted_window(track_id)
+                    track = by_id.get(track_id)
+                    entry["fake"].append({
+                        "track": track_id,
+                        "t": window[0] if window else (track["t"][0] if track else start_s),
+                        "t_end": window[1] if window else (track["t"][-1] if track else start_s),
+                    })
+            entry["counts"] = {
+                "yolo": sum(1 for m in entry["marks"] if m["category"] == 1),
+                "algo": sum(1 for m in entry["marks"] if m["category"] == 2),
+                "real": sum(1 for m in entry["marks"] if m["category"] == 3),
+                "fake": len(entry["fake"]) if run is not None else None,
+            }
             output["segments"][key] = entry
         return output
 

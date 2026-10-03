@@ -231,20 +231,20 @@ For working with external APIs of [VideoFiles](https://files.mobility-squad.com/
 
 
 ### Checking crossings by hand
-`crossing_review.py` is a small local web tool for counting, on real footage, how well crossings are detected. Start it and open the address it prints:
+`crossing_review.py` is a small local web tool for counting, on real footage, how many pedestrians actually cross and how many of them the pipeline gets right. Start it and open the address it prints:
 
 ```bash
 uv run python crossing_review.py
 ```
 
-Enter a video id and pick one of its segments (from `mapping.csv`). The video plays with every YOLO person box drawn on it; no algorithm runs while you review, so its decisions cannot bias you. Mark every pedestrian who crosses the road: click their box, or, if YOLO drew none, press `M` (or Shift-click) and click where they are. Then **Compare with run** sets your marks against the crossings the last `analysis.py` run counted (its `results.pickle`, or `--results`) and fills four counts:
+Enter a video id and pick one of its segments (from `mapping.csv`). The video plays with nothing drawn on it, so neither YOLO nor the algorithm can bias you. **Click on every pedestrian you see crossing the road**, once each, while they are on the road; click a mark again to remove it. When the segment is done, mark it fully reviewed and press **Compare with run**. Each click is then matched to the YOLO person box at that spot and moment, and checked against the crossings the last `analysis.py` run counted (its `results.pickle`, or `--results`):
 
-1. **Crossed, not detected by YOLO**: your marks without a box.
-2. **Detected crossing, algorithm missed**: boxes you marked that the run did not count.
-3. **Algorithm crossing, real**: boxes you marked that the run also counted.
-4. **Algorithm crossing, fake**: crossings the run counted that you did not mark. They are listed so you can jump to each and check it.
+1. **Crossing, not detected by YOLO**: no YOLO person box where you clicked.
+2. **Crossing detected by YOLO, missed by the algorithm**: there is a box, but the run did not count that person as crossing.
+3. **Crossing detected by YOLO and counted by the algorithm**.
+4. **Fake crossing**: a crossing the run counted that you never clicked. These are listed with a **Go** button that shows the counted box, so you can check each one; if it was a real crossing you missed, click it and compare again.
 
-It also shows precision (3 / (3 + 4)) and recall (3 / (1 + 2 + 3)), per segment or for the whole video. Mark a segment fully reviewed once you have watched all of it, since unmarked crossings count as fake. Only segments the run analysed can be compared, and with a footage cap the run may have analysed only part of a segment. Labels are saved after every change in `_output/crossing_review/labels/<video_id>.json`, and **Export CSV** writes the counts per segment. The video is streamed through the tool with the credentials from the secrets file. Detection files missing locally are downloaded from the file server's `data` alias (`--csv-url-path`) and converted to Parquet.
+The page shows the four counts per segment or for the whole video, with precision (3 / (3 + 4)), recall (3 / (1 + 2 + 3)) and the share YOLO detected. After comparing, the YOLO box each click was matched to can be shown to check the matching. A second click on the same person within 15 s counts once. Only segments the run analysed can be compared; with a footage cap the run may have covered only part of a segment. Labels are saved after every change in `_output/crossing_review/labels/<video_id>.json`, and **Export CSV** writes the counts per segment. The video is streamed through the tool with the credentials from the secrets file; detection files missing locally are downloaded from the file server's `data` alias (`--csv-url-path`) and converted to Parquet.
 
 ### Waymo calibration: current results and what was tried
 Crossing speeds are reported in m/s by a speed model calibrated on the [Waymo Open Dataset](https://waymo.com/open/), whose lidar-derived pedestrian speeds serve as the reference. The analysis refuses to run without a qualified model rather than falling back to a relative index. When `process_waymo_if_missing` is enabled, the raw Waymo TFRecords are exported (in Docker if available, otherwise in a local `uv` environment), tracked with YOLO and BoT-SORT at `yolo_imgsz`, and the speed model is fitted on the Waymo training split and tested once on the untouched validation split. The model is only used when it passes both the cross-validation and the external validation checks.
