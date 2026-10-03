@@ -61,6 +61,9 @@
   <input id="videoInput" type="text" placeholder="video id, e.g. wzvRUXA70vA" autocomplete="off">
   <button class="primary" id="loadBtn">Load</button>
   <span id="cityLabel" class="hint"></span>
+  <button id="processBtn" class="primary" style="display:none">Process video</button>
+  <progress id="processBar" max="1" style="display:none; width: 160px"></progress>
+  <span id="processMsg" class="hint"></span>
   <span id="status"></span>
 </header>
 <div id="layout">
@@ -98,15 +101,15 @@
     <div class="derived" id="derived"></div>
     <div style="display:flex; gap:6px; margin-bottom:10px; flex-wrap: wrap">
       <button id="segDone">Mark segment fully reviewed</button>
-      <button id="compareBtn" class="primary">Compare with run</button>
+      <button id="compareBtn" class="primary">Compare</button>
       <button id="exportBtn">Export CSV</button>
     </div>
     <div id="runNote" class="note" style="display:none"></div>
     <h2>Your crossings</h2>
     <div id="markList" class="hint">–</div>
     <div id="fakeBlock" style="display:none">
-      <h2 style="margin-top:14px">4. Run's crossings you did not click</h2>
-      <div class="hint" style="margin-bottom:4px">Check each one with Go (its box is shown in red). If it is a real crossing you missed, click the person, then compare again.</div>
+      <h2 style="margin-top:14px">4. Algorithm crossings you did not click</h2>
+      <div class="hint" style="margin-bottom:4px">Check each one with Go (its box is shown in red). If it is a real crossing you missed, click the person and compare again.</div>
       <div id="fakeList"></div>
     </div>
   </div>
@@ -151,16 +154,47 @@ function button(text, onclick) { const b = document.createElement("button"); b.t
 async function loadVideo() {
   const id = $("videoInput").value.trim();
   if (!id) return;
-  try { state.info = await api("/api/segments?video_id=" + encodeURIComponent(id)); }
+  let info;
+  try { info = await api("/api/video?video_id=" + encodeURIComponent(id)); }
   catch (error) { setStatus(error.message); return; }
-  state.videoId = id; state.seg = null; state.data = null; state.compare = null;
+  clearInterval(state.poll);
+  state.info = info; state.videoId = id; state.seg = null; state.data = null; state.compare = null;
   history.replaceState(null, "", "?video=" + encodeURIComponent(id));
-  $("cityLabel").textContent = state.info.city + " · " + state.info.segments.length + " segment(s)";
+  $("cityLabel").textContent = info.city + " · " + info.segments.length + " segment(s)";
   try { state.labels = await api("/api/labels?video_id=" + encodeURIComponent(id)); } catch { state.labels = {}; }
   if (!state.labels.segments) state.labels = { video_id: id, segments: {} };
-  video.src = "/video/" + encodeURIComponent(id);
-  $("overlayMsg").textContent = "Pick a segment on the left."; $("overlayMsg").style.display = "flex";
-  setStatus(""); renderSegments(); renderSide();
+  video.removeAttribute("src"); video.load();
+  setStatus(""); showProcessing(info.processing); renderSegments(); renderSide();
+  if (info.processing.status !== "ready" && info.processing.status !== "not_processed" && info.processing.status !== "error") pollProcessing();
+}
+function processed() { return state.info && state.info.processing.status === "ready"; }
+function showProcessing(p) {
+  const ready = p.status === "ready";
+  $("processBtn").style.display = ready || p.status === "running" || p.status === "queued" ? "none" : "inline-block";
+  $("processBtn").textContent = p.status === "error" ? "Retry processing" : "Process video";
+  $("processBar").style.display = p.status === "running" || p.status === "queued" ? "inline-block" : "none";
+  if (p.fraction != null) $("processBar").value = p.fraction; else $("processBar").removeAttribute("value");
+  $("processMsg").textContent = ready ? "Processed: video downloaded, algorithm run on every segment." :
+    p.status === "not_processed" ? "Process the video first: it is downloaded and the algorithm runs on every segment, so reviewing has no lag." :
+    p.status === "error" ? "Processing failed: " + p.message : (p.message || "");
+  $("overlayMsg").style.display = "flex";
+  $("overlayMsg").textContent = ready ? "Pick a segment on the left." : "Process the video to start reviewing.";
+  if (ready && !video.getAttribute("src")) video.src = "/video/" + encodeURIComponent(state.videoId);
+}
+function pollProcessing() {
+  clearInterval(state.poll);
+  state.poll = setInterval(async () => {
+    try {
+      const info = await api("/api/video?video_id=" + encodeURIComponent(state.videoId));
+      state.info.processing = info.processing; showProcessing(info.processing); renderSegments();
+      if (["ready", "error"].includes(info.processing.status)) clearInterval(state.poll);
+    } catch (error) { setStatus(error.message); }
+  }, 2000);
+}
+async function startProcessing() {
+  try { state.info.processing = await api("/api/process", { video_id: state.videoId }); }
+  catch (error) { setStatus(error.message); return; }
+  showProcessing(state.info.processing); pollProcessing();
 }
 function segLabels(start) {
   const key = String(start);
@@ -175,35 +209,22 @@ function renderSegments() {
     const marks = lab && lab.crossings ? lab.crossings.length : 0;
     const div = document.createElement("div");
     div.className = "seg" + (state.seg && state.seg.start === s.start ? " active" : "");
+    if (!processed()) div.style.opacity = 0.55;
     div.innerHTML = `<b>${fmt(s.start)} – ${fmt(s.end)}</b><small>${((s.end - s.start) / 60).toFixed(1)} min · ${s.time_of_day}` +
       `${marks ? " · " + marks + " crossing(s)" : ""}${lab && lab.reviewed ? " · reviewed ✓" : ""}</small>`;
-    div.onclick = () => openSegment(s);
+    div.onclick = () => { if (processed()) openSegment(s); };
     box.appendChild(div);
   }
 }
 async function openSegment(s) {
-  state.seg = s; state.data = null; state.byId = {}; state.focusFake = null; clearInterval(state.poll);
-  renderSegments(); renderSide();
-  $("overlayMsg").style.display = "flex"; $("overlayMsg").textContent = "Loading the segment…";
-  const url = `/api/segment?video_id=${encodeURIComponent(state.videoId)}&start=${s.start}`;
-  const check = async () => {
-    const result = await api(url);
-    if (state.seg !== s) return true;
-    if (result.tracks) {
-      state.data = result; state.byId = Object.fromEntries(result.tracks.map((t) => [t.id, t]));
-      $("overlayMsg").style.display = "none";
-      $("seek").min = result.start; $("seek").max = result.end;
-      seek(result.start); renderSegments(); renderSide(); setStatus("");
-      return true;
-    }
-    $("overlayMsg").textContent = result.status === "error" ? "Loading failed: " + result.message : (result.message || "Loading…");
-    return result.status === "error";
-  };
+  state.seg = s; state.focusFake = null;
   try {
-    const first = await api(url);
-    if (!first.tracks && !["running", "queued"].includes(first.status)) await api("/api/load", { video_id: state.videoId, start: s.start });
-    if (!(await check())) state.poll = setInterval(() => check().then((done) => done && clearInterval(state.poll)), 1500);
-  } catch (error) { $("overlayMsg").textContent = error.message; }
+    const data = await api(`/api/segment?video_id=${encodeURIComponent(state.videoId)}&start=${s.start}`);
+    state.data = data; state.byId = Object.fromEntries(data.tracks.map((t) => [t.id, t]));
+  } catch (error) { setStatus(error.message); return; }
+  $("overlayMsg").style.display = "none";
+  $("seek").min = s.start; $("seek").max = s.end;
+  seek(s.start); renderSegments(); renderSide();
 }
 
 // ---------------- labels ----------------
@@ -227,7 +248,7 @@ function categoryOf(start, mark) {
 }
 function totals() {
   const starts = state.scope === "segment" ? (state.seg ? [state.seg.start] : []) : (state.info ? state.info.segments.map((s) => s.start) : []);
-  const t = { clicked: 0, yolo: 0, algo: 0, real: 0, fake: 0, comparedSegs: 0, notInRun: 0, notReviewed: 0, stale: false };
+  const t = { clicked: 0, yolo: 0, algo: 0, real: 0, fake: 0, comparedSegs: 0, notReviewed: 0, stale: false };
   for (const start of starts) {
     const lab = state.labels.segments[String(start)];
     t.clicked += lab && lab.crossings ? lab.crossings.length : 0;
@@ -235,7 +256,7 @@ function totals() {
     if (!c) continue;
     t.comparedSegs++;
     t.yolo += c.counts.yolo; t.algo += c.counts.algo; t.real += c.counts.real;
-    if (c.in_run) { t.fake += c.counts.fake; if (!c.reviewed) t.notReviewed++; } else t.notInRun++;
+    t.fake += c.counts.fake; if (!c.reviewed) t.notReviewed++;
     if ((lab ? lab.crossings.length : 0) !== c.marks.length) t.stale = true;
   }
   return t;
@@ -248,14 +269,13 @@ function renderSide() {
   let text = `You clicked <b>${t.clicked}</b> crossing(s).`;
   if (have) {
     const truth = t.yolo + t.algo + t.real, found = t.real + t.fake;
-    text += ` Real crossings: <b>${truth}</b>; the run counted <b>${found}</b>.` +
+    text += ` Real crossings: <b>${truth}</b>; the algorithm counted <b>${found}</b>.` +
       `<br>Precision ${pct(t.real, found)} · recall ${pct(t.real, truth)} · recall among YOLO detections ${pct(t.real, t.real + t.algo)} · YOLO detected ${pct(t.algo + t.real, truth)}`;
-  } else text += "<br>The four counts appear after <b>Compare with run</b>.";
+  } else text += "<br>The four counts appear after <b>Compare</b>.";
   $("derived").innerHTML = text;
   const notes = [];
-  if (state.compare) notes.push("Compared with the " + state.compare.run + ".");
+  if (state.compare && state.compare.rule) notes.push("Compared with the algorithm (crossing_rule " + state.compare.rule + ").");
   if (t.stale) notes.push("<b>You changed your clicks since comparing; compare again.</b>");
-  if (t.notInRun) notes.push(`${t.notInRun} segment(s) were not analysed in that run, so their crossings count as categories 1 and 2 only.`);
   if (t.notReviewed) notes.push(`${t.notReviewed} compared segment(s) are not marked fully reviewed; crossings you have not reached yet show up as fake.`);
   $("runNote").style.display = notes.length ? "block" : "none"; $("runNote").innerHTML = notes.join("<br>");
   const lab = state.seg ? segLabels(state.seg.start) : null;
@@ -277,8 +297,8 @@ function renderSide() {
     list.appendChild(row);
   }
   const c = compared(state.seg.start), fakes = $("fakeList");
-  $("fakeBlock").style.display = c && c.in_run ? "block" : "none";
-  if (c && c.in_run) {
+  $("fakeBlock").style.display = c ? "block" : "none";
+  if (c) {
     fakes.innerHTML = c.fake.length ? "" : "<div class='hint'>None.</div>";
     for (const f of c.fake) {
       const row = document.createElement("div"); row.className = "row";
@@ -290,7 +310,7 @@ function renderSide() {
 }
 async function compare() {
   if (!state.videoId) return;
-  try { state.compare = await api("/api/compare?video_id=" + encodeURIComponent(state.videoId)); setStatus("Compared with the run"); }
+  try { state.compare = await api("/api/compare?video_id=" + encodeURIComponent(state.videoId)); setStatus("Compared"); }
   catch (error) { setStatus("Compare failed: " + error.message); }
   renderSide();
 }
@@ -348,7 +368,7 @@ function draw() {
       if (result && result.track && $("showBoxes").checked) drawBox(state.byId[result.track], colour, "YOLO id " + result.track, false);
     }
     const f = state.focusFake;
-    if (f && time >= f.t - 2 && time <= f.t_end + 2) drawBox(state.byId[f.track], css("--c4"), "run counted id " + f.track, true);
+    if (f && time >= f.t - 2 && time <= f.t_end + 2) drawBox(state.byId[f.track], css("--c4"), "algorithm counted id " + f.track, true);
     if (time >= state.data.end && !video.paused) video.pause();
   }
   $("timeLabel").textContent = state.data ? `${fmt(video.currentTime)} / segment ${fmt(state.data.start)}–${fmt(state.data.end)}` : fmt(video.currentTime);
@@ -388,17 +408,18 @@ document.querySelectorAll("[data-frame]").forEach((b) => (b.onclick = () => { vi
 $("speed").onchange = () => (video.playbackRate = +$("speed").value);
 $("seek").oninput = () => seek(+$("seek").value);
 $("compareBtn").onclick = compare;
+$("processBtn").onclick = startProcessing;
 $("scopeSeg").onclick = () => { state.scope = "segment"; $("scopeSeg").classList.add("sel"); $("scopeVideo").classList.remove("sel"); renderSide(); };
 $("scopeVideo").onclick = () => { state.scope = "video"; $("scopeVideo").classList.add("sel"); $("scopeSeg").classList.remove("sel"); renderSide(); };
 $("segDone").onclick = () => { if (!state.seg) return; const lab = segLabels(state.seg.start); lab.reviewed = !lab.reviewed; changed(); };
 $("exportBtn").onclick = () => {
   if (!state.info) return;
-  const lines = ["video_id,city,segment_start,segment_end,reviewed,in_run,crossings_clicked,not_detected_by_yolo,detected_algorithm_missed,detected_and_counted,fake"];
+  const lines = ["video_id,city,segment_start,segment_end,reviewed,crossings_clicked,not_detected_by_yolo,detected_algorithm_missed,detected_and_counted,fake"];
   for (const s of state.info.segments) {
     const lab = state.labels.segments[String(s.start)], c = compared(s.start);
     if (!lab && !c) continue;
     const n = c ? c.counts : {};
-    lines.push([state.videoId, `"${state.info.city}"`, s.start, s.end, !!(lab && lab.reviewed), c ? c.in_run : "",
+    lines.push([state.videoId, `"${state.info.city}"`, s.start, s.end, !!(lab && lab.reviewed),
                 lab && lab.crossings ? lab.crossings.length : 0, n.yolo ?? "", n.algo ?? "", n.real ?? "", n.fake ?? ""].join(","));
   }
   const link = document.createElement("a");
