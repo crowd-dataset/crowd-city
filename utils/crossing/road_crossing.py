@@ -49,6 +49,28 @@ MINIMUM_TRACK_ROWS = 5
 MINIMUM_TRACK_SECONDS = 0.5
 # A gap longer than this inside one tracker id is treated as a reused id.
 TRACK_GAP_SECONDS = 2.0
+# Rule D's candidate step reuses two checks of the CROWD detector that the box
+# geometry alone cannot replace. A pedestrian riding a bicycle or motorcycle is
+# not crossing on foot (Detection.is_rider_id). And a pedestrian whose
+# sideways movement in the image is mostly the camera turning barely moves
+# relative to the static objects around them (traffic lights, signs,
+# hydrants): with such a reference visible for at least
+# STATIC_REFERENCE_MIN_FRAMES (at 30 fps, scaled to the video's rate), a
+# candidate that moves less than MINIMUM_RELATIVE_X_RANGE of the image width
+# relative to it is rejected.
+#
+# Validation (Waymo rule-D picks, real = matched to a labelled crosswalk
+# crosser): the rider check removed 2 of 232 real training crossers and 9
+# other picks, 0 of 51 and 6 on validation. For the camera check, 0.08 was
+# chosen from a sweep: it removed 9 real and 22 other training picks (1 and 2
+# on validation), against 18 and 27 at 0.12; on a hand-reviewed busy CROWD
+# segment it removed 4 fake crossings and none of 22 confirmed ones.
+MINIMUM_RELATIVE_X_RANGE = 0.08
+# Recorded in the results.pickle fingerprint; bump when rule D changes, so
+# cached results from an earlier version of the rule are not reused.
+ROAD_CROSSING_RULE_VERSION = "rule_d_rider_camera_v1"
+STATIC_REFERENCE_MIN_FRAMES = 8
+DETECTOR_BASE_FPS = 30.0
 WAYMO_STORE_FOLDER = "segmentation_store"
 WAYMO_VIDEO_NAME = "waymo_front.mp4"
 
@@ -106,6 +128,46 @@ def longest_track_run(frames: Sequence[int], fps: float) -> Optional[Tuple[int, 
         if previous - start > best[1] - best[0]:
             best = (start, previous)
     return best
+
+
+def independent_motion_rejection(
+    window: pl.DataFrame,
+    track_id: Any,
+    fps: float,
+) -> Optional[str]:
+    """Return why a candidate is not a pedestrian crossing on foot, or None.
+
+    ``window`` holds every detection (all classes) in the candidate's frames.
+    Returns ``"rider"`` for someone on a bicycle or motorcycle and
+    ``"camera_motion"`` when the track hardly moves relative to the static
+    objects around it, using the CROWD detector's own checks and its
+    frame-count thresholds scaled to ``fps``.
+    """
+    from utils.crossing.detection import Detection
+
+    def scaled(frames: int, minimum: int) -> int:
+        return Detection._scale_frames(frames, float(fps), DETECTOR_BASE_FPS, minimum=minimum)
+
+    if Detection.is_rider_id(
+        window,
+        track_id,
+        None,
+        min_shared_frames=scaled(4, 1),
+        min_continuous_shared_frames=scaled(12, 1),
+        shared_run_gap_allow=scaled(2, 0),
+        min_motion_steps=scaled(3, 1),
+        short_shared_frames=scaled(8, 1),
+    ):
+        return "rider"
+    reference = Detection.static_reference_motion_stats(
+        window, track_id, MIN_SHARED_FRAMES=scaled(STATIC_REFERENCE_MIN_FRAMES, 1),
+    )
+    if (
+        int(reference.get("shared_frames", 0) or 0) >= scaled(STATIC_REFERENCE_MIN_FRAMES, 1)
+        and float(reference.get("relative_x_range", 0.0) or 0.0) < MINIMUM_RELATIVE_X_RANGE
+    ):
+        return "camera_motion"
+    return None
 
 
 def box_only_candidates(

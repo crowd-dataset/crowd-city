@@ -566,7 +566,11 @@ def _road_crossing_candidates(
     duration, speed and waiting time are computed here with exactly the code
     and frozen speed model the detector's picks use.
     """
-    from utils.crossing.road_crossing import box_only_candidates, longest_track_run
+    from utils.crossing.road_crossing import (
+        box_only_candidates,
+        independent_motion_rejection,
+        longest_track_run,
+    )
 
     rows, scene_profile = crossing_metrics_module.rows_and_scene_profile(df, float(fps))
     person_tracks = crossing_metrics_module.group_tracks(
@@ -593,11 +597,29 @@ def _road_crossing_candidates(
         fps,
         float(_WORKER_CROSSING_PARAMETERS["min_crossing_x_range"]),
     )
+    # Riders and tracks that only move with the camera are not pedestrians
+    # crossing on foot; both checks look at every object in the candidate's
+    # own frames, so they run here, before any segmentation is spent on them.
+    rejected: Dict[str, int] = {}
+    kept = []
+    frames = df.get_column("frame-count")
+    for track_id in ids:
+        first, last = bounds[track_id]
+        window = df.filter(frames.is_between(first, last))
+        reason = independent_motion_rejection(window, track_id, fps)
+        if reason is None:
+            kept.append(track_id)
+        else:
+            rejected[reason] = rejected.get(reason, 0) + 1
+            bounds.pop(track_id, None)
+            size_rates.pop(track_id, None)
+    ids = kept
     temp_data = _time_to_cross_from_track_index(track_index, ids, fps, bounds)
     return {
         "ids": ids,
         "id_bounds": bounds,
         "size_rates": size_rates,
+        "rejected": rejected,
         "temp_data": temp_data,
         "speed_value": _METRICS.calculate_speed_of_crossing(
             mapping, df, {source_id: temp_data}, id_bounds=bounds,

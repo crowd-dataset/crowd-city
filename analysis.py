@@ -1877,6 +1877,10 @@ def _current_cache_config() -> Dict[str, object]:
         if segmentation_enabled or key not in skipped
     }
     config["hesitation_rule"] = HESITATION_RULE
+    if common.get_configs("crossing_rule") == "road_crossing":
+        from utils.crossing.road_crossing import ROAD_CROSSING_RULE_VERSION
+
+        config["road_crossing_rule_version"] = ROAD_CROSSING_RULE_VERSION
     cities = common.get_configs("cities_analyse")
     if cities:
         # Left out when empty, so a results.pickle from before the setting
