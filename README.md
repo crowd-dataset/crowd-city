@@ -260,12 +260,12 @@ The crossing algorithm is held to **100% precision**: every pedestrian it counts
 | City | Video id | YouTube URL | Footage | Counted by the algorithm | Real (confirmed) | Fake | Precision | Missed by the algorithm (YOLO detected) | Not detected by YOLO | Recall |
 |---|---|---|---|---|---|---|---|---|---|---|
 | Los Angeles | `1LS7MhOyhro` | <https://www.youtube.com/watch?v=1LS7MhOyhro> | 60.0 min from 0 s | 6 | 6 | 0 | **100%** | 6 | 3 | 6 / 15 (40%) |
-| Amsterdam | `iVJGEW1st8c` | <https://www.youtube.com/watch?v=iVJGEW1st8c> | 59.5 min from 0 s | 25 |  |  | pending review |  |  |  |
+| Amsterdam | `1xvhW53j75A` | <https://www.youtube.com/watch?v=1xvhW53j75A> | 58.8 min from 0 s |  |  |  | pending review |  |  |  |
 | Seoul | `XuYX93xqjB4` | <https://www.youtube.com/watch?v=XuYX93xqjB4&t=10s> | 62.4 min from 10 s | 25 |  |  | pending review |  |  |  |
 | Sydney | `u084OpLn2Ps` | <https://www.youtube.com/watch?v=u084OpLn2Ps&t=38s> | 59.7 min from 38 s | 2 |  |  | pending review |  |  |  |
 | Cairo | `a4zcL56YSME` | <https://www.youtube.com/watch?v=a4zcL56YSME&t=27s> | 73.0 min from 27 s | 0 | 0 | 0 | — (nothing counted) |  |  |  |
 
-In Los Angeles, YOLO detected 12 of the 15 pedestrians who crossed, and the algorithm counts 6 of those 12 (5 before pedestrians emerging in front of the camera were allowed, see below). The counts of the other four videos are from the current rule and are pending review. The first Sydney video chosen (`JMUROQ59kAQ`) was replaced because its detection file on the file server holds only the first second.
+In Los Angeles, YOLO detected 12 of the 15 pedestrians who crossed, and the algorithm counts 6 of those 12 (5 before pedestrians emerging in front of the camera were allowed, see below). The counts of the other four videos are from the current rule and are pending review. Two videos first chosen were replaced because their detection files on the file server are incomplete: Sydney `JMUROQ59kAQ` (only the first second) and Amsterdam `iVJGEW1st8c` (only the last 13 of 60 minutes).
 
 The rule was tuned on other data, which is reported separately:
 

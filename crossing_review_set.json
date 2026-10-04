@@ -15,12 +15,12 @@
     {
       "city": "Amsterdam",
       "iso3": "NLD",
-      "video_id": "iVJGEW1st8c",
-      "footage_minutes": 59.5,
+      "video_id": "1xvhW53j75A",
+      "footage_minutes": 58.8,
       "segments": [
         0
       ],
-      "fps": 60
+      "fps": 30
     },
     {
       "city": "Seoul",
@@ -69,6 +69,11 @@
       "city": "Sydney",
       "video_id": "JMUROQ59kAQ",
       "reason": "detection CSV on the file server is a 1 KB stub (17 rows, first second only)"
+    },
+    {
+      "city": "Amsterdam",
+      "video_id": "iVJGEW1st8c",
+      "reason": "detection CSV on the file server covers only the last 22% of the video (frames 166059-214260 of 214320 at 60 fps); found during review at 13:52"
     }
   ]
 }
