@@ -26,6 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
 import polars as pl
 
 import common
@@ -68,7 +69,7 @@ TRACK_GAP_SECONDS = 2.0
 MINIMUM_RELATIVE_X_RANGE = 0.08
 # Recorded in the results.pickle fingerprint; bump when rule D changes, so
 # cached results from an earlier version of the rule are not reused.
-ROAD_CROSSING_RULE_VERSION = "rule_d_rider_camera_passes_camera_tol003_v3"
+ROAD_CROSSING_RULE_VERSION = "rule_d_rider_camera_passes_camera_tol003_walking_v4"
 # How far past each edge of the middle strip a track must go to count as
 # having passed in front of the camera (passes_camera). A pedestrian standing
 # far ahead can be carried just across the strip when the car turns; with
@@ -93,27 +94,97 @@ def on_road_x_range(track: pl.DataFrame, interval: Optional[RoadInterval]) -> Op
     return float(on_road["x-center"].max() - on_road["x-center"].min())
 
 
+# A crossing pedestrian walks: a cyclist or a figure swept across the image by
+# a turning camera moves too fast, too unevenly, or hardly at all. The walking
+# speed is estimated from the box alone, as sideways image speed over box
+# height times a typical stature, over WALKING_SPEED_WINDOW_SECONDS steps; the
+# track must walk at MINIMUM_WALKING_SPEED to MAXIMUM_WALKING_SPEED (median
+# over the track), must not speed up more than MAXIMUM_SPEED_UP times from its
+# first to its last third, and must have its feet on the road in at least
+# MINIMUM_ROAD_SHARE of its segmented samples.
+#
+# Chosen on the Waymo training picks you reviewed: all 11 fakes (a cyclist the
+# detector saw no bicycle under, people swept across by a turning camera,
+# runners) are removed and 205 of 218 real crossings kept. Held out: Waymo
+# validation 0 of 4 fakes left, 39 of 41 real kept; the reviewed Paris
+# segment keeps all 22 real crossings.
+WALKING_SPEED_WINDOW_SECONDS = 0.5
+MINIMUM_WALKING_SPEED = 0.2
+MAXIMUM_WALKING_SPEED = 3.5
+MAXIMUM_SPEED_UP = 5.0
+MINIMUM_ROAD_SHARE = 0.2
+STATURE_METRES = 1.7
+
+
+def walking_motion(track: pl.DataFrame, fps: float, aspect_ratio: float) -> Optional[Tuple[float, float]]:
+    """Return (median walking speed in m/s, speed-up ratio) of a track, or None."""
+    ordered = track.sort("frame-count")
+    frames = ordered.get_column("frame-count").cast(pl.Float64, strict=False).to_numpy()
+    x = ordered.get_column("x-center").cast(pl.Float64, strict=False).to_numpy()
+    height = ordered.get_column("height").cast(pl.Float64, strict=False).to_numpy()
+    if len(frames) < 4 or fps <= 0:
+        return None
+    times = frames / float(fps)
+    step = max(1, int(round(WALKING_SPEED_WINDOW_SECONDS * float(fps))))
+    speeds = []
+    for index in range(len(times) - step):
+        elapsed = times[index + step] - times[index]
+        box_height = float(np.median(height[index:index + step + 1]))
+        if elapsed > 0 and box_height > 0:
+            image_speed = abs(x[index + step] - x[index]) / elapsed
+            speeds.append(image_speed * float(aspect_ratio) / box_height * STATURE_METRES)
+    if len(speeds) < 2:
+        return None
+    values = np.asarray(speeds)
+    third = max(1, len(values) // 3)
+    speed_up = (float(np.median(values[-third:])) + 0.05) / (float(np.median(values[:third])) + 0.05)
+    return float(np.median(values)), speed_up
+
+
 def road_crossing_flags(
     track: pl.DataFrame,
     interval: Optional[RoadInterval],
     box_size_change_rate: Optional[float],
     minimum_x_range: float,
+    surfaces: Optional[Sequence[str]] = None,
+    fps: Optional[float] = None,
+    aspect_ratio: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Return rule D and its parts for one pedestrian track.
 
     ``box_size_change_rate`` is the track's ``log_height_rate_abs`` feature.
+    When ``surfaces`` (the track's segmented surface labels), ``fps`` and
+    ``aspect_ratio`` are given, the walking checks (walking_motion and the
+    road share) are applied too; callers without them get the earlier rule.
     """
     x_range = on_road_x_range(track, interval)
     road_lateral = x_range is not None and x_range >= float(minimum_x_range)
     size_rate = None if box_size_change_rate is None else float(box_size_change_rate)
     slow_size_change = size_rate is not None and size_rate <= MAXIMUM_BOX_SIZE_CHANGE_RATE
-    return {
+    flags: Dict[str, Any] = {
         "on_road": int(interval is not None),
         "on_road_x_range": x_range,
         "road_lateral": int(road_lateral),
         "box_size_change_rate": size_rate,
         "road_crossing": int(road_lateral and slow_size_change),
     }
+    if surfaces is not None and fps and aspect_ratio:
+        labelled = [surface for surface in surfaces if surface in ("road", "footpath")]
+        road_share = (sum(1 for surface in labelled if surface == "road") / len(labelled)) if labelled else 0.0
+        motion = walking_motion(track, float(fps), float(aspect_ratio))
+        walking = (
+            motion is not None
+            and MINIMUM_WALKING_SPEED <= motion[0] <= MAXIMUM_WALKING_SPEED
+            and motion[1] <= MAXIMUM_SPEED_UP
+        )
+        flags.update(
+            road_share=road_share,
+            walking_speed_mps=None if motion is None else motion[0],
+            speed_up=None if motion is None else motion[1],
+            walking=int(walking),
+        )
+        flags["road_crossing"] = int(flags["road_crossing"] and walking and road_share >= MINIMUM_ROAD_SHARE)
+    return flags
 
 
 def longest_track_run(frames: Sequence[int], fps: float) -> Optional[Tuple[int, int]]:

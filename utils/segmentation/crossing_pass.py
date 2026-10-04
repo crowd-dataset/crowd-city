@@ -9,6 +9,7 @@ segments that actually contain a crossing.
 
 from __future__ import annotations
 
+import os
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -460,6 +461,11 @@ def select_road_crossings(
         if (payload or {}).get("ids") and stem in tasks_by_stem
     )
     minimum_x_range = float(crossing_parameters["min_crossing_x_range"])
+    # The frame aspect ratio the speed model assumes (CROWD_BBOX_ASPECT_RATIO,
+    # else 16:9), used to turn image speed into a walking speed.
+    aspect_ratio = crossing_metrics.safe_float(os.environ.get("CROWD_BBOX_ASPECT_RATIO"))
+    if aspect_ratio is None or aspect_ratio <= 0.0:
+        aspect_ratio = crossing_metrics.DEFAULT_ASPECT_RATIO
     logger.info(
         f"Selecting road crossings: segmenting {sum(len(candidates[stem]['ids']) for stem in pending)} "
         f"candidate track(s) in {len(pending)} detection segment(s)."
@@ -490,6 +496,9 @@ def select_road_crossings(
             if str(track_id) in tracks
             and road_crossing_flags(
                 tracks[str(track_id)], intervals.get(str(track_id)), rates.get(str(track_id)), minimum_x_range,
+                surfaces=[sample.surface for sample in timelines.get(str(track_id)) or []],
+                fps=float(effective_fps),
+                aspect_ratio=aspect_ratio,
             )["road_crossing"]
         ]
 
