@@ -19,6 +19,7 @@ import common
 from utils.crossing.detection import Detection
 from utils.crossing.metrics import Metrics
 import utils.crossing.metrics as crossing_metrics_module
+from utils.crossing.track_joining import join_track_pieces
 
 
 _WORKER_MAPPING: Optional[pl.DataFrame] = None
@@ -681,6 +682,8 @@ def process_csv_task(task: Dict[str, Any]) -> Dict[str, Any]:
             source_fps,
             _WORKER_PROCESSING_FPS,
         )
+        # One id per pedestrian before anything counts or judges tracks.
+        confidence_filtered = join_track_pieces(confidence_filtered, fps)
 
         metric_counts = _metric_counts_from_confidence_filtered(
             confidence_filtered

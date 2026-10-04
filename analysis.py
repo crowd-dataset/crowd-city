@@ -1877,6 +1877,10 @@ def _current_cache_config() -> Dict[str, object]:
         if segmentation_enabled or key not in skipped
     }
     config["hesitation_rule"] = HESITATION_RULE
+    from utils.crossing import track_joining
+
+    if track_joining.TRACK_JOINING_ENABLED:
+        config["track_joining"] = track_joining.TRACK_JOINING_VERSION
     if common.get_configs("crossing_rule") == "road_crossing":
         from utils.crossing.road_crossing import ROAD_CROSSING_RULE_VERSION
 

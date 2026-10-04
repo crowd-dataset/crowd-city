@@ -20,6 +20,7 @@ import common
 from custom_logger import CustomLogger
 import utils.analytics.csv_parallel as csv_parallel
 import utils.crossing.metrics as crossing_metrics
+from utils.crossing.track_joining import join_track_pieces
 from utils.analytics.csv_parallel import (
     _limit_detection_duration,
     _read_confidence_filtered,
@@ -392,6 +393,7 @@ def _prepared_detections(task: Mapping[str, Any]) -> Tuple[pl.DataFrame, float, 
         float(task["fps"]),
         csv_parallel._WORKER_PROCESSING_FPS,
     )
+    detections = join_track_pieces(detections, float(effective_fps))
     return detections, float(effective_fps), int(first_source_frame or 0)
 
 

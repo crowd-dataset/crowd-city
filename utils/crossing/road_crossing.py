@@ -126,7 +126,15 @@ def longest_track_run(frames: Sequence[int], fps: float) -> Optional[Tuple[int, 
     values = sorted({int(value) for value in frames})
     if not values:
         return None
-    maximum_gap = max(1, int(round(TRACK_GAP_SECONDS * float(fps))))
+    from utils.crossing import track_joining
+
+    # Joined tracks deliberately bridge gaps up to the joining limit (ids were
+    # already split where the tracker reused them), so a candidate must not be
+    # cut back into its pieces here.
+    gap_seconds = TRACK_GAP_SECONDS
+    if track_joining.TRACK_JOINING_ENABLED:
+        gap_seconds = max(gap_seconds, track_joining.MAXIMUM_JOIN_GAP_SECONDS)
+    maximum_gap = max(1, int(round(gap_seconds * float(fps))))
     best = (values[0], values[0])
     start = previous = values[0]
     for value in values[1:]:
