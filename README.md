@@ -257,13 +257,13 @@ The page shows them per segment or for the whole video, with precision (3 / (3 +
 ### Hand-verified precision test
 The crossing algorithm is held to **100% precision**: every pedestrian it counts as crossing must really walk across the road in front of the camera. Feet on the road alone, walking along the road, or crossing a side street do not count. Recall is secondary. Precision is checked by hand with `crossing_review.py` on a fixed set of about one hour of daytime footage from a car in each of five cities, listed with their video ids in [`crossing_review_set.json`](crossing_review_set.json). These videos were not used to tune the rule, so they are an honest test.
 
-| City | Video | Footage | Counted by the algorithm | Real (confirmed) | Fake | Precision | Missed by the algorithm (YOLO detected) | Not detected by YOLO | Recall |
-|---|---|---|---|---|---|---|---|---|---|
-| Los Angeles | [`1LS7MhOyhro`](https://www.youtube.com/watch?v=1LS7MhOyhro) | 60.0 min | 5 | 5 | 0 | **100%** | 7 | 3 | 5 / 15 (33%) |
-| Amsterdam | [`iVJGEW1st8c`](https://www.youtube.com/watch?v=iVJGEW1st8c) | 59.5 min | 25 | | | pending review | | | |
-| Seoul | [`XuYX93xqjB4`](https://www.youtube.com/watch?v=XuYX93xqjB4) | 62.4 min | 25 | | | pending review | | | |
-| Sydney | [`u084OpLn2Ps`](https://www.youtube.com/watch?v=u084OpLn2Ps) | 59.7 min | 2 | | | pending review | | | |
-| Cairo | [`a4zcL56YSME`](https://www.youtube.com/watch?v=a4zcL56YSME) | 73.0 min | 0 | 0 | 0 | — (nothing counted) | | | |
+| City | Video id | YouTube URL | Footage | Counted by the algorithm | Real (confirmed) | Fake | Precision | Missed by the algorithm (YOLO detected) | Not detected by YOLO | Recall |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Los Angeles | `1LS7MhOyhro` | <https://www.youtube.com/watch?v=1LS7MhOyhro> | 60.0 min from 0 s | 5 | 5 | 0 | **100%** | 7 | 3 | 5 / 15 (33%) |
+| Amsterdam | `iVJGEW1st8c` | <https://www.youtube.com/watch?v=iVJGEW1st8c> | 59.5 min from 0 s | 25 |  |  | pending review |  |  |  |
+| Seoul | `XuYX93xqjB4` | <https://www.youtube.com/watch?v=XuYX93xqjB4&t=10s> | 62.4 min from 10 s | 25 |  |  | pending review |  |  |  |
+| Sydney | `u084OpLn2Ps` | <https://www.youtube.com/watch?v=u084OpLn2Ps&t=38s> | 59.7 min from 38 s | 2 |  |  | pending review |  |  |  |
+| Cairo | `a4zcL56YSME` | <https://www.youtube.com/watch?v=a4zcL56YSME&t=27s> | 73.0 min from 27 s | 0 | 0 | 0 | — (nothing counted) |  |  |  |
 
 In Los Angeles, YOLO detected 12 of the 15 pedestrians who crossed, and the algorithm counted 5 of those 12. The first Sydney video chosen (`JMUROQ59kAQ`) was replaced because its detection file on the file server holds only the first second.
 
@@ -273,9 +273,11 @@ The rule was tuned on other data, which is reported separately:
 |---|---|---|---|---|
 | Waymo training (798 recordings; tuning) | 205 | 0 | 100% | 140 / 416 crosswalk crossers (34%) |
 | Waymo validation (202 recordings; held out) | 39 | 0 | 100% | 24 / 79 crosswalk crossers (30%) |
-| Paris `AdqE7mFQ7Y4`, first 12 minutes of segment 31 (busy; used while tuning) | 22 | 0 | 100% | about 23 of 54 crossers (43%) |
+| Paris, video id `AdqE7mFQ7Y4` (<https://www.youtube.com/watch?v=AdqE7mFQ7Y4&t=31s>), first 12 minutes from 31 s (busy; used while tuning) | 22 | 0 | 100% | about 23 of 54 crossers (43%) |
 
 On Waymo, a counted pedestrian is real when Waymo labels them as crossing on a crosswalk or, since those labels cover marked crosswalks only, when the hand review of the clip confirms a crossing elsewhere (62 in training, 15 in validation).
+
+**Trying to count more of the missed crossers.** Of the 7 Los Angeles crossers YOLO detected but the algorithm missed, 1 is a distant figure (box 0.07 of the image high) seen for under 2 s near the centre, 3 are only tracked on one side of the centre, so they never pass in front of the camera within their track, 1 fails both the box-size and the camera-motion checks, and 2 are first seen inside the centre strip and walk out to the left (one of them also moves with the camera). The only change that would recover any of them is to also count pedestrians first seen *inside* the centre strip who then walk out to one side, such as someone stepping out from behind a vehicle in front of the camera. It counts 1 more real crosser in Los Angeles, 2 more in Paris and 19 more crosswalk crossers in Waymo training, but it also counts 2 pedestrians in Paris that the review marked as not crossing, plus 18 unreviewed Waymo picks. It was therefore not adopted: precision comes first.
 
 ### Waymo calibration: current results and what was tried
 Crossing speeds are reported in m/s by a speed model calibrated on the [Waymo Open Dataset](https://waymo.com/open/), whose lidar-derived pedestrian speeds serve as the reference. The analysis refuses to run without a qualified model rather than falling back to a relative index. When `process_waymo_if_missing` is enabled, the raw Waymo TFRecords are exported (in Docker if available, otherwise in a local `uv` environment), tracked with YOLO and BoT-SORT at `yolo_imgsz`, and the speed model is fitted on the Waymo training split and tested once on the untouched validation split. The model is only used when it passes both the cross-validation and the external validation checks.
