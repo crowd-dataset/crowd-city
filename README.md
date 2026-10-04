@@ -201,10 +201,10 @@ Video is never downloaded in full: ffmpeg seeks over HTTP range requests and dec
 ![Crossings that are counted correctly](docs/images/crossing_samples_good.jpg)
 *Correctly counted crossings: a zebra crossing in Catania (1.39 m/s, no wait), a signalised crossing in Birmingham, a pedestrian waiting 2.56 s at the kerb in Prague at night, and a crossing in front of a shop in the United States.*
 
-The rule also counts some pedestrians who are not crossing, which is why its precision on Waymo is about 50% (see below). The common causes are snow at the road edge labelled as road, and people walking along the edge of the carriageway:
+Earlier versions of the rule also counted some pedestrians who were not crossing; the common causes were snow at the road edge labelled as road, and people walking along the edge of the carriageway. The current rule requires the pedestrian to pass in front of the camera and to walk across, which removes these cases (see [Hand-verified precision test](#hand-verified-precision-test)):
 
 ![Typical false crossings](docs/images/crossing_samples_failures.jpg)
-*Typical false crossings: in Sapporo the snowbank is labelled as road, so a pedestrian beside it counts as on the road; in Bengaluru a pedestrian walks along the road edge beside the barrier.*
+*False crossings of an earlier rule version: in Sapporo the snowbank is labelled as road, so a pedestrian beside it counts as on the road; in Bengaluru a pedestrian walks along the road edge beside the barrier.*
 
 To render sample clips from your own run, with the surface overlay and the boxes labelled by track id (the clips are written to `_output/segmentation_samples/`):
 
@@ -212,7 +212,7 @@ To render sample clips from your own run, with the surface overlay and the boxes
 uv run python visualize_segmentation_samples.py --samples 8
 ```
 
-- **`crossing_rule`**: Decides which pedestrians count as crossing, for every count, speed, waiting time and figure. `detector` uses the CROWD crossing detector alone: the track must pass through the vertical strip between `boundary_left` and `boundary_right` and survive its motion filters. `road_crossing` uses the road surface instead: the pedestrian's feet are on the road, the track moves across at least `min_crossing_x_range` of the image while there, and its box size changes slowly, which rejects people walking along the road. Tested against Waymo ground truth, `road_crossing` finds about twice as many real crossings as `detector` (training 232 vs 139, untouched validation 51 vs 19) at a precision of about 49% against Waymo's crosswalk-only labels, which audits showed undercounts real crossings. It requires `use_segmentation` and the video file server: candidates are first found from the boxes alone, then segmented, and the run stops if the road surface cannot be read for more than 5% of segments rather than undercounting crossings. The rules are defined in `utils/crossing/road_crossing.py`.
+- **`crossing_rule`**: Decides which pedestrians count as crossing, for every count, speed, waiting time and figure. `detector` uses the CROWD crossing detector alone: the track must pass through the vertical strip between `boundary_left` and `boundary_right` and survive its motion filters. `road_crossing` uses the road surface instead, and is tuned for precision first: whenever it counts a crossing, that should really be a pedestrian walking across the road in front of the camera. Broken YOLO tracks of sideways-walking pedestrians are first joined (`utils/crossing/track_joining.py`); a pedestrian then counts only when the track passes the centre of the image (in front of the camera), is not a cyclist or rider, moves independently of the camera, has its feet on the road while moving across at least `min_crossing_x_range` of the image with a slowly changing box size (which rejects people walking along the road), and walks at a plausible pace that does not speed up sharply. On every reviewed test, Waymo and hand-checked CROWD footage, its precision is 100%, at a recall of about a third (see [Hand-verified precision test](#hand-verified-precision-test)). It requires `use_segmentation` and the video file server: candidates are first found from the boxes alone, then segmented, and the run stops if the road surface cannot be read for more than 5% of segments rather than undercounting crossings. The rules are defined in `utils/crossing/road_crossing.py`.
 - **`use_segmentation`**: Enables the road-surface segmentation pass. When disabled, the analysis is exactly the baseline. Required when `crossing_rule` is `road_crossing`.
 - **`segmentation_is_primary`**: Determines which derivation the figures report. When `false` every figure and correlation uses the bounding-box metrics. When `true` the segmentation values become the reported crossing speed and initiation time throughout, i.e. in `speed_crossing_*` and `time_crossing_*`. Either way the bounding-box values stay in `speed_crossing_bbox_*` / `time_crossing_bbox_*` and the segmentation values in `speed_crossing_seg_*` / `time_crossing_seg_*`, so the two can always be compared. Note that the segmentation metrics do not cover every crossing the baseline covers: a track is dropped when it never reaches the carriageway, when the frozen speed model's reliability gates reject the shortened window, and, for the initiation time, whenever the pedestrian was already on the road when first detected. The count of localities that lose a value is logged when this is enabled.
 - **`seg_data`**: Directory holding the persistent surface-label store.
@@ -254,6 +254,29 @@ The four counts update as you go:
 
 The page shows them per segment or for the whole video, with precision (3 / (3 + 4)), recall (3 / (1 + 2 + 3)) and the share YOLO detected. Mark a segment fully reviewed once you have watched all of it. Labels are saved after every change in `_output/crossing_review/labels/<video_id>.json`, and **Export CSV** writes the counts per segment. The file-server credentials come from the secrets file and never reach the browser.
 
+### Hand-verified precision test
+The crossing algorithm is held to **100% precision**: every pedestrian it counts as crossing must really walk across the road in front of the camera. Feet on the road alone, walking along the road, or crossing a side street do not count. Recall is secondary. Precision is checked by hand with `crossing_review.py` on a fixed set of about one hour of daytime footage from a car in each of five cities, listed with their video ids in [`crossing_review_set.json`](crossing_review_set.json). These videos were not used to tune the rule, so they are an honest test.
+
+| City | Video | Footage | Counted by the algorithm | Real (confirmed) | Fake | Precision | Missed by the algorithm (YOLO detected) | Not detected by YOLO | Recall |
+|---|---|---|---|---|---|---|---|---|---|
+| Los Angeles | [`1LS7MhOyhro`](https://www.youtube.com/watch?v=1LS7MhOyhro) | 60.0 min | 5 | 5 | 0 | **100%** | 7 | 3 | 5 / 15 (33%) |
+| Amsterdam | [`iVJGEW1st8c`](https://www.youtube.com/watch?v=iVJGEW1st8c) | 59.5 min | 25 | | | pending review | | | |
+| Seoul | [`XuYX93xqjB4`](https://www.youtube.com/watch?v=XuYX93xqjB4) | 62.4 min | 25 | | | pending review | | | |
+| Sydney | [`u084OpLn2Ps`](https://www.youtube.com/watch?v=u084OpLn2Ps) | 59.7 min | | | | pending review | | | |
+| Cairo | [`a4zcL56YSME`](https://www.youtube.com/watch?v=a4zcL56YSME) | 73.0 min | 0 | 0 | 0 | — (nothing counted) | | | |
+
+In Los Angeles, YOLO detected 12 of the 15 pedestrians who crossed, and the algorithm counted 5 of those 12. The first Sydney video chosen (`JMUROQ59kAQ`) was replaced because its detection file on the file server holds only the first second.
+
+The rule was tuned on other data, which is reported separately:
+
+| Data | Counted | Fake | Precision | Recall |
+|---|---|---|---|---|
+| Waymo training (798 recordings; tuning) | 205 | 0 | 100% | 140 / 416 crosswalk crossers (34%) |
+| Waymo validation (202 recordings; held out) | 39 | 0 | 100% | 24 / 79 crosswalk crossers (30%) |
+| Paris `AdqE7mFQ7Y4`, first 12 minutes of segment 31 (busy; used while tuning) | 22 | 0 | 100% | about 23 of 54 crossers (43%) |
+
+On Waymo, a counted pedestrian is real when Waymo labels them as crossing on a crosswalk or, since those labels cover marked crosswalks only, when the hand review of the clip confirms a crossing elsewhere (62 in training, 15 in validation).
+
 ### Waymo calibration: current results and what was tried
 Crossing speeds are reported in m/s by a speed model calibrated on the [Waymo Open Dataset](https://waymo.com/open/), whose lidar-derived pedestrian speeds serve as the reference. The analysis refuses to run without a qualified model rather than falling back to a relative index. When `process_waymo_if_missing` is enabled, the raw Waymo TFRecords are exported (in Docker if available, otherwise in a local `uv` environment), tracked with YOLO and BoT-SORT at `yolo_imgsz`, and the speed model is fitted on the Waymo training split and tested once on the untouched validation split. The model is only used when it passes both the cross-validation and the external validation checks.
 
@@ -275,9 +298,9 @@ City averages are close to unbiased; individual crossings are typically off by 0
 |---|---|---|---|
 | CROWD detector | 139 / 918 (15%) | 19 / 183 (10%) | 65% / 58% |
 | Detector with feet on the road | 139 / 918 (15%) | 19 / 183 (10%) | 70% / 59% |
-| `road_crossing` (used to count crossings) | 232 / 918 (25%) | 51 / 183 (28%) | 49% / 49% |
+| `road_crossing`, first version (feet on the road only) | 232 / 918 (25%) | 51 / 183 (28%) | 49% / 49% |
 
-About three quarters of the real crossers that are missed are never detected by YOLO at all (small, distant pedestrians). On the validation split, speeds of `road_crossing` crossings have an MAE of 0.15 m/s, against 0.11 m/s for the detector's crossings.
+These were the first comparisons. The `road_crossing` rule used now adds the passes-the-camera, rider, camera-motion and walking checks, and track joining; with Waymo's labels completed by hand review its precision is 100% on both splits (see [Hand-verified precision test](#hand-verified-precision-test)). About three quarters of the real crossers that are missed are never detected by YOLO at all (small, distant pedestrians). On the validation split, speeds of `road_crossing` crossings have an MAE of 0.15 m/s, against 0.11 m/s for the detector's crossings.
 
 **What was tried**, all on the Waymo training split first and confirmed on the untouched validation split only once:
 
