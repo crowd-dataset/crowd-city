@@ -262,7 +262,7 @@ The crossing algorithm is held to **100% precision**: every pedestrian it counts
 | Los Angeles | [`1LS7MhOyhro`](https://www.youtube.com/watch?v=1LS7MhOyhro) | 60.0 min | 5 | 5 | 0 | **100%** | 7 | 3 | 5 / 15 (33%) |
 | Amsterdam | [`iVJGEW1st8c`](https://www.youtube.com/watch?v=iVJGEW1st8c) | 59.5 min | 25 | | | pending review | | | |
 | Seoul | [`XuYX93xqjB4`](https://www.youtube.com/watch?v=XuYX93xqjB4) | 62.4 min | 25 | | | pending review | | | |
-| Sydney | [`u084OpLn2Ps`](https://www.youtube.com/watch?v=u084OpLn2Ps) | 59.7 min | | | | pending review | | | |
+| Sydney | [`u084OpLn2Ps`](https://www.youtube.com/watch?v=u084OpLn2Ps) | 59.7 min | 2 | | | pending review | | | |
 | Cairo | [`a4zcL56YSME`](https://www.youtube.com/watch?v=a4zcL56YSME) | 73.0 min | 0 | 0 | 0 | — (nothing counted) | | | |
 
 In Los Angeles, YOLO detected 12 of the 15 pedestrians who crossed, and the algorithm counted 5 of those 12. The first Sydney video chosen (`JMUROQ59kAQ`) was replaced because its detection file on the file server holds only the first second.
