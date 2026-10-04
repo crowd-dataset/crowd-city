@@ -69,7 +69,7 @@ TRACK_GAP_SECONDS = 2.0
 MINIMUM_RELATIVE_X_RANGE = 0.08
 # Recorded in the results.pickle fingerprint; bump when rule D changes, so
 # cached results from an earlier version of the rule are not reused.
-ROAD_CROSSING_RULE_VERSION = "rule_d_rider_camera_passes_camera_tol003_walking_v4"
+ROAD_CROSSING_RULE_VERSION = "rule_d_rider_camera_passes_or_emerges_tol003_walking_v5"
 # How far past each edge of the middle strip a track must go to count as
 # having passed in front of the camera (passes_camera). A pedestrian standing
 # far ahead can be carried just across the strip when the car turns; with
@@ -114,6 +114,21 @@ MAXIMUM_WALKING_SPEED = 3.5
 MAXIMUM_SPEED_UP = 5.0
 MINIMUM_ROAD_SHARE = 0.2
 STATURE_METRES = 1.7
+# A pedestrian first seen inside the middle strip who walks out past one of
+# its edges (emerges_in_front; typically someone stepping out from behind a
+# vehicle in front of the camera) also counts as passing the camera, but only
+# when walking steadily: at least EMERGING_MINIMUM_WALKING_SPEED, and without
+# slowing to below EMERGING_MINIMUM_SPEED_UP of the starting speed (the same
+# last-third over first-third ratio as MAXIMUM_SPEED_UP).
+#
+# Chosen on everything reviewed by hand: allowing these pedestrians added 32
+# real crossings on Waymo training, 6 on validation, 3 on the reviewed Paris
+# segment and 1 on the reviewed Los Angeles video, with 2 fakes: a Waymo
+# pedestrian who almost stops (speed ratio 0.15, every real one at least
+# 0.38) and a Paris pedestrian creeping at 0.23 m/s (the slowest real one
+# 0.33 m/s). With both limits all reviewed data stays at 100% precision.
+EMERGING_MINIMUM_WALKING_SPEED = 0.3
+EMERGING_MINIMUM_SPEED_UP = 0.25
 
 
 def walking_motion(track: pl.DataFrame, fps: float, aspect_ratio: float) -> Optional[Tuple[float, float]]:
@@ -149,6 +164,7 @@ def road_crossing_flags(
     surfaces: Optional[Sequence[str]] = None,
     fps: Optional[float] = None,
     aspect_ratio: Optional[float] = None,
+    camera_strip: Optional[Tuple[float, float, float]] = None,
 ) -> Dict[str, Any]:
     """Return rule D and its parts for one pedestrian track.
 
@@ -156,6 +172,9 @@ def road_crossing_flags(
     When ``surfaces`` (the track's segmented surface labels), ``fps`` and
     ``aspect_ratio`` are given, the walking checks (walking_motion and the
     road share) are applied too; callers without them get the earlier rule.
+    When ``camera_strip`` (``(left, right, tolerance)``) is also given, a
+    track that only emerges in front of the camera rather than passing it
+    must meet the stricter EMERGING_* walking limits.
     """
     x_range = on_road_x_range(track, interval)
     road_lateral = x_range is not None and x_range >= float(minimum_x_range)
@@ -184,6 +203,16 @@ def road_crossing_flags(
             walking=int(walking),
         )
         flags["road_crossing"] = int(flags["road_crossing"] and walking and road_share >= MINIMUM_ROAD_SHARE)
+        if camera_strip is not None:
+            x_values = track.sort("frame-count").get_column("x-center").to_list()
+            emerging = not passes_camera(x_values, *camera_strip)
+            flags["emerges_in_front"] = int(emerging)
+            if emerging and (
+                motion is None
+                or motion[0] < EMERGING_MINIMUM_WALKING_SPEED
+                or motion[1] < EMERGING_MINIMUM_SPEED_UP
+            ):
+                flags["road_crossing"] = 0
     return flags
 
 
@@ -251,6 +280,24 @@ def passes_camera(x_values: Sequence[float], left: float, right: float, toleranc
     return False
 
 
+def emerges_in_front(x_values: Sequence[float], left: float, right: float, tolerance: float = 0.0) -> bool:
+    """Return whether a track first seen inside the middle strip walks out of it.
+
+    The box centre starts within ``[left, right]`` and later goes past one of
+    its edges by ``tolerance``: a pedestrian who appears in front of the
+    camera (often from behind a vehicle) and walks to one side.
+    """
+    values = [float(value) for value in x_values]
+    if not values or not float(left) <= values[0] <= float(right):
+        return False
+    return any(x <= float(left) - float(tolerance) or x >= float(right) + float(tolerance) for x in values)
+
+
+def crosses_in_front(x_values: Sequence[float], left: float, right: float, tolerance: float = 0.0) -> bool:
+    """Return whether a track passes the camera or emerges in front of it."""
+    return passes_camera(x_values, left, right, tolerance) or emerges_in_front(x_values, left, right, tolerance)
+
+
 def independent_motion_rejection(
     window: pl.DataFrame,
     track_id: Any,
@@ -310,7 +357,8 @@ def box_only_candidates(
     restricted to its candidate bounds, keyed by normalised id. Returns the
     candidate ids, their ``(start_frame, end_frame)`` bounds and their box
     size change rates. ``camera_strip`` is ``(left, right, tolerance)``; when
-    given, a candidate must also pass in front of the camera (passes_camera).
+    given, a candidate must also pass in front of the camera or emerge in
+    front of it (crosses_in_front).
     """
     candidates: List[Any] = []
     bounds: Dict[Any, Tuple[int, int]] = {}
@@ -326,7 +374,7 @@ def box_only_candidates(
             continue
         x_range = float(rows["x-center"].max() - rows["x-center"].min())
         if camera_strip is not None:
-            if not passes_camera(rows.sort("frame-count")["x-center"].to_list(), *camera_strip):
+            if not crosses_in_front(rows.sort("frame-count")["x-center"].to_list(), *camera_strip):
                 continue
         features = features_by_track.get(crossing_metrics.normalise_id(track_id))
         if x_range < float(minimum_x_range) or features is None:

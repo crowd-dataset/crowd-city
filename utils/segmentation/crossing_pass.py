@@ -447,7 +447,7 @@ def select_road_crossings(
     segmentation cannot run this raises rather than silently counting
     crossings another way.
     """
-    from utils.crossing.road_crossing import road_crossing_flags
+    from utils.crossing.road_crossing import PASS_TOLERANCE, road_crossing_flags
 
     pipeline = _segmentation_pipeline(df_mapping, crossing_parameters)
     if pipeline is None:
@@ -466,6 +466,12 @@ def select_road_crossings(
     aspect_ratio = crossing_metrics.safe_float(os.environ.get("CROWD_BBOX_ASPECT_RATIO"))
     if aspect_ratio is None or aspect_ratio <= 0.0:
         aspect_ratio = crossing_metrics.DEFAULT_ASPECT_RATIO
+    # The same middle strip the candidates were found with (csv_parallel).
+    camera_strip = (
+        float(crossing_parameters.get("boundary_left", _config("boundary_left"))),
+        float(crossing_parameters.get("boundary_right", _config("boundary_right"))),
+        PASS_TOLERANCE,
+    )
     logger.info(
         f"Selecting road crossings: segmenting {sum(len(candidates[stem]['ids']) for stem in pending)} "
         f"candidate track(s) in {len(pending)} detection segment(s)."
@@ -499,6 +505,7 @@ def select_road_crossings(
                 surfaces=[sample.surface for sample in timelines.get(str(track_id)) or []],
                 fps=float(effective_fps),
                 aspect_ratio=aspect_ratio,
+                camera_strip=camera_strip,
             )["road_crossing"]
         ]
 

@@ -177,6 +177,14 @@ def _download_detection_file(video_id: str, start: int, csv_url: str) -> Optiona
     return None
 
 
+def _rule_version() -> str:
+    """The crossing rule and track joining versions; cached segments from others are redone."""
+    from utils.crossing.road_crossing import ROAD_CROSSING_RULE_VERSION
+    from utils.crossing.track_joining import TRACK_JOINING_VERSION
+
+    return f"{ROAD_CROSSING_RULE_VERSION}+{TRACK_JOINING_VERSION}"
+
+
 def video_path(video_id: str) -> Path:
     return VIDEO_DIR / f"{video_id}.mp4"
 
@@ -313,9 +321,10 @@ class Processor:
         if not path.is_file():
             return False
         try:
-            return json.loads(path.read_text(encoding="utf-8")).get("version") == SEGMENT_CACHE_VERSION
+            cached = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return False
+        return cached.get("version") == SEGMENT_CACHE_VERSION and cached.get("rule_version") == _rule_version()
 
     def state(self, video_id: str) -> Dict[str, Any]:
         info = self.mapping.segments(video_id) or {"segments": []}
@@ -481,6 +490,7 @@ class Processor:
             "city": info["city"],
             "video_fps": video_fps,
             "crossing_rule": rule,
+            "rule_version": _rule_version(),
             "counted": counted,
             "counted_windows": windows,
             "tracks": _person_tracks(detections, clock, float(effective_fps)),
