@@ -2,13 +2,73 @@
   "purpose": "Hand-verified test set for the crossing algorithm. Every crossing the algorithm counts on these videos must be a real crossing in front of the camera (target precision 100%). Reviewed with crossing_review.py; labels are saved in _output/crossing_review/labels/<video_id>.json.",
   "chosen": "2026-10-04",
   "videos": [
-    {"city": "Los Angeles", "iso3": "USA", "video_id": "1LS7MhOyhro", "footage_minutes": 60.0, "segments": [0], "fps": 30},
-    {"city": "Amsterdam", "iso3": "NLD", "video_id": "iVJGEW1st8c", "footage_minutes": 59.5, "segments": [0], "fps": 60},
-    {"city": "Seoul", "iso3": "KOR", "video_id": "XuYX93xqjB4", "footage_minutes": 62.4, "segments": [10], "fps": 30},
-    {"city": "Sydney", "iso3": "AUS", "video_id": "JMUROQ59kAQ", "footage_minutes": 59.8, "segments": [60], "fps": 30},
-    {"city": "Cairo", "iso3": "EGY", "video_id": "a4zcL56YSME", "footage_minutes": 73.0, "segments": [27], "fps": 25}
+    {
+      "city": "Los Angeles",
+      "iso3": "USA",
+      "video_id": "1LS7MhOyhro",
+      "footage_minutes": 60.0,
+      "segments": [
+        0
+      ],
+      "fps": 30
+    },
+    {
+      "city": "Amsterdam",
+      "iso3": "NLD",
+      "video_id": "iVJGEW1st8c",
+      "footage_minutes": 59.5,
+      "segments": [
+        0
+      ],
+      "fps": 60
+    },
+    {
+      "city": "Seoul",
+      "iso3": "KOR",
+      "video_id": "XuYX93xqjB4",
+      "footage_minutes": 62.4,
+      "segments": [
+        10
+      ],
+      "fps": 30
+    },
+    {
+      "city": "Sydney",
+      "iso3": "AUS",
+      "video_id": "u084OpLn2Ps",
+      "footage_minutes": 59.7,
+      "segments": [
+        38
+      ],
+      "fps": 30
+    },
+    {
+      "city": "Cairo",
+      "iso3": "EGY",
+      "video_id": "a4zcL56YSME",
+      "footage_minutes": 73.0,
+      "segments": [
+        27
+      ],
+      "fps": 25
+    }
   ],
   "earlier_reviews": [
-    {"city": "Paris", "iso3": "FRA", "video_id": "AdqE7mFQ7Y4", "segments": [31], "note": "reviewed to 12:06; used while tuning the rule"}
+    {
+      "city": "Paris",
+      "iso3": "FRA",
+      "video_id": "AdqE7mFQ7Y4",
+      "segments": [
+        31
+      ],
+      "note": "reviewed to 12:06; used while tuning the rule"
+    }
+  ],
+  "excluded": [
+    {
+      "city": "Sydney",
+      "video_id": "JMUROQ59kAQ",
+      "reason": "detection CSV on the file server is a 1 KB stub (17 rows, first second only)"
+    }
   ]
 }
