@@ -52,10 +52,17 @@ REQUIRE_UNIQUE_MATCH = False
 REQUIRE_SIDEWAYS_MOTION = True
 MINIMUM_SIDEWAYS_SPEED = 0.03
 MAXIMUM_SPEED_RATIO = 2.0
+# Only pedestrians whose box is at least this share of the image height are
+# joined. Small, distant figures are where links go wrong: several people fit
+# where the lost one should reappear, and a turning camera sweeps them across
+# the image. On the reviewed segment the only fake crossing (box 0.088 high)
+# passed in front of the camera only through such a link, while every real
+# crossing that needed joining was at least 0.147 high.
+MINIMUM_JOIN_HEIGHT = 0.12
 # Seconds at the end of a piece over which its sideways velocity is measured.
 VELOCITY_SECONDS = 1.0
 # Recorded in the results.pickle fingerprint; bump when joining changes.
-TRACK_JOINING_VERSION = "track_joining_sideways_v1"
+TRACK_JOINING_VERSION = "track_joining_sideways_minheight012_v2"
 
 
 def _pieces(people: pl.DataFrame, fps: float) -> List[Dict]:
@@ -109,6 +116,8 @@ def _links(pieces: List[Dict], fps: float) -> Dict[int, int]:
         if REQUIRE_SIDEWAYS_MOTION and abs(piece["velocity"]) < minimum_speed:
             continue
         end_x, end_y, end_height = piece["end_state"]
+        if end_height < MINIMUM_JOIN_HEIGHT:
+            continue
         best, best_score, fitting = None, None, 0
         low = bisect.bisect_right(starts, piece["last"])
         high = bisect.bisect_right(starts, piece["last"] + maximum_gap)
