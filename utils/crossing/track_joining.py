@@ -24,8 +24,12 @@ from typing import Dict, List, Tuple
 import polars as pl
 
 PERSON_CLASS = 0
-# Off until the comparison on reviewed footage decides the settings.
-TRACK_JOINING_ENABLED = False
+# Chosen from a comparison on a hand-reviewed busy CROWD segment: sideways-only
+# joining (no unique-match requirement, the default gates below) raised the
+# crossers counted from 13 to 21 of 54 at precision 91% (93% without joining);
+# tighter gates gave 18. On Waymo, real crossers with a track passing the
+# camera rose from 162 to 182 (training) and 25 to 27 (validation).
+TRACK_JOINING_ENABLED = True
 # A gap longer than this within one id ends a piece (the id was reused).
 RUN_GAP_SECONDS = 2.0
 # Longest gap between two pieces that can still be one pedestrian.
@@ -40,7 +44,7 @@ JOIN_Y_HEIGHT_SHARE = 0.6
 MAXIMUM_HEIGHT_RATIO = 1.5
 # Link only when exactly one piece fits the gates; in a crowd, another person
 # standing where the lost one is expected is a common source of wrong links.
-REQUIRE_UNIQUE_MATCH = True
+REQUIRE_UNIQUE_MATCH = False
 # Only pedestrians walking sideways are joined (the case that matters for
 # crossings): both pieces must move in the same direction at least
 # MINIMUM_SIDEWAYS_SPEED (image widths per second), at speeds within
@@ -51,7 +55,7 @@ MAXIMUM_SPEED_RATIO = 2.0
 # Seconds at the end of a piece over which its sideways velocity is measured.
 VELOCITY_SECONDS = 1.0
 # Recorded in the results.pickle fingerprint; bump when joining changes.
-TRACK_JOINING_VERSION = "track_joining_v1"
+TRACK_JOINING_VERSION = "track_joining_sideways_v1"
 
 
 def _pieces(people: pl.DataFrame, fps: float) -> List[Dict]:

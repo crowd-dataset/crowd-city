@@ -238,10 +238,25 @@ async function loadAllSegments() {
   for (const s of state.info.segments) { try { await segmentData(s.start); } catch { /* not processed */ } }
   renderSide();
 }
+// Track ids change when a segment is processed again (track joining, a new
+// algorithm version), so a saved click is re-matched to the track under it.
+function rematchClicks(start, data) {
+  let changedAny = false;
+  for (const mark of segLabels(start).crossings) {
+    if (!mark.track) continue;
+    const track = data.byId[mark.track];
+    if (track && boxNear(track, mark.t)) continue;
+    const found = matchClick(data, mark);
+    const id = found ? found.id : null;
+    if (id !== mark.track) { mark.track = id; changedAny = true; }
+  }
+  return changedAny;
+}
 async function openSegment(s) {
   state.seg = s;
   try { state.data = await segmentData(s.start); state.byId = state.data.byId; }
   catch (error) { setStatus(error.message); return; }
+  if (rematchClicks(s.start, state.data)) changed();
   $("overlayMsg").style.display = "none";
   $("seek").min = s.start; $("seek").max = s.end;
   seek(s.start); renderSegments(); renderSide();
