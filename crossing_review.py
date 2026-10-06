@@ -258,7 +258,8 @@ def _download_video(video_id: str, progress) -> Path:
         with lock:
             finished.add(first)
             part = record.with_suffix(".tmp")
-            part.write_text(json.dumps({"total": total, "part_bytes": DOWNLOAD_PART_BYTES, "finished": sorted(finished)}), encoding="utf-8")
+            saved = {"total": total, "part_bytes": DOWNLOAD_PART_BYTES, "finished": sorted(finished)}
+            part.write_text(json.dumps(saved), encoding="utf-8")
             os.replace(part, record)
 
     def fetch(first: int) -> None:
@@ -446,7 +447,7 @@ class Processor:
             share = (index - 1) / len(segments)
             self._process_segment(
                 video_id, info, segment, local_video,
-                lambda message: self._progress(video_id, f"{label}: {message}", share),
+                lambda message, label=label, share=share: self._progress(video_id, f"{label}: {message}", share),
             )
 
     def _process_segment(self, video_id: str, info: Dict[str, Any], segment: Dict[str, Any],

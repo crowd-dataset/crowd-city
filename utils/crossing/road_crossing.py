@@ -72,7 +72,9 @@ TRACK_GAP_SECONDS = 2.0
 MINIMUM_RELATIVE_X_RANGE = 0.08
 # Recorded in the results.pickle fingerprint; bump when rule D changes, so
 # cached results from an earlier version of the rule are not reused.
-ROAD_CROSSING_RULE_VERSION = "rule_d_rider_camera_passes_or_emerges_tol003_walking_turning_unverified_size035_speedup9_v8"
+ROAD_CROSSING_RULE_VERSION = (
+    "rule_d_rider_camera_passes_or_emerges_tol003_walking_turning_unverified_size035_speedup9_v8"
+)
 # How far past each edge of the middle strip a track must go to count as
 # having passed in front of the camera (passes_camera). A pedestrian standing
 # far ahead can be carried just across the strip when the car turns; with

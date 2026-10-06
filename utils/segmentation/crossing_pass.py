@@ -533,7 +533,8 @@ def select_road_crossings(
                 pipeline._count("rejected_turning_camera", 1)
                 continue
             window = detections.filter(pl.col("frame-count").is_between(frames.min(), frames.max()))
-            if unverifiable_crossing(track, window, track_id, float(effective_fps), shift, flags.get("walking_speed_mps")):
+            speed = flags.get("walking_speed_mps")
+            if unverifiable_crossing(track, window, track_id, float(effective_fps), shift, speed):
                 pipeline._count("rejected_unverifiable", 1)
                 continue
             selected_ids.append(track_id)

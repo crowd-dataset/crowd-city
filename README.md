@@ -324,7 +324,18 @@ City averages are close to unbiased; individual crossings are typically off by 0
 | Detector with feet on the road | 139 / 918 (15%) | 19 / 183 (10%) | 70% / 59% |
 | `road_crossing`, first version (feet on the road only) | 232 / 918 (25%) | 51 / 183 (28%) | 49% / 49% |
 
-These were the first comparisons. The `road_crossing` rule used now adds the passes-the-camera, rider, camera-motion and walking checks, and track joining; with Waymo's labels completed by hand review its precision is 100% on both splits (see [Manual verification of crossings](#manual-verification-of-crossings)). About three quarters of the real crossers that are missed are never detected by YOLO at all (small, distant pedestrians). On the validation split, speeds of `road_crossing` crossings have an MAE of 0.15 m/s, against 0.11 m/s for the detector's crossings.
+These were the first comparisons. The `road_crossing` rule used now adds the passes-the-camera, rider, camera-motion and walking checks, and track joining; with Waymo's labels completed by hand review its precision is 100% on both splits (see [Manual verification of crossings](#manual-verification-of-crossings)). About three quarters of the real crossers that are missed are never detected by YOLO at all (small, distant pedestrians). On the validation split, speeds of the first `road_crossing` rule's crossings had an MAE of 0.15 m/s, against 0.11 m/s for the detector's crossings.
+
+**Speed of the crossings counted now.** For every crossing the current `road_crossing` rule counts on Waymo and that matches a Waymo pedestrian, the reported speed (road-restricted, since `segmentation_is_primary` is on) is compared with Waymo's lidar speed over the same on-road frames, and the whole-track speed with the lidar speed over the whole track:
+
+| Split | Crossings with a speed | Speed | MAE | RMSE | Bias | Median error | Within 0.25 m/s | Within 0.50 m/s | r |
+|---|---|---|---|---|---|---|---|---|---|
+| Training | 165 of 227 | road-restricted (reported) | 0.14 m/s | 0.24 m/s | −0.01 m/s | 0.08 m/s | 87% | 98% | 0.54 |
+| Training | 165 of 227 | whole track | 0.14 m/s | 0.25 m/s | −0.02 m/s | 0.09 m/s | 87% | 96% | 0.62 |
+| Untouched validation | 28 of 42 | road-restricted (reported) | 0.12 m/s | 0.21 m/s | −0.06 m/s | 0.06 m/s | 86% | 96% | 0.77 |
+| Untouched validation | 28 of 42 | whole track | 0.13 m/s | 0.22 m/s | −0.05 m/s | 0.09 m/s | 86% | 96% | 0.76 |
+
+About 70% of the counted crossings get a speed; the speed model's reliability gates reject the rest rather than guess. The speed model was fitted on the training split, so validation is the honest figure, and with 28 crossings its MAE carries an uncertainty of roughly ±0.04 m/s. The tighter crossing rule did not make the speeds worse: they are as accurate as those of the detector's crossings. Estimates stay compressed towards the mean, so differences between cities are somewhat understated.
 
 **What was tried**, all on the Waymo training split first and confirmed on the untouched validation split only once:
 
