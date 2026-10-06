@@ -42,9 +42,12 @@ from utils.segmentation.surface import (
 )
 
 # Largest absolute rate of change of log box height, per second, for rule D.
-# Chosen on the Waymo training split: it removes along-the-road walkers while
-# keeping 95% of the real crossings the rule would otherwise find.
-MAXIMUM_BOX_SIZE_CHANGE_RATE = 0.25
+# First chosen at 0.25 on the Waymo training split, to remove along-the-road
+# walkers. Raised to 0.35 for pedestrians crossing right in front of an
+# approaching car, whose box grows fast: on the hand-reviewed CROWD videos
+# this adds 12 real crossings (Paris 3, Cairo 9) and no fake, and on Waymo 3
+# more crosswalk crossers on training, none lost and no fake.
+MAXIMUM_BOX_SIZE_CHANGE_RATE = 0.35
 # Shortest pedestrian track worth segmenting: half a second at Waymo's 10 fps.
 MINIMUM_TRACK_ROWS = 5
 MINIMUM_TRACK_SECONDS = 0.5
@@ -69,7 +72,7 @@ TRACK_GAP_SECONDS = 2.0
 MINIMUM_RELATIVE_X_RANGE = 0.08
 # Recorded in the results.pickle fingerprint; bump when rule D changes, so
 # cached results from an earlier version of the rule are not reused.
-ROAD_CROSSING_RULE_VERSION = "rule_d_rider_camera_passes_or_emerges_tol003_walking_turning_unverified_v7"
+ROAD_CROSSING_RULE_VERSION = "rule_d_rider_camera_passes_or_emerges_tol003_walking_turning_unverified_size035_speedup9_v8"
 # How far past each edge of the middle strip a track must go to count as
 # having passed in front of the camera (passes_camera). A pedestrian standing
 # far ahead can be carried just across the strip when the car turns; with
@@ -111,7 +114,11 @@ def on_road_x_range(track: pl.DataFrame, interval: Optional[RoadInterval]) -> Op
 WALKING_SPEED_WINDOW_SECONDS = 0.5
 MINIMUM_WALKING_SPEED = 0.2
 MAXIMUM_WALKING_SPEED = 3.5
-MAXIMUM_SPEED_UP = 5.0
+# The speed-up limit was first 5; people who wait at the kerb and then cross
+# speed up 5.7 to 8.7 times on the reviewed CROWD videos, while a Waymo
+# validation pick the review marked as not crossing speeds up 9.8 times. At
+# 9 the reviewed videos gain 8 real crossings and no fake.
+MAXIMUM_SPEED_UP = 9.0
 MINIMUM_ROAD_SHARE = 0.2
 STATURE_METRES = 1.7
 # A pedestrian first seen inside the middle strip who walks out past one of

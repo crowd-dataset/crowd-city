@@ -391,6 +391,17 @@ class SegmentationPipeline:
         tolerance = clock.frames_per_second / (2.0 * cadence_hz)
 
         for window in windows:
+            # Sample on a fixed grid of video time (multiples of 1 / cadence_hz)
+            # rather than from wherever the merged window happens to start.
+            # A window's start depends on which other tracks share it, so
+            # without this, adding or removing one candidate moves every
+            # sample of its neighbours and can tip a borderline track over a
+            # threshold (a confirmed Paris crossing was lost this way).
+            grid_start = math.floor(window.start_seconds * cadence_hz) / cadence_hz
+            window = FrameWindow(
+                start_seconds=grid_start,
+                duration_seconds=window.start_seconds + window.duration_seconds - grid_start,
+            )
             frames = extract_window_frames(
                 source,
                 window,

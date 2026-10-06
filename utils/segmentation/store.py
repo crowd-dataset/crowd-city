@@ -32,7 +32,9 @@ logger = CustomLogger(__name__)
 # re-segmented rather than reused.
 # v3: merged windows longer than the per-window ceiling are split instead of
 # dropped, so v2 entries can be missing whole stretches of crossing tracks.
-INDEX_SCHEMA = "crowd_surface_index_v3"
+# v4: frames are sampled on a fixed grid of video time, so a track's labels
+# no longer depend on which other tracks share its window.
+INDEX_SCHEMA = "crowd_surface_index_v4"
 INDEX_FOLDER = "index"
 MANIFEST_FOLDER = "manifest"
 URL_CACHE_FILE = "video_urls.json"
