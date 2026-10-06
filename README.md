@@ -201,11 +201,6 @@ Video is never downloaded in full: ffmpeg seeks over HTTP range requests and dec
 ![Crossings that are counted correctly](docs/images/crossing_samples_good.jpg)
 *Correctly counted crossings: a zebra crossing in Catania (1.39 m/s, no wait), a signalised crossing in Birmingham, a pedestrian waiting 2.56 s at the kerb in Prague at night, and a crossing in front of a shop in the United States.*
 
-Earlier versions of the rule also counted some pedestrians who were not crossing; the common causes were snow at the road edge labelled as road, and people walking along the edge of the carriageway. The current rule requires the pedestrian to pass in front of the camera and to walk across, which removes these cases (see [Manual verification of crossings](#manual-verification-of-crossings)):
-
-![Typical false crossings](docs/images/crossing_samples_failures.jpg)
-*False crossings of an earlier rule version: in Sapporo the snowbank is labelled as road, so a pedestrian beside it counts as on the road; in Bengaluru a pedestrian walks along the road edge beside the barrier.*
-
 To render sample clips from your own run, with the surface overlay and the boxes labelled by track id (the clips are written to `_output/segmentation_samples/`):
 
 ```bash
@@ -244,6 +239,9 @@ The test uses a fixed set of daytime videos filmed from a car, about one hour ea
 ```bash
 uv run python crossing_review.py
 ```
+
+![The manual verification tool](docs/images/crossing_review_tool.jpg)
+*The review tool on the Seoul video at a busy signalised crossing (34:46). Green boxes are crossings the algorithm counted and the reviewer confirmed; the four counts, precision and recall are on the right, above the list of the reviewer's clicks, each with a **Go** button that jumps to it.*
 
 1. **Process the video.** Enter a video id and press **Process video**. This does all the slow work once, before you start, so the review has no lag: the whole video is downloaded (over 8 parallel connections) into `_output/crossing_review/videos/`, the segment's YOLO detection file is read (files missing locally are fetched from the file server's `data` alias, see `--csv-url-path`, and converted to Parquet), and the crossing algorithm (the detection worker, then `crossing_rule` with the current `config`) runs on every segment, reading the local video. An hour of video takes roughly 10 to 30 minutes, mostly the download. The result is cached in `_output/crossing_review/segments/` together with the rule version, so it is redone automatically when the rule changes.
 2. **Watch the whole segment.** The video plays from the local copy. Every crossing the algorithm counted is drawn as a **yellow** box while it happens. No other boxes are drawn, so the review is not steered by what YOLO saw.
