@@ -12,10 +12,12 @@ import polars as pl
 import requests
 
 from custom_logger import CustomLogger
+from utils.segmentation.camera_shift import CAMERA_SHIFT_HZ, FRAME_HEIGHT, FRAME_WIDTH, background_shift
 from utils.segmentation.frames import (
     FrameClock,
     FrameWindow,
     RemoteCredentials,
+    WindowReadError,
     extract_window_frames,
     probe_video_fps,
     resolve_video_url,
@@ -122,6 +124,10 @@ class SegmentationPipeline:
             "videos_fps_unprobed": 0,
             "videos_fps_fractional": 0,
             "windows_split": 0,
+            "frames_camera_shift": 0,
+            "camera_shift_unreadable": 0,
+            "rejected_turning_camera": 0,
+            "rejected_unverifiable": 0,
         }
 
     # ------------------------------------------------------------------
@@ -241,6 +247,36 @@ class SegmentationPipeline:
         )
         self._count("segments_segmented", 1)
         return surface_timeline(samples)
+
+    def camera_shift(self, request: SegmentRequest, first_frame: float, last_frame: float) -> Optional[float]:
+        """Return how far the background slides sideways between two detection frames.
+
+        In image widths (see utils/segmentation/camera_shift.py), or None when
+        the video cannot be read.
+        """
+        source = request.video_path or self._video_source(request.video_id)
+        if source is None:
+            return None
+        clock = self._clock(request, source)
+        if clock is None:
+            return None
+        start, end = clock.seconds(first_frame), clock.seconds(last_frame)
+        if end <= start:
+            return 0.0
+        try:
+            frames = extract_window_frames(
+                source,
+                FrameWindow(start_seconds=start, duration_seconds=end - start),
+                CAMERA_SHIFT_HZ,
+                FRAME_WIDTH,
+                FRAME_HEIGHT,
+                credentials=self.credentials,
+            )
+        except WindowReadError as error:
+            logger.warning(f"Could not read the camera motion of {request.stem}: {error}")
+            return None
+        self._count("frames_camera_shift", int(len(frames)))
+        return background_shift(frames)
 
     @staticmethod
     def _timelines_from_index(

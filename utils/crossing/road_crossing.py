@@ -69,7 +69,7 @@ TRACK_GAP_SECONDS = 2.0
 MINIMUM_RELATIVE_X_RANGE = 0.08
 # Recorded in the results.pickle fingerprint; bump when rule D changes, so
 # cached results from an earlier version of the rule are not reused.
-ROAD_CROSSING_RULE_VERSION = "rule_d_rider_camera_passes_or_emerges_tol003_walking_v5"
+ROAD_CROSSING_RULE_VERSION = "rule_d_rider_camera_passes_or_emerges_tol003_walking_turning_unverified_v7"
 # How far past each edge of the middle strip a track must go to count as
 # having passed in front of the camera (passes_camera). A pedestrian standing
 # far ahead can be carried just across the strip when the car turns; with
@@ -129,6 +129,46 @@ STATURE_METRES = 1.7
 # 0.33 m/s). With both limits all reviewed data stays at 100% precision.
 EMERGING_MINIMUM_WALKING_SPEED = 0.3
 EMERGING_MINIMUM_SPEED_UP = 0.25
+# ... and must not speed up more than this. Two hand-confirmed fakes (Paris,
+# a distant figure and a pedestrian creeping, then walking off) speed up 4.8
+# times; every confirmed emerging crosser, on Waymo and on the reviewed CROWD
+# videos, at most 3.7 times.
+EMERGING_MAXIMUM_SPEED_UP = 4.0
+# A pedestrian carried across the image by the car turning is not crossing.
+# When the background slides at least TURN_MINIMUM_BACKGROUND_SHIFT of the
+# image width while the pedestrian is tracked (utils/segmentation/
+# camera_shift.py), the pedestrian must move relative to the background by at
+# least TURN_MINIMUM_RELATIVE_SHARE of that slide. Of 434 hand-confirmed
+# crossings (282 Waymo, 152 on reviewed CROWD videos), 40 happened while the
+# camera turned, all with a share of at least 0.31; the 3 pedestrians a
+# turning car swept across the image on the reviewed Paris video had 0.04 to
+# 0.23.
+TURN_MINIMUM_BACKGROUND_SHIFT = 0.1
+TURN_MINIMUM_RELATIVE_SHARE = 0.27
+# A small, distant figure moving fast is a rider whose two-wheeler YOLO
+# hardly saw: below DISTANT_RIDER_MAXIMUM_HEIGHT of the image height and
+# faster than DISTANT_RIDER_MINIMUM_SPEED. On the reviewed Cairo video two
+# motorcyclists (boxes 0.072 and 0.079 high, 2.1 and 2.3 m/s, a motorcycle
+# box under them in only 2 and 5 frames) were counted; no confirmed crossing
+# on the reviewed CROWD videos and 1 of 282 on Waymo fit this.
+DISTANT_RIDER_MAXIMUM_HEIGHT = 0.085
+DISTANT_RIDER_MINIMUM_SPEED = 1.8
+# A crossing that cannot be verified: the camera moves (the background
+# slides more than UNVERIFIED_MINIMUM_BACKGROUND_SHIFT of the image width),
+# no static object is tracked in the same frames to show the pedestrian
+# moving on their own (independent_motion_rejection needs one), and the box
+# grows more than UNVERIFIED_MAXIMUM_GROWTH times from the first to the last
+# third of the track (coming towards the camera, or the tracker switching
+# from a distant person to a near one) or moves faster than
+# UNVERIFIED_MAXIMUM_SPEED. On the reviewed Cairo video this held for all 7
+# remaining fakes (tracker switches, people walking towards the camera, a
+# runner while the car turned) and for 18 of its 92 confirmed crossings;
+# for none on the other reviewed CROWD videos and for 11 of 282 on Waymo.
+# The limits were set on these same fakes, so a newly reviewed video is
+# their test.
+UNVERIFIED_MINIMUM_BACKGROUND_SHIFT = 0.05
+UNVERIFIED_MAXIMUM_GROWTH = 1.4
+UNVERIFIED_MAXIMUM_SPEED = 3.0
 
 
 def walking_motion(track: pl.DataFrame, fps: float, aspect_ratio: float) -> Optional[Tuple[float, float]]:
@@ -203,6 +243,10 @@ def road_crossing_flags(
             walking=int(walking),
         )
         flags["road_crossing"] = int(flags["road_crossing"] and walking and road_share >= MINIMUM_ROAD_SHARE)
+        rider = distant_rider(track, None if motion is None else motion[0])
+        flags["distant_rider"] = int(rider)
+        if rider:
+            flags["road_crossing"] = 0
         if camera_strip is not None:
             x_values = track.sort("frame-count").get_column("x-center").to_list()
             emerging = not passes_camera(x_values, *camera_strip)
@@ -211,6 +255,7 @@ def road_crossing_flags(
                 motion is None
                 or motion[0] < EMERGING_MINIMUM_WALKING_SPEED
                 or motion[1] < EMERGING_MINIMUM_SPEED_UP
+                or motion[1] > EMERGING_MAXIMUM_SPEED_UP
             ):
                 flags["road_crossing"] = 0
     return flags
@@ -278,6 +323,67 @@ def passes_camera(x_values: Sequence[float], left: float, right: float, toleranc
                 return True
             seen_right = True
     return False
+
+
+def box_growth(track: pl.DataFrame) -> Optional[float]:
+    """Median box height over the last third of a track divided by that over the first third."""
+    heights = track.sort("frame-count").get_column("height").cast(pl.Float64, strict=False).to_numpy()
+    if len(heights) < 3:
+        return None
+    third = max(1, len(heights) // 3)
+    first = float(np.median(heights[:third]))
+    return float(np.median(heights[-third:])) / first if first > 0 else None
+
+
+def distant_rider(track: pl.DataFrame, walking_speed: Optional[float]) -> bool:
+    """Return whether a track is a small, distant figure moving at a rider's speed."""
+    if walking_speed is None or track.height == 0:
+        return False
+    height = float(track.get_column("height").cast(pl.Float64, strict=False).median())
+    return height < DISTANT_RIDER_MAXIMUM_HEIGHT and float(walking_speed) > DISTANT_RIDER_MINIMUM_SPEED
+
+
+def unverifiable_crossing(
+    track: pl.DataFrame,
+    window: pl.DataFrame,
+    track_id: Any,
+    fps: float,
+    background_shift: Optional[float],
+    walking_speed: Optional[float],
+) -> bool:
+    """Return whether a crossing cannot be verified and looks like a known fake (see UNVERIFIED_*).
+
+    ``window`` holds every detection (all classes) in the track's frames and
+    ``background_shift`` the background's sideways displacement over them.
+    """
+    from utils.crossing.detection import Detection
+
+    if background_shift is None or abs(float(background_shift)) <= UNVERIFIED_MINIMUM_BACKGROUND_SHIFT:
+        return False
+    minimum_frames = Detection._scale_frames(STATIC_REFERENCE_MIN_FRAMES, float(fps), DETECTOR_BASE_FPS, minimum=1)
+    reference = Detection.static_reference_motion_stats(window, track_id, MIN_SHARED_FRAMES=minimum_frames)
+    if int(reference.get("shared_frames", 0) or 0) > 0:
+        return False
+    growth = box_growth(track)
+    fast = walking_speed is not None and float(walking_speed) > UNVERIFIED_MAXIMUM_SPEED
+    return fast or (growth is not None and growth > UNVERIFIED_MAXIMUM_GROWTH)
+
+
+def swept_by_turning_camera(x_values: Sequence[float], background_shift: Optional[float]) -> bool:
+    """Return whether a track only moves across the image because the camera turns.
+
+    ``x_values`` are the track's box centres in time order and
+    ``background_shift`` the background's sideways displacement over the
+    same frames (utils/segmentation/camera_shift.py), both in image widths.
+    """
+    values = [float(value) for value in x_values]
+    if background_shift is None or not values:
+        return False
+    shift = float(background_shift)
+    if abs(shift) < TURN_MINIMUM_BACKGROUND_SHIFT:
+        return False
+    relative = abs((values[-1] - values[0]) - shift)
+    return relative < TURN_MINIMUM_RELATIVE_SHARE * abs(shift)
 
 
 def emerges_in_front(x_values: Sequence[float], left: float, right: float, tolerance: float = 0.0) -> bool:

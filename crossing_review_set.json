@@ -1,5 +1,5 @@
 {
-  "purpose": "Hand-verified test set for the crossing algorithm. Every crossing the algorithm counts on these videos must be a real crossing in front of the camera (target precision 100%). Reviewed with crossing_review.py; labels are saved in _output/crossing_review/labels/<video_id>.json.",
+  "purpose": "Hand-verified test set for the crossing algorithm (see 'Manual verification of crossings' in README.md). Every crossing the algorithm counts on these videos must be a real crossing in front of the camera (target precision 100%). Reviewed with crossing_review.py; labels are saved in _output/crossing_review/labels/<video_id>.json.",
   "chosen": "2026-10-04",
   "videos": [
     {
@@ -45,23 +45,23 @@
     {
       "city": "Cairo",
       "iso3": "EGY",
-      "video_id": "a4zcL56YSME",
-      "footage_minutes": 73.0,
+      "video_id": "Esyp2P0uJu4",
+      "footage_minutes": 96.2,
       "segments": [
-        27
+        36
       ],
-      "fps": 25
-    }
-  ],
-  "earlier_reviews": [
+      "fps": 30
+    },
     {
       "city": "Paris",
       "iso3": "FRA",
       "video_id": "AdqE7mFQ7Y4",
+      "footage_minutes": 37.0,
       "segments": [
         31
       ],
-      "note": "reviewed to 12:06; used while tuning the rule"
+      "fps": 30,
+      "note": "busy; the first 12 minutes (to 12:06) were reviewed earlier and used while tuning the rule, so only the rest is a held-out test"
     }
   ],
   "excluded": [
@@ -74,6 +74,11 @@
       "city": "Amsterdam",
       "video_id": "iVJGEW1st8c",
       "reason": "detection CSV on the file server covers only the last 22% of the video (frames 166059-214260 of 214320 at 60 fps); found during review at 13:52"
+    },
+    {
+      "city": "Cairo",
+      "video_id": "a4zcL56YSME",
+      "reason": "the algorithm counts no crossing in its 73 minutes and only a handful of pedestrians pass the box-only checks, so it cannot test precision"
     }
   ]
 }

@@ -447,7 +447,12 @@ def select_road_crossings(
     segmentation cannot run this raises rather than silently counting
     crossings another way.
     """
-    from utils.crossing.road_crossing import PASS_TOLERANCE, road_crossing_flags
+    from utils.crossing.road_crossing import (
+        PASS_TOLERANCE,
+        road_crossing_flags,
+        swept_by_turning_camera,
+        unverifiable_crossing,
+    )
 
     pipeline = _segmentation_pipeline(df_mapping, crossing_parameters)
     if pipeline is None:
@@ -496,18 +501,43 @@ def select_road_crossings(
             return "diagnostic", "no_surface_timeline"
         intervals = road_intervals_for_tracks(timelines)
         rates = {str(key): value for key, value in (payload.get("size_rates") or {}).items()}
-        return "selected", [
-            track_id
-            for track_id in payload["ids"]
-            if str(track_id) in tracks
-            and road_crossing_flags(
-                tracks[str(track_id)], intervals.get(str(track_id)), rates.get(str(track_id)), minimum_x_range,
+        request = _segment_request(task, stem, effective_fps, first_source_frame, tracks)
+        selected_ids = []
+        for track_id in payload["ids"]:
+            track = tracks.get(str(track_id))
+            if track is None:
+                continue
+            flags = road_crossing_flags(
+                track, intervals.get(str(track_id)), rates.get(str(track_id)), minimum_x_range,
                 surfaces=[sample.surface for sample in timelines.get(str(track_id)) or []],
                 fps=float(effective_fps),
                 aspect_ratio=aspect_ratio,
                 camera_strip=camera_strip,
-            )["road_crossing"]
-        ]
+            )
+            if not flags["road_crossing"]:
+                continue
+            # Only tracks that pass every other check are measured, since this
+            # reads the video once more. A window that cannot be read is not
+            # counted rather than counted unchecked.
+            ordered = track.sort("frame-count")
+            frames = ordered.get_column("frame-count")
+            try:
+                shift = pipeline.camera_shift(request, float(frames.min()), float(frames.max()))
+            except Exception as error:
+                _raise_if_gpu_failure(error)
+                shift = None
+            if shift is None:
+                pipeline._count("camera_shift_unreadable", 1)
+                continue
+            if swept_by_turning_camera(ordered.get_column("x-center").to_list(), shift):
+                pipeline._count("rejected_turning_camera", 1)
+                continue
+            window = detections.filter(pl.col("frame-count").is_between(frames.min(), frames.max()))
+            if unverifiable_crossing(track, window, track_id, float(effective_fps), shift, flags.get("walking_speed_mps")):
+                pipeline._count("rejected_unverifiable", 1)
+                continue
+            selected_ids.append(track_id)
+        return "selected", selected_ids
 
     selected: Dict[str, List[Any]] = {}
     diagnostics: Counter = Counter()

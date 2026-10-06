@@ -194,10 +194,14 @@ def _download_video(video_id: str, progress) -> Path:
 
     The file server limits each connection rather than the total, so the file
     is fetched as DOWNLOAD_PARTS-sized byte ranges over DOWNLOAD_CONNECTIONS
-    connections at once, each written at its own offset.
+    connections at once, each written at its own offset. The parts already
+    written are listed beside the partial file, so a download that stops
+    (the server going away, or the tool being restarted) resumes rather than
+    starting over, and a part that keeps failing waits for the server to
+    come back (wait_through_outage) instead of abandoning the download.
     """
     from concurrent.futures import ThreadPoolExecutor
-    from utils.segmentation.frames import resolve_video_url
+    from utils.segmentation.frames import resolve_video_url, wait_through_outage
 
     target = video_path(video_id)
     if target.is_file():
@@ -215,11 +219,12 @@ def _download_video(video_id: str, progress) -> Path:
     VIDEO_DIR.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(".mp4.part")
     done = [0]
+    resumed = [0]
     lock = threading.Lock()
     started = time.time()
 
     def report() -> None:
-        rate = done[0] / max(time.time() - started, 1e-6) / 1e6
+        rate = (done[0] - resumed[0]) / max(time.time() - started, 1e-6) / 1e6
         share = f"{100 * done[0] / total:.0f}% of {total / 1e6:.0f} MB" if total else f"{done[0] / 1e6:.0f} MB"
         progress(f"Downloading the video: {share} at {rate:.1f} MB/s.", done[0] / total if total else None)
 
@@ -234,12 +239,35 @@ def _download_video(video_id: str, progress) -> Path:
         os.replace(temporary, target)
         return target
 
-    with temporary.open("wb") as handle:
-        handle.truncate(total)
+    record = target.with_suffix(".mp4.parts.json")
+    finished: set = set()
+    if temporary.is_file() and temporary.stat().st_size == total and record.is_file():
+        try:
+            saved = json.loads(record.read_text(encoding="utf-8"))
+            if saved.get("total") == total and saved.get("part_bytes") == DOWNLOAD_PART_BYTES:
+                finished = {int(first) for first in saved.get("finished", [])}
+        except (OSError, ValueError):
+            finished = set()
+    else:
+        with temporary.open("wb") as handle:
+            handle.truncate(total)
+    done[0] = sum(min(first + DOWNLOAD_PART_BYTES, total) - first for first in finished)
+    resumed[0] = done[0]
+
+    def mark_finished(first: int) -> None:
+        with lock:
+            finished.add(first)
+            part = record.with_suffix(".tmp")
+            part.write_text(json.dumps({"total": total, "part_bytes": DOWNLOAD_PART_BYTES, "finished": sorted(finished)}), encoding="utf-8")
+            os.replace(part, record)
 
     def fetch(first: int) -> None:
+        if first in finished:
+            return
         last = min(first + DOWNLOAD_PART_BYTES, total) - 1
-        for attempt in range(5):
+        failed_since = time.time()
+        attempt = 0
+        while True:
             written = 0
             try:
                 own = _session(credentials)
@@ -255,17 +283,27 @@ def _download_video(video_id: str, progress) -> Path:
                                 done[0] += len(chunk)
                                 report()
                 if written == last - first + 1:
+                    mark_finished(first)
                     return
-            except requests.RequestException:
+            except (requests.RequestException, OSError):
                 pass
             with lock:
                 done[0] -= written
-            time.sleep(5 * (attempt + 1))
-        raise RuntimeError(f"Could not download bytes {first}-{last} of {video_id}.")
+            attempt += 1
+            if attempt < 5:
+                time.sleep(5 * attempt)
+                continue
+            # Five failures in a row: wait for the server to answer again,
+            # then start a new round of attempts; give up only if it stays away.
+            if not wait_through_outage(url, failed_since):
+                raise RuntimeError(f"Could not download bytes {first}-{last} of {video_id}.")
+            attempt = 0
+            failed_since = time.time()
 
     with ThreadPoolExecutor(DOWNLOAD_CONNECTIONS) as executor:
         list(executor.map(fetch, range(0, total, DOWNLOAD_PART_BYTES)))
     os.replace(temporary, target)
+    record.unlink(missing_ok=True)
     return target
 
 
@@ -349,8 +387,10 @@ class Processor:
                 self._process(video_id)
                 self.status[video_id] = {"status": "ready"}
             except Exception as error:
-                logger.error(f"{video_id}: {error}\n{traceback.format_exc()}")
                 self.status[video_id] = {"status": "error", "message": str(error)}
+                # Passed as arguments: the logger formats its message with
+                # str.format, and tracebacks contain braces.
+                logger.error("{}: {}\n{}", video_id, error, traceback.format_exc())
 
     def _progress(self, video_id: str, message: str, fraction: Optional[float] = None) -> None:
         previous = self.status.get(video_id, {}).get("message")
