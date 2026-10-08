@@ -34,7 +34,7 @@ from utils.analytics.io import IO
 from utils.analytics.mapping_enrichment import Mapping_Enrich
 from utils.analytics.metrics_cache import MetricsCache
 from utils.analytics.structure import analyse_structure
-from utils.analytics import speed_recompute
+from utils.analytics import remote_detections, speed_recompute
 from utils.segmentation import crossing_pass as segmentation_pass
 from utils.segmentation.store import INDEX_SCHEMA as SEGMENTATION_INDEX_SCHEMA
 from utils.analytics.parquet_store import (
@@ -1826,6 +1826,8 @@ CACHE_CONFIG_KEYS: tuple[str, ...] = (
     "vehicles_analyse",
     "crossing_rule",
     "target_crossings_per_city",
+    # Which segments count as available depends on it, so it changes the draw.
+    "fetch_detections_on_demand",
     # Segmentation settings change the derived crossing metrics, so a cached
     # run must not silently reuse values computed under different ones.
     "use_segmentation",
@@ -2602,13 +2604,16 @@ def _process_until_target(
     target: int,
     process,
     crossings_found,
+    prepare=None,
 ) -> list:
     """Process each city's segments in its random draw order until it has ``target`` crossings.
 
     Works in rounds of one segment per unfinished city, so a city stops within
     one segment of the target (whole segments are processed, so it can end a
     little above it). A city that runs out of footage keeps what it has. Returns
-    the tasks processed, in processing order.
+    the tasks processed, in processing order. ``prepare`` (optional) gets each
+    round's tasks first and returns the ones that can be processed, e.g. after
+    fetching their detection files.
     """
     queues: Dict[tuple, list] = {}
     for task in tasks:
@@ -2623,6 +2628,10 @@ def _process_until_target(
         batch = [queue.pop(0)[1] for city, queue in queues.items() if queue and found[city] < target]
         if not batch:
             break
+        if prepare is not None:
+            batch = prepare(batch)
+            if not batch:
+                continue
         round_number += 1
         logger.info(
             f"target_crossings_per_city={target}, round {round_number}: {len(batch)} segment(s) "
@@ -3488,6 +3497,11 @@ if __name__ == "__main__":
             df_mapping,
             city_limit,
         )
+        if remote_detections.enabled():
+            # Index the server's detection files for the chosen cities, so the
+            # footage selection below sees every segment that has detections.
+            remote_detections.build_index(remote_detections.mapping_segments(df_mapping))
+            MetaData.clear_video_index_cache()
         log_rollups(df_mapping)
 
         # Make a dict for all columns
@@ -3661,6 +3675,34 @@ if __name__ == "__main__":
                     }
                 )
 
+        if remote_detections.enabled():
+            # Segments whose detection file is only on the server: their task
+            # points at where the Parquet file will be, and it is fetched just
+            # before the segment is processed.
+            local_stems = {task["filename_no_ext"] for task in csv_tasks}
+            for (video_id, start_index), stem in sorted(remote_detections.indexed_segments().items()):
+                if stem in local_stems:
+                    continue
+                if analytics_IO.filter_detection_file(file=f"{stem}.parquet", df_mapping=df_mapping) is None:
+                    continue
+                segment_meta = segment_lookup.get((video_id, start_index))
+                if segment_meta is None or id_to_place.get(int(segment_meta[0])) is None:
+                    continue
+                csv_tasks.append(
+                    {
+                        "file_path": str(remote_detections.parquet_path(stem)),
+                        "file_name": f"{stem}.parquet",
+                        "filename_no_ext": stem,
+                        "video_id": video_id,
+                        "start_index": int(start_index),
+                        "fps": float(stem.rsplit("_", 1)[1]),
+                        "video_locality_id": int(segment_meta[0]),
+                        "time_video": float(segment_meta[1]),
+                        "is_bbox_stream": True,
+                        "remote": True,
+                    }
+                )
+
         worker_env = os.environ.get("CROWD_CSV_WORKERS", "").strip()
         if worker_env:
             try:
@@ -3814,6 +3856,8 @@ if __name__ == "__main__":
             )
         with executor_context as executor:
             if target_crossings is None:
+                if remote_detections.enabled():
+                    csv_tasks = remote_detections.fetch_tasks(csv_tasks)
                 run_detection(csv_tasks, executor)
                 select_crossings(csv_tasks)
             else:
@@ -3823,6 +3867,7 @@ if __name__ == "__main__":
                     int(target_crossings),
                     lambda tasks: (run_detection(tasks, executor), select_crossings(tasks)),
                     crossings_found,
+                    prepare=remote_detections.fetch_tasks if remote_detections.enabled() else None,
                 )
 
         if crossing_rule == "road_crossing":

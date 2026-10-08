@@ -140,10 +140,12 @@ Configuration of the project is defined in `config`. Every value is read from `c
 - **`max_speed_limit`**: Maximum crossing speed for a crossing to be included.
 - **`countries_analyse`**: ISO3 codes of the countries to analyse; an empty list analyses all countries.
 - **`cities_analyse`**: Cities to analyse; an empty list analyses all cities. City names repeat across countries and states, so each entry is `"City"`, `"City, ISO3"` or `"City, State, ISO3"`, for example `["Aberdeen, GBR", "Aberdeen, WA, USA", "Tokyo"]`. State and ISO3 are written as in `mapping.csv`, and names are matched case-insensitively against `locality` and `locality_aka`. A bare name keeps every city with that name and logs which ones matched. An entry that matches no city in `mapping.csv` stops the run. When `countries_analyse` is also set, a city must satisfy both lists, and `n_cities` then chooses among the cities that remain.
-- **`n_cities`**: Number of cities to analyse, chosen by total footage: a positive value keeps the cities with the most footage, a negative value those with the least, and `null` keeps all cities.
+- **`n_cities`**: Number of cities to analyse, chosen by total footage: a positive value keeps the cities with the most footage, a negative value those with the least, and `null` keeps all cities. Total footage counts every vehicle type and also footage without detection files, so a city can be chosen and still have little footage that is actually analysed.
 - **`max_footage_hours_per_city`**: Caps the footage analysed per city, in hours; `null` analyses everything. Segments are drawn in a random order per city rather than in mapping order, so the budget is spread across that city's videos. Segments with no detection file in the Parquet store, or with a vehicle type outside `vehicles_analyse`, are skipped and the next segment is drawn in their place, so the whole budget goes to footage that is actually analysed. The last segment drawn is trimmed to fit the cap.
 - **`footage_sampling_seed`**: Seed for that random draw (default `42`). The same seed always selects the same segments, so runs are reproducible; change it to analyse a different sample.
 - **`target_crossings_per_city`**: Number of pedestrian crossings to collect per city, or `null` to switch this off (the default). When set, each city's footage is processed in the same seeded random order as `max_footage_hours_per_city`, one segment per city per round, and a city stops receiving footage once it has at least this many crossings (as counted by `crossing_rule`). Whole segments are processed, so a city can end slightly above the target; a city that runs out of footage keeps what it found. When `max_footage_hours_per_city` is also set, whichever limit is reached first applies. Footage time, object counts and every other statistic are then taken over exactly the footage processed. With `road_crossing`, the limit on unreadable segments applies to the whole run rather than to each round.
+- **`fetch_detections_on_demand`**: When `true`, detection files that are not in the local Parquet store are fetched from the file server only when the analysis needs them, instead of having to be copied first. The analysis first looks up which detection file the server has for each segment of the chosen cities (cached in `remote_detection_index.json` beside the Parquet store, so only new segments are looked up), lets segment selection use that, and downloads each segment's CSV just before processing it, converting it to Parquet and deleting the CSV. With `target_crossings_per_city` this downloads only the footage the cities actually need. Failed requests are retried, and an outage of the server is waited out. Default `false`.
+- **`detection_csv_url_path`**: Path on the file server, after `ftp_base_url`, where the detection CSVs are served (used by `fetch_detections_on_demand`).
 - **`processing_fps`**: Frame rate the detections are resampled to before analysis; `null` keeps each video's own frame rate.
 - **`vehicles_analyse`**: Vehicle types (the codes in the mapping's `vehicle_type` column) to analyse; an empty list analyses footage from all vehicle types.
 - **`min_confidence`**: Minimum YOLO detection confidence for a detection to be used.
@@ -356,17 +358,204 @@ About 70% of the counted crossings get a speed; the speed model's reliability ga
 The remaining error comes mainly from the bounding boxes themselves (jitter, partial occlusion, and box height as a stand-in for distance). Further gains would likely need better boxes or a direct distance estimate, such as a monocular depth model, rather than parameter tuning.
 
 
-## Example results
-These figures come from a run with `max_footage_hours_per_city` set to 1, `crossing_rule` set to `road_crossing` and `segmentation_is_primary` enabled: 200 cities in 84 countries, one hour of footage per city. That run counted 8,915 crossings; 2,514 of them received a reliable road-restricted speed and 482 an initiation time (most pedestrians step onto the road without stopping, or are already on it when first seen). Every run writes its figures to `figures/` as interactive HTML and, when `save_images` is enabled, as PNG and EPS.
+## Results
+The figures below come from a run over the **100 cities with the most footage**, each analysed until **100 crossings** were counted (`n_cities: 100`, `target_crossings_per_city: 100`, `max_footage_hours_per_city: 100`, `vehicles_analyse: [0]`, `crossing_rule: road_crossing`, `segmentation_is_primary: true`). Each city's footage was taken in its fixed random order (`footage_sampling_seed: 42`), with the detection files fetched from the file server as needed (`fetch_detections_on_demand`). The run used 1,299 hours of footage (a median of 9.5 hours per city) and counted 11,101 crossings with the rule that is 100% precise on every hand-reviewed video (see [Manual verification of crossings](#manual-verification-of-crossings)). 95 cities reached 100 crossings. Ninh Binh (99) and Anchorage (83) ran out of footage or reached the 100-hour cap, while Oldenburg (14), Townsville (9) and Seattle (0) have little or no car footage with detections on the file server: they rank among the top 100 by total footage, which also counts other vehicle types and footage that was never run through YOLO. Every run writes its figures to `figures/` as interactive HTML and, with `save_images` enabled, as PNG and EPS; click any HTML file for hover details.
 
-![Distribution of crossing speed](docs/images/crossing_speed_histogram.png)
-*Crossing speed per pedestrian (median 1.30 m/s).*
+### Crossing speed and initiation time
 
-![Distribution of crossing initiation time](docs/images/initiation_time_histogram.png)
-*Crossing initiation time per pedestrian (median 2.0 s). Waits shorter than three stationary checks (about 1 s, see `check_per_sec_time`) are not recorded.*
+![Distribution of crossing speed](figures/hist_speed.png)
+*Crossing speed of every counted crossing with a reliable speed, in m/s (median 1.34 m/s, mean 1.34 m/s). The violin above the histogram shows the same distribution. Speeds are the road-restricted estimate from the Waymo-calibrated speed model; on Waymo they are off by 0.12 m/s on average (see [Waymo calibration](#waymo-calibration-current-results-and-what-was-tried)).*
 
-![City average crossing speed against initiation time](docs/images/speed_vs_initiation_time.png)
-*City averages of crossing speed against initiation time, coloured by continent. Cities with only a few measured waits can show extreme averages (Chișinău), so read single cities with care.*
+![Distribution of crossing speed within the speed limits](figures/hist_speed_filtered.png)
+*The same distribution restricted to `min_speed_limit` to `max_speed_limit` (0.3 to 3.5 m/s), the range used for every average: median 1.35 m/s, mean 1.34 m/s. Almost no crossing falls outside it.*
+
+![Distribution of crossing initiation time](figures/hist_time.png)
+*Crossing initiation time: how long a pedestrian waits at the kerb before stepping onto the road (median 1.67 s, mean 2.29 s). It is only measured for pedestrians seen standing at the kerb before they cross; most step onto the road without stopping, or are already on it when first seen.*
+
+![Distribution of crossing initiation time within the limits](figures/hist_time_filtered.png)
+*The same distribution restricted to `min_waiting_time` to `max_waiting_time`, the range used for every average.*
+
+![Initiation time and its measurement floor](figures/structure_time_floor.png)
+*Initiation times of all 3,895 analysed tracks. The estimator cannot measure a wait shorter than its floor of 1.0 s (three stationary checks of `check_per_sec_time`; 9.2% of tracks sit at it), and values come in steps of one third of a second. Short waits are therefore rounded up, which is why the distribution starts with a peak.*
+
+
+### Cities and continents
+
+![Countries covered](figures/world_map.png)
+*Countries with at least one analysed city (orange).*
+
+![Analysed cities](figures/mapbox_map.png)
+*The analysed cities, coloured by continent. The companion map `mapbox_map_time` (city footage on a map) needs a map-tile API key to render its background, so it is not shown here.*
+
+![Distributions per continent](figures/structure_continent_distributions.png)
+*City averages per continent: crossing speed (left), initiation time (middle) and the share of crossings made where there are no traffic signals (right), each with a Kruskal-Wallis test across continents. Speeds differ between continents (H = 9.7, p = 0.02), initiation times do not (p = 0.21), and the share of crossings without traffic signals differs strongly (p < 0.001), being highest in Asia and Africa. Africa and South America have only a few cities among the top 100, so their boxes are uncertain.*
+
+![Day against night](figures/structure_day_night.png)
+*Day against night in the same cities: mean crossing speed (left, for cities with at least 1 and at least 10 tracks in both conditions) and mean initiation time (right). None of the differences is significant (paired tests, p = 0.71 to 0.90); most footage is from daytime, so night-time averages rest on fewer crossings.*
+
+![Crossings with traffic equipment](figures/crossings_with_traffic_equipment_avg.png)
+*Crossings per city made at traffic signals, normalised by footage, sorted from most to fewest (Hong Kong and London highest), with daytime (red) and night-time (blue) stacked.*
+
+![Crossings without traffic equipment](figures/crossings_without_traffic_equipment_avg.png)
+*The same for crossings made away from traffic signals.*
+
+![Crossings with against without traffic lights](figures/scatter_with_trf_light_norm-without_trf_light_norm.png)
+*Per city, crossings with traffic lights against crossings without them, both normalised by footage, coloured by continent. Cities far up the vertical axis, such as Sylhet and Samarkand, cross mostly away from signals.*
+
+![Footage against pedestrians detected](figures/scatter_total_time-person.png)
+*Per city, the footage analysed (seconds) against the number of pedestrians detected in it. Cities on the far right needed long stretches of footage to reach 100 crossings (Sacramento, Anchorage).*
+
+
+<details>
+<summary><b>Crossing speed per city (bar charts)</b></summary>
+
+
+![speed crossing avg](figures/speed_crossing_avg.png)
+*Mean crossing speed per city, day and night combined, sorted from fastest to slowest and coloured by continent.*
+
+![speed crossing avg day](figures/speed_crossing_avg_day.png)
+*The same for daytime crossings.*
+
+![speed crossing avg night](figures/speed_crossing_avg_night.png)
+*The same for night-time crossings; fewer cities have enough night footage.*
+
+![speed crossing alphabetical](figures/speed_crossing_alphabetical.png)
+*Mean crossing speed per city, day and night combined, in alphabetical order, to look up a city.*
+
+![speed crossing alphabetical day](figures/speed_crossing_alphabetical_day.png)
+*The same for daytime crossings.*
+
+![speed crossing alphabetical night](figures/speed_crossing_alphabetical_night.png)
+*The same for night-time crossings.*
+
+
+</details>
+
+<details>
+<summary><b>Crossing initiation time per city (bar charts)</b></summary>
+
+
+![time crossing avg](figures/time_crossing_avg.png)
+*Mean crossing initiation time per city, day and night combined, sorted from longest to shortest wait.*
+
+![time crossing avg day](figures/time_crossing_avg_day.png)
+*The same for daytime crossings.*
+
+![time crossing avg night](figures/time_crossing_avg_night.png)
+*The same for night-time crossings.*
+
+![time crossing alphabetical](figures/time_crossing_alphabetical.png)
+*Mean crossing initiation time per city in alphabetical order.*
+
+![time crossing alphabetical day](figures/time_crossing_alphabetical_day.png)
+*The same for daytime crossings.*
+
+![time crossing alphabetical night](figures/time_crossing_alphabetical_night.png)
+*The same for night-time crossings.*
+
+
+</details>
+
+### What explains the differences between cities
+
+![Correlations with city indicators](figures/structure_gradient_correlations.png)
+*Spearman correlation of each city's mean crossing speed (left) and initiation time (right) with city indicators. Only average height (rho = 0.29, p < 0.01) and median age (p < 0.05) relate to speed; nothing relates significantly to initiation time. The indicators are correlated with each other, so these are pointers rather than separate effects.*
+
+![Principal components of the city averages](figures/structure_pca_cloud.png)
+*Cities on the first two principal components of speed, initiation time, crossings per hour and share of unsignalised crossings, coloured by continent, with each variable's direction as an arrow. The cities form one continuum rather than distinct groups (Hopkins statistic 0.47, close to random; best silhouette 0.27).*
+
+![Cluster diagnostics](figures/structure_cluster_diagnostics.png)
+*Silhouette score and gap statistic for 2 to 6 clusters. Both stay low, confirming that the cities do not split into distinct types.*
+
+![Reliability of city averages](figures/structure_reliability.png)
+*Split-half reliability of the city averages against the minimum number of analysed tracks per city. City mean speeds are fairly reliable (about 0.63, rising to 0.76 with 50 tracks per city), city mean initiation times much less so (0.23 to 0.52): with 100 crossings per city, of which only some have a measurable wait, waiting times are noisy per city.*
+
+
+<details>
+<summary><b>Speed and initiation time against city indicators (scatter plots)</b></summary>
+
+
+![Speed against mobile phone use](figures/scatter_speed_crossing_day_night_locality_avg-cellphone_normalised.png)
+*City mean crossing speed against mobile phone use, coloured by continent; outlying cities are labelled.*
+
+![Initiation time against mobile phone use](figures/scatter_time_crossing_day_night_locality_avg-cellphone_normalised.png)
+*City mean initiation time against mobile phone use.*
+
+![Speed against the Gini coefficient of income inequality](figures/scatter_speed_crossing_day_night_locality_avg-gini.png)
+*City mean crossing speed against the Gini coefficient of income inequality, coloured by continent; outlying cities are labelled.*
+
+![Initiation time against the Gini coefficient of income inequality](figures/scatter_time_crossing_day_night_locality_avg-gini.png)
+*City mean initiation time against the Gini coefficient of income inequality.*
+
+![Speed against the literacy rate](figures/scatter_speed_crossing_day_night_locality_avg-literacy_rate.png)
+*City mean crossing speed against the literacy rate, coloured by continent; outlying cities are labelled.*
+
+![Initiation time against the literacy rate](figures/scatter_time_crossing_day_night_locality_avg-literacy_rate.png)
+*City mean initiation time against the literacy rate.*
+
+![Speed against the city's population](figures/scatter_speed_crossing_day_night_locality_avg-population_locality.png)
+*City mean crossing speed against the city's population, coloured by continent; outlying cities are labelled.*
+
+![Initiation time against the city's population](figures/scatter_time_crossing_day_night_locality_avg-population_locality.png)
+*City mean initiation time against the city's population.*
+
+![Speed against the traffic index](figures/scatter_speed_crossing_day_night_locality_avg-traffic_index.png)
+*City mean crossing speed against the traffic index, coloured by continent; outlying cities are labelled.*
+
+![Initiation time against the traffic index](figures/scatter_time_crossing_day_night_locality_avg-traffic_index.png)
+*City mean initiation time against the traffic index.*
+
+![Speed against traffic mortality per 100,000 people](figures/scatter_speed_crossing_day_night_locality_avg-traffic_mortality.png)
+*City mean crossing speed against traffic mortality per 100,000 people, coloured by continent; outlying cities are labelled.*
+
+![Initiation time against traffic mortality per 100,000 people](figures/scatter_time_crossing_day_night_locality_avg-traffic_mortality.png)
+*City mean initiation time against traffic mortality per 100,000 people.*
+
+![Speed against initiation time](figures/scatter_speed_crossing_day_night_locality_avg-time_crossing_day_night_locality_avg.png)
+*City mean crossing speed against mean initiation time, day and night combined. The two are unrelated: cities that wait longer do not cross faster or slower.*
+
+![Speed against initiation time by day](figures/scatter_speed_crossing_day_locality-time_crossing_day_locality.png)
+*The same for daytime crossings.*
+
+![Speed against initiation time by night](figures/scatter_speed_crossing_night_locality-time_crossing_night_locality.png)
+*The same for night-time crossings.*
+
+
+</details>
+
+<details>
+<summary><b>Correlation matrices</b></summary>
+
+
+![Correlation matrix, all cities](figures/correlation_matrix_heatmap_averaged.png)
+*Spearman correlations between every city variable (crossing counts, detected objects, speed, initiation time and city indicators) over all cities, day and night combined.*
+
+![Correlation matrix, day](figures/correlation_matrix_heatmap_day.png)
+*The same for daytime values.*
+
+![Correlation matrix, night](figures/correlation_matrix_heatmap_night.png)
+*The same for night-time values.*
+
+![Correlation matrix, Asia](figures/correlation_matrix_heatmap_Asia.png)
+*The same over the cities in Asia.*
+
+![Correlation matrix, Europe](figures/correlation_matrix_heatmap_Europe.png)
+*The same over the cities in Europe.*
+
+![Correlation matrix, North America](figures/correlation_matrix_heatmap_North%20America.png)
+*The same over the cities in North America.*
+
+![Correlation matrix, South America](figures/correlation_matrix_heatmap_South%20America.png)
+*The same over the cities in South America. Few cities, so read with care.*
+
+![Correlation matrix, Oceania](figures/correlation_matrix_heatmap_Oceania.png)
+*The same over the cities in Oceania. Few cities, so read with care.*
+
+![Correlation matrix, Africa](figures/correlation_matrix_heatmap_Africa.png)
+*The same over the cities in Africa. With only a few cities in Africa, nearly every correlation is ±1 and carries no information.*
+
+
+</details>
 
 ## Contact
 If you have any questions or suggestions, feel free to reach out to md_shadab_alam@outlook.com or pavlo.bazilinskyy@gmail.com.

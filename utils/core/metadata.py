@@ -200,6 +200,11 @@ class MetaData:
                 except ValueError:
                     continue
 
+        # With fetch_detections_on_demand, a segment whose file the server has
+        # is available too: it is downloaded just before it is processed.
+        from utils.analytics import remote_detections
+
+        available.update(remote_detections.indexed_segments())
         cls._available_segments_cache = available
         return available
 
