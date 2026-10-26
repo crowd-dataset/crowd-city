@@ -7,8 +7,8 @@ tracks either side has segmented, so neither segments them again.
     python sync_surface_store.py pull --remote "$SHARED" --key ~/.ssh/id_mesh
     python sync_surface_store.py push --remote "$SHARED" --key ~/.ssh/id_mesh
 
-with, for the CROWD machines, SHARED=salam@100.80.227.26:/media/salam/crowd-tue-3/pedestrians_in-youtube/data/
-segmentation_jaywalking (lin4080's drive, where crowd-jaywalking also syncs).
+with, for the CROWD machines, SHARED=salam@100.80.227.26:/media/salam/crowd-tue-3/pedestrians_in-youtube/seg
+(lin4080's drive, where crowd-jaywalking also syncs).
 
 ``pull`` adds the shared folder's tracks to the local store (``seg_data`` in config); run it before an
 analysis, not during one, as it writes to the local store. ``push`` adds the local tracks to the shared
