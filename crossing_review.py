@@ -70,7 +70,8 @@ DOWNLOAD_CONNECTIONS = 8
 SERVE_CHUNK_BYTES = 256 * 1024
 VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
 # Bumped when the cached segment files change shape or meaning.
-SEGMENT_CACHE_VERSION = 3
+# 4: windows are timed with CROWD's frame-count starting at 1, one frame earlier.
+SEGMENT_CACHE_VERSION = 4
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +457,7 @@ class Processor:
         import utils.crossing.metrics as metrics
         import utils.segmentation.crossing_pass as crossing_pass
         from utils.core.metadata import MetaData
-        from utils.segmentation.frames import FrameClock, probe_video_fps
+        from utils.segmentation.frames import CROWD_FIRST_FRAME_NUMBER, FrameClock, probe_video_fps
 
         start = int(segment["start"])
         progress("finding the detection file.")
@@ -515,6 +516,7 @@ class Processor:
         clock = FrameClock.for_segment(
             start_seconds=float(start), video_fps=float(video_fps), source_fps=fps,
             detection_fps=float(effective_fps), first_source_frame=float(first_source_frame),
+            first_frame_number=CROWD_FIRST_FRAME_NUMBER,
         )
         bounds = {_normalise_id(k): v for k, v in bounds.items()}
         windows = {

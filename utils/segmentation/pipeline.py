@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -23,7 +23,12 @@ from utils.segmentation.frames import (
     resolve_video_url,
 )
 from utils.segmentation.segformer import SurfaceSegmenter
-from utils.segmentation.store import SegmentationSettings, SurfaceStore
+from utils.segmentation.store import (
+    SegmentationSettings,
+    SurfaceStore,
+    canonical_track_id,
+    track_signature,
+)
 from utils.segmentation.surface import (
     DEFAULT_FOOTPOINT_BAND_FRACTION,
     DEFAULT_FOOTPOINT_WIDTH_FRACTION,
@@ -79,6 +84,9 @@ class SegmentRequest:
     # A local video file to read instead of resolving video_id on the file
     # server, e.g. the exported Waymo camera videos used for calibration.
     video_path: Optional[str] = None
+    # frame-count of the segment's first frame: CROWD_FIRST_FRAME_NUMBER (1)
+    # for CROWD detection files, 0 for the Waymo tracks.
+    first_frame_number: int = 0
 
 
 class SegmentationPipeline:
@@ -117,6 +125,8 @@ class SegmentationPipeline:
             "segments_reused": 0,
             "segments_segmented": 0,
             "segments_failed": 0,
+            "tracks_reused": 0,
+            "tracks_segmented": 0,
             "frames_coarse": 0,
             "frames_refine": 0,
             "frames_segmented": 0,
@@ -207,45 +217,84 @@ class SegmentationPipeline:
             source_fps=source_fps,
             detection_fps=float(request.detection_fps),
             first_source_frame=request.first_source_frame,
+            first_frame_number=request.first_frame_number,
         )
 
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
     def timelines(self, request: SegmentRequest) -> Optional[Dict[str, List[SurfaceSample]]]:
-        """Return surface samples per track, segmenting only when necessary."""
-        track_ids = [str(key) for key in request.tracks]
-        if not track_ids:
+        """Return surface samples per track, segmenting only the tracks the store lacks.
+
+        Tracks are matched to the store by their canonical id and the signature
+        of their boxes, so labels made for the same boxes by an earlier run, a
+        different crossing configuration or crowd-jaywalking are reused, and a
+        segment with one new track costs only that track's frames.
+        """
+        if not request.tracks:
             return {}
+        original_ids = {canonical_track_id(key): str(key) for key in request.tracks}
+        signatures = {
+            canonical_track_id(key): track_signature(track)
+            for key, track in request.tracks.items()
+        }
 
-        if self.store.is_current(request.stem, self.settings, track_ids):
-            stored = self.store.read_index(request.stem)
-            if stored is not None:
-                self._count("segments_reused", 1)
-                return self._timelines_from_index(stored, track_ids)
+        # v4 labels were sampled with frame-count f at start + f / fps. That
+        # holds only for tracks counted from 0 (Waymo); CROWD's count from 1,
+        # so their v4 labels sit one frame late and are made again.
+        stored, legacy = self.store.load_tracks(
+            request.stem, self.settings, signatures,
+            accept_legacy=request.first_frame_number == 0,
+        )
+        missing = [track_id for track_id in signatures if track_id not in stored]
+        rows = [row for track_rows in stored.values() for row in track_rows]
+        self._count("tracks_reused", len(stored))
 
-        segmented = self._segment_request(request)
-        if segmented is None:
-            self._count("segments_failed", 1)
-            return None
-        samples, clock = segmented
-
-        self.store.write_index(request.stem, [sample.as_row() for sample in samples])
-        self.store.write_manifest(
-            request.stem,
-            self.settings,
-            track_ids,
-            extra={
+        extra: Dict[str, object] = {}
+        if missing:
+            subset = replace(
+                request,
+                tracks={
+                    key: track for key, track in request.tracks.items()
+                    if canonical_track_id(key) in missing
+                },
+            )
+            segmented = self._segment_request(subset)
+            if segmented is None:
+                self._count("segments_failed", 1)
+                return None
+            samples, clock = segmented
+            rows += [sample.as_row() for sample in samples]
+            extra = {
                 "video_id": request.video_id,
                 "start_seconds": float(request.start_seconds),
                 "detection_fps": float(request.detection_fps),
                 "source_fps": float(request.source_fps or request.detection_fps),
                 "video_fps": float(clock.video_fps),
                 "first_source_frame": int(request.first_source_frame),
-                "sample_count": len(samples),
-            },
-        )
-        self._count("segments_segmented", 1)
+                "first_frame_number": int(request.first_frame_number),
+            }
+            self._count("tracks_segmented", len(missing))
+            self._count("segments_segmented", 1)
+        else:
+            self._count("segments_reused", 1)
+
+        if missing or legacy:
+            # A v4 entry that served this request is rewritten as v5, so the
+            # labels become shareable without being segmented again.
+            self.store.save_tracks(request.stem, self.settings, signatures, rows, extra=extra)
+
+        samples = [
+            SurfaceSample(
+                track_id=original_ids[canonical_track_id(row["unique-id"])],
+                frame=int(row["frame-count"]),
+                video_time_s=float(row["video_time_s"]),
+                surface=str(row["surface"]),
+                confidence=float(row["confidence"]),
+            )
+            for row in rows
+            if canonical_track_id(row["unique-id"]) in original_ids
+        ]
         return surface_timeline(samples)
 
     def camera_shift(self, request: SegmentRequest, first_frame: float, last_frame: float) -> Optional[float]:
@@ -277,28 +326,6 @@ class SegmentationPipeline:
             return None
         self._count("frames_camera_shift", int(len(frames)))
         return background_shift(frames)
-
-    @staticmethod
-    def _timelines_from_index(
-        index: pl.DataFrame,
-        track_ids: Sequence[str],
-    ) -> Dict[str, List[SurfaceSample]]:
-        wanted = {str(value) for value in track_ids}
-        samples: List[SurfaceSample] = []
-        for row in index.iter_rows(named=True):
-            track_id = str(row["unique-id"])
-            if track_id not in wanted:
-                continue
-            samples.append(
-                SurfaceSample(
-                    track_id=track_id,
-                    frame=int(row["frame-count"]),
-                    video_time_s=float(row["video_time_s"]),
-                    surface=str(row["surface"]),
-                    confidence=float(row["confidence"]),
-                )
-            )
-        return surface_timeline(samples)
 
     # ------------------------------------------------------------------
     # Segmentation
