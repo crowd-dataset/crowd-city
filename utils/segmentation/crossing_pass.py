@@ -34,7 +34,7 @@ from utils.crossing.road_metrics import (
     road_intervals_for_tracks,
     road_restricted_speed,
 )
-from utils.segmentation.frames import RemoteCredentials
+from utils.segmentation.frames import CROWD_FIRST_FRAME_NUMBER, RemoteCredentials
 from utils.segmentation.pipeline import SegmentationPipeline, SegmentRequest
 from utils.segmentation.segformer import (
     IsolatedSurfaceSegmenter,
@@ -413,6 +413,7 @@ def _segment_request(
         tracks=tracks,
         source_fps=float(task["fps"]),
         first_source_frame=int(first_source_frame),
+        first_frame_number=CROWD_FIRST_FRAME_NUMBER,
     )
 
 

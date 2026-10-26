@@ -35,6 +35,7 @@ from utils.crossing.metrics import ensure_waymo_processed, tuned_crossing_parame
 from utils.crossing.road_metrics import road_intervals_for_tracks
 from utils.segmentation.constants import SURFACE_FOOTPATH, SURFACE_ROAD
 from utils.segmentation.frames import (
+    CROWD_FIRST_FRAME_NUMBER,
     FrameClock,
     FrameWindow,
     RemoteCredentials,
@@ -48,6 +49,7 @@ from utils.segmentation.segformer import (
 )
 from utils.segmentation.store import (
     INDEX_SCHEMA,
+    LEGACY_INDEX_SCHEMA,
     SurfaceStore,
     configured_segmentation_root,
     crossing_fingerprint,
@@ -150,11 +152,12 @@ def _discover_samples(store: SurfaceStore, limit: Optional[int]) -> List[Sample]
     Candidates are scanned from a shuffled, bounded pool and then sorted by
     how many tracks share the clip, so a handful of clean one- or two-person
     crossings are preferred over a busy intersection with dozens of
-    simultaneous tracks that would be hard to read as a "sample". Manifests
-    whose crossing fingerprint does not match the current configuration are
-    skipped, since they were filtered by parameters no longer in effect.
+    simultaneous tracks that would be hard to read as a "sample". Current
+    (v5) entries are validated per track, by their boxes, so any of them is a
+    fair sample whichever run or program wrote it. A v4 entry is used only when
+    its crossing fingerprint matches the current configuration, as before.
     """
-    current_fingerprint = _current_crossing_fingerprint()
+    current_fingerprint: Optional[str] = None
     manifest_paths = sorted(store.manifest_dir.glob("*.json"))
     random.shuffle(manifest_paths)
     scan_pool = manifest_paths if not limit else manifest_paths[: max(limit * 20, 200)]
@@ -166,11 +169,15 @@ def _discover_samples(store: SurfaceStore, limit: Optional[int]) -> List[Sample]
         if not manifest:
             continue
         # Older schemas mapped frames to time with the rounded file-name rate,
-        # so their intervals were derived from misplaced boxes.
-        if manifest.get("schema") != INDEX_SCHEMA:
-            continue
-        stored_fingerprint = (manifest.get("settings") or {}).get("crossing_fingerprint")
-        if stored_fingerprint != current_fingerprint:
+        # or dropped long windows, so their intervals are not trustworthy.
+        schema = manifest.get("schema")
+        if schema == LEGACY_INDEX_SCHEMA:
+            if current_fingerprint is None:
+                current_fingerprint = _current_crossing_fingerprint()
+            stored_fingerprint = (manifest.get("settings") or {}).get("crossing_fingerprint")
+            if stored_fingerprint != current_fingerprint:
+                continue
+        elif schema != INDEX_SCHEMA:
             continue
         index = store.read_index(stem)
         if index is None or index.height == 0:
@@ -371,9 +378,12 @@ def render_sample(
         source_fps=sample.source_fps,
         detection_fps=sample.detection_fps,
         first_source_frame=sample.first_source_frame,
+        first_frame_number=CROWD_FIRST_FRAME_NUMBER,
     )
     # The boxes are read straight from the detection file, on raw frames.
-    raw_clock = FrameClock(start_seconds=sample.start_seconds, video_fps=video_fps)
+    raw_clock = FrameClock(
+        start_seconds=sample.start_seconds, video_fps=video_fps, first_frame_number=CROWD_FIRST_FRAME_NUMBER,
+    )
 
     entry = min(interval.entry_frame for interval in sample.intervals.values())
     exit_ = max(interval.exit_frame for interval in sample.intervals.values())

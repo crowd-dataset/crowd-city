@@ -118,6 +118,13 @@ class FrameWindow:
     duration_seconds: float
 
 
+# CROWD's detection files number the first frame of a segment 1 (in 257 of 300
+# files checked the lowest frame-count is 1), so frame-count f is decoded at
+# start + (f - 1) / fps. The Waymo tracks of speed_estimation_harness.py count
+# from 0.
+CROWD_FIRST_FRAME_NUMBER = 1
+
+
 @dataclass(frozen=True)
 class FrameClock:
     """Map one detection segment's analysis frame numbers onto video time.
@@ -127,12 +134,17 @@ class FrameClock:
     an integer (29.97 is stored as 30). When processing_fps downsampled the
     detections, frames were also renumbered onto a coarser grid anchored at
     the first retained source frame; this undoes that as well.
+
+    ``first_frame_number`` is the frame-count of a segment's first decoded
+    frame: CROWD's detection files count from 1 (CROWD_FIRST_FRAME_NUMBER),
+    the Waymo tracks made by speed_estimation_harness.py from 0.
     """
 
     start_seconds: float
     video_fps: float
     origin_frame: float = 0.0
     source_frames_per_frame: float = 1.0
+    first_frame_number: float = 0.0
 
     @classmethod
     def for_segment(
@@ -142,6 +154,7 @@ class FrameClock:
         source_fps: float,
         detection_fps: float,
         first_source_frame: float = 0.0,
+        first_frame_number: float = 0.0,
     ) -> "FrameClock":
         # Mirrors _resample_detection_fps, which only renumbers when the
         # processing rate is below the (nominal) source rate.
@@ -151,8 +164,13 @@ class FrameClock:
                 video_fps=float(video_fps),
                 origin_frame=float(first_source_frame),
                 source_frames_per_frame=float(source_fps) / float(detection_fps),
+                first_frame_number=float(first_frame_number),
             )
-        return cls(start_seconds=float(start_seconds), video_fps=float(video_fps))
+        return cls(
+            start_seconds=float(start_seconds),
+            video_fps=float(video_fps),
+            first_frame_number=float(first_frame_number),
+        )
 
     @property
     def frames_per_second(self) -> float:
@@ -161,10 +179,10 @@ class FrameClock:
 
     def seconds(self, frame: float) -> float:
         source_frame = self.origin_frame + float(frame) * self.source_frames_per_frame
-        return self.start_seconds + source_frame / self.video_fps
+        return self.start_seconds + (source_frame - self.first_frame_number) / self.video_fps
 
     def frame(self, seconds: float) -> float:
-        source_frame = (float(seconds) - self.start_seconds) * self.video_fps
+        source_frame = (float(seconds) - self.start_seconds) * self.video_fps + self.first_frame_number
         return (source_frame - self.origin_frame) / self.source_frames_per_frame
 
 
