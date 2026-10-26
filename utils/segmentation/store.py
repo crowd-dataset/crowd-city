@@ -300,6 +300,60 @@ class SurfaceStore:
             "track_ids": sorted(merged_signatures),
             "track_signatures": dict(sorted(merged_signatures.items())),
         })
+        self._write_manifest(stem, manifest)
+
+    def merge_entry(self, stem: str, other: "SurfaceStore") -> Tuple[bool, bool]:
+        """Add the tracks ``other`` holds for ``stem`` that this store lacks.
+
+        Used to share one store between machines (sync_surface_store.py) and
+        with crowd-jaywalking. Only v5 entries under the same settings are
+        merged; this store's version of a track it already holds is kept. A
+        missing or pre-v5 entry here is replaced by the other v5 entry. Returns
+        whether this store changed, and whether it holds tracks (or versions
+        of tracks) that ``other`` lacks.
+        """
+        theirs = other.read_manifest(stem) or {}
+        ours = self.read_manifest(stem) or {}
+        ours_is_current = ours.get("schema") == INDEX_SCHEMA
+        if theirs.get("schema") != INDEX_SCHEMA:
+            return False, ours_is_current
+        if not ours_is_current:
+            index = other.read_index(stem)
+            if index is None:
+                return False, False
+            self.write_index(stem, index.to_dicts())
+            self._write_manifest(stem, theirs)
+            return True, False
+        if ours.get("settings") != theirs.get("settings"):
+            return False, False
+
+        our_tracks = dict(ours.get("track_signatures") or {})
+        their_tracks = dict(theirs.get("track_signatures") or {})
+        take = {track_id: signature for track_id, signature in their_tracks.items() if track_id not in our_tracks}
+        ours_extra = any(their_tracks.get(track_id) != signature for track_id, signature in our_tracks.items())
+        if not take:
+            return False, ours_extra
+
+        our_index = self.read_index(stem)
+        their_index = other.read_index(stem)
+        if their_index is None:
+            return False, ours_extra
+        rows = [] if our_index is None else [
+            row for row in our_index.iter_rows(named=True)
+            if canonical_track_id(row["unique-id"]) in our_tracks
+        ]
+        rows += [
+            {**row, "unique-id": canonical_track_id(row["unique-id"])}
+            for row in their_index.iter_rows(named=True)
+            if canonical_track_id(row["unique-id"]) in take
+        ]
+        merged_tracks = dict(sorted({**our_tracks, **take}.items()))
+        manifest = {**theirs, **ours, "track_ids": sorted(merged_tracks), "track_signatures": merged_tracks}
+        self.write_index(stem, rows)
+        self._write_manifest(stem, manifest)
+        return True, ours_extra
+
+    def _write_manifest(self, stem: str, manifest: Dict[str, Any]) -> None:
         path = self.manifest_path(stem)
         temporary = path.with_suffix(".json.tmp")
         with temporary.open("w", encoding="utf-8") as handle:
