@@ -17,7 +17,7 @@ import shutil
 import sys
 import warnings
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Set, Optional, Dict
 
 import polars as pl
@@ -2651,6 +2651,35 @@ def _process_until_target(
     return processed
 
 
+# Segments per batch when detection files are fetched on demand without a crossing target.
+FETCH_BATCH_SIZE = 200
+
+
+def _process_in_batches(tasks: list, prepare, process, batch_size: int = FETCH_BATCH_SIZE) -> list:
+    """Process ``tasks`` in batches, preparing the next batch while this one is processed.
+
+    ``prepare`` fetches a batch's detection files (network-bound) and returns the
+    tasks that can be processed; ``process`` analyses and segments them (CPU and
+    GPU). Overlapping the two keeps the GPU busy during the downloads instead of
+    leaving it idle until every file is local. Returns the tasks processed.
+    """
+    batches = [tasks[start:start + batch_size] for start in range(0, len(tasks), batch_size)]
+    processed: list = []
+    if not batches:
+        return processed
+    with ThreadPoolExecutor(max_workers=1) as fetcher:
+        upcoming = fetcher.submit(prepare, batches[0])
+        for number in range(1, len(batches) + 1):
+            batch = upcoming.result()
+            if number < len(batches):
+                upcoming = fetcher.submit(prepare, batches[number])
+            logger.info(f"Detection batch {number} of {len(batches)}: {len(batch)} segment(s).")
+            if batch:
+                process(batch)
+                processed.extend(batch)
+    return processed
+
+
 def _crossing_rule() -> str:
     """Return the configured crossing rule, stopping on an unusable setting.
 
@@ -3855,9 +3884,13 @@ if __name__ == "__main__":
                 initargs=worker_init_args,
             )
         with executor_context as executor:
-            if target_crossings is None:
-                if remote_detections.enabled():
-                    csv_tasks = remote_detections.fetch_tasks(csv_tasks)
+            if target_crossings is None and remote_detections.enabled():
+                csv_tasks = _process_in_batches(
+                    csv_tasks,
+                    remote_detections.fetch_tasks,
+                    lambda tasks: (run_detection(tasks, executor), select_crossings(tasks)),
+                )
+            elif target_crossings is None:
                 run_detection(csv_tasks, executor)
                 select_crossings(csv_tasks)
             else:
